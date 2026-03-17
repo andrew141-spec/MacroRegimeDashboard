@@ -1,0 +1,134 @@
+# data_loaders.py — FRED, yfinance, options chain data fetching
+import os, re, time, math, datetime as dt, json, tempfile
+from dataclasses import dataclass, field
+from typing import List, Dict, Tuple, Optional
+from enum import Enum
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.graph_objects as go
+import plotly.express as px
+import yfinance as yf
+from fredapi import Fred
+from scipy import stats as scipy_stats
+from scipy.stats import norm as scipy_norm
+from urllib.request import Request, urlopen
+import xml.etree.ElementTree as ET
+from config import GammaState
+from utils import _to_1d, resample_ffill, yf_close, _get_secret
+from gex_engine import build_gamma_state
+
+def get_gex_from_yfinance(symbol="SPY") -> Tuple[Optional[pd.DataFrame], float, str]:
+    """Pull option chain from yfinance and compute GEX."""
+    try:
+        ticker = yf.Ticker(symbol)
+        spot = ticker.info.get("regularMarketPrice") or ticker.info.get("previousClose") or 580.0
+        exps = ticker.options
+        if not exps: return None, float(spot), "yfinance (no options)"
+        rows = []
+        today = dt.date.today()
+        for exp in exps[:3]:
+            try:
+                exp_dt = dt.datetime.strptime(exp, "%Y-%m-%d").date()
+                T = max((exp_dt - today).days / 365.0, 1/365)
+                chain = ticker.option_chain(exp)
+                calls = chain.calls[["strike","impliedVolatility","openInterest"]].copy()
+                calls.columns = ["strike","iv","call_oi"]
+                calls["put_oi"] = 0
+                puts  = chain.puts[["strike","impliedVolatility","openInterest"]].copy()
+                puts.columns = ["strike","iv","put_oi"]
+                puts["call_oi"] = 0
+                for df_leg in [calls, puts]:
+                    df_leg["expiry_T"] = T
+                    df_leg["iv"] = df_leg["iv"].fillna(0.20).clip(0.05, 5.0)
+                    df_leg[["call_oi","put_oi"]] = df_leg[["call_oi","put_oi"]].fillna(0).astype(int)
+                    rows.append(df_leg)
+            except: pass
+        if not rows: return None, float(spot), "yfinance (chain error)"
+        full = pd.concat(rows, ignore_index=True)
+        # Near-the-money filter
+        full = full[(full["strike"] > spot * 0.88) & (full["strike"] < spot * 1.12)]
+        agg = full.groupby(["strike","expiry_T"]).agg(
+            iv=("iv","mean"), call_oi=("call_oi","sum"), put_oi=("put_oi","sum")
+        ).reset_index()
+        return agg, float(spot), "yfinance"
+    except Exception as e:
+        return None, 580.0, f"error: {e}"
+
+# ============================================================
+# DATA LOADING — MACRO
+# ============================================================
+@st.cache_data(ttl=1800)
+def load_macro(start_iso, end_iso):
+    start, end = dt.date.fromisoformat(start_iso), dt.date.fromisoformat(end_iso)
+    key  = _get_secret("FRED_API_KEY")
+    fred = Fred(api_key=key) if key else Fred()
+
+    def fs(sid):
+        s = fred.get_series(sid, observation_start=start_iso, observation_end=end_iso)
+        s = pd.Series(s); s.index = pd.to_datetime(s.index)
+        return s.sort_index()
+
+    out = {}
+
+    # ── Existing series (keep) ────────────────────────────────────────────
+    for sid in ["DGS3MO","DGS2","DGS10","DGS30",
+                "CPIAUCSL","CPILFESL","UNRATE","WALCL","WTREGEN","RRPONTSYD","M2SL","NFCI"]:
+        try:    out[sid] = fs(sid)
+        except: out[sid] = pd.Series(dtype=float)
+    try:    out["ICSA"] = fs("ICSA")
+    except: out["ICSA"] = pd.Series(dtype=float)
+
+    # ── NEW: Real yields (10Y TIPS) ───────────────────────────────────────
+    # DFII10: 10-Year Treasury Inflation-Indexed Security yield
+    # Critical driver of equity multiples — completely absent before
+    try:    out["DFII10"] = fs("DFII10")
+    except: out["DFII10"] = pd.Series(dtype=float)
+
+    # ── NEW: Bank reserves at Fed ────────────────────────────────────────
+    # WRBWFRBL: reserve balances. Below ~$3T = repo stress risk
+    try:    out["WRBWFRBL"] = fs("WRBWFRBL")
+    except: out["WRBWFRBL"] = pd.Series(dtype=float)
+
+    # ── NEW: Bank credit (for true credit impulse) ────────────────────────
+    # TOTBKCR: total bank credit — flow gives credit impulse
+    try:    out["TOTBKCR"] = fs("TOTBKCR")
+    except: out["TOTBKCR"] = pd.Series(dtype=float)
+
+    # ── NEW: ISM Manufacturing New Orders ────────────────────────────────
+    # AMTMNO: new orders — leads headline ISM by 1-2m, GDP by 3-6m
+    try:    out["AMTMNO"] = fs("AMTMNO")
+    except: out["AMTMNO"] = pd.Series(dtype=float)
+
+    # ── NEW: Money market fund assets (for net liquidity calc) ───────────
+    # WRMFSL: captures RRP→MMMF migration
+    try:    out["WRMFSL"] = fs("WRMFSL")
+    except: out["WRMFSL"] = pd.Series(dtype=float)
+
+    # ── NEW: GDP (for credit impulse denominator) ─────────────────────────
+    # GDPC1: quarterly real GDP, will be interpolated to daily
+    try:    out["GDPC1"] = fs("GDPC1")
+    except: out["GDPC1"] = pd.Series(dtype=float)
+
+    # ── Market series (keep + no change) ─────────────────────────────────
+    idx = pd.date_range(start, end, freq="D")
+    for sym in ["^VIX","SPY","TLT","QQQ","COPX","GLD","HYG","LQD","UUP","IWM"]:
+        k = sym.replace("^","")
+        out[k] = yf_close(sym, start, end, idx).dropna()
+
+    return out
+
+@st.cache_data(ttl=3600)
+def get_fwd_pe(ticker):
+    try:
+        pe = yf.Ticker(ticker).info.get("forwardPE", np.nan)
+        return float(pe) if pe else np.nan
+    except: return np.nan
+
+# ============================================================
+# WORLD INTELLIGENCE MONITOR — Feed Infrastructure
+# ============================================================
+# Organised into 7 signal categories matching the thesis document.
+# Each category has: feeds, keywords, impact weights, and a colour.
+# ============================================================
+

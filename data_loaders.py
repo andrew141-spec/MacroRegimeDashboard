@@ -22,9 +22,38 @@ def get_gex_from_yfinance(symbol="SPY") -> Tuple[Optional[pd.DataFrame], float, 
     """Pull option chain from yfinance and compute GEX."""
     try:
         ticker = yf.Ticker(symbol)
-        spot = ticker.info.get("regularMarketPrice") or ticker.info.get("previousClose") or 580.0
+
+        # ── Spot price: try multiple methods robustly ──────────────────────
+        # yfinance .info is unreliable; fall back to fast_info then history
+        spot = None
+        try:
+            fi = ticker.fast_info
+            spot = float(fi.last_price or fi.previous_close or 0) or None
+        except Exception:
+            pass
+        if not spot:
+            try:
+                info = ticker.info
+                spot = float(info.get("regularMarketPrice") or
+                             info.get("currentPrice") or
+                             info.get("previousClose") or 0) or None
+            except Exception:
+                pass
+        if not spot:
+            try:
+                hist = ticker.history(period="2d")
+                if not hist.empty:
+                    spot = float(hist["Close"].iloc[-1])
+            except Exception:
+                pass
+        if not spot:
+            spot = 580.0  # last-resort fallback
+
+        # ── Options chain ──────────────────────────────────────────────────
         exps = ticker.options
-        if not exps: return None, float(spot), "yfinance (no options)"
+        if not exps:
+            return None, float(spot), "yfinance (no options)"
+
         rows = []
         today = dt.date.today()
         for exp in exps[:3]:
@@ -43,11 +72,18 @@ def get_gex_from_yfinance(symbol="SPY") -> Tuple[Optional[pd.DataFrame], float, 
                     df_leg["iv"] = df_leg["iv"].fillna(0.20).clip(0.05, 5.0)
                     df_leg[["call_oi","put_oi"]] = df_leg[["call_oi","put_oi"]].fillna(0).astype(int)
                     rows.append(df_leg)
-            except: pass
-        if not rows: return None, float(spot), "yfinance (chain error)"
+            except:
+                pass
+
+        if not rows:
+            return None, float(spot), "yfinance (chain error)"
+
         full = pd.concat(rows, ignore_index=True)
         # Near-the-money filter
         full = full[(full["strike"] > spot * 0.88) & (full["strike"] < spot * 1.12)]
+        if full.empty:
+            return None, float(spot), "yfinance (no NTM strikes)"
+
         agg = full.groupby(["strike","expiry_T"]).agg(
             iv=("iv","mean"), call_oi=("call_oi","sum"), put_oi=("put_oi","sum")
         ).reset_index()

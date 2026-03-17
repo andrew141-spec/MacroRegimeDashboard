@@ -14,7 +14,7 @@ from scipy import stats as scipy_stats
 from scipy.stats import norm as scipy_norm
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
-from config import GammaRegime, REGIME_COLOURS, REGIME_BG
+from config import GammaRegime, REGIME_COLORS, REGIME_BG
 
 def pill(label, value):
     return f"<span class='badge'>{label}: <b>{value}</b></span>"
@@ -80,4 +80,3 @@ def autorefresh_js(seconds, enabled):
     st.components.v1.html(
         f"<script>setTimeout(()=>{{window.parent.location.reload();}},{seconds*1000});</script>",
         height=0)
-

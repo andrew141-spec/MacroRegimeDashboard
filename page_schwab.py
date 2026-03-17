@@ -14,7 +14,7 @@ from scipy import stats as scipy_stats
 from scipy.stats import norm as scipy_norm
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
-from config import GammaState, GammaRegime, FeedItem, SetupScore
+from config import GammaState, GammaRegime, FeedItem, SetupScore, CSS
 from utils import _to_1d, zscore, resample_ffill, yf_close, kelly, current_pct_rank
 from config import _get_secret
 from ui_components import pill, pbar, sec_hdr, plotly_dark, regime_chip, autorefresh_js
@@ -27,6 +27,7 @@ from probability import compute_prob_composite, get_session_context, evaluate_se
 
 def render_schwab_page():
     """Schwab / ThinkorSwim OAuth2 + Supabase token storage."""
+    st.markdown(CSS, unsafe_allow_html=True)
     st.markdown("## 📈 Schwab / ThinkorSwim Connection")
 
     # ── Pre-flight checks ────────────────────────────────────────────────

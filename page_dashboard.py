@@ -17,13 +17,14 @@ import xml.etree.ElementTree as ET
 from config import GammaState, GammaRegime, FeedItem, SetupScore, REGIME_COLORS
 from utils import _to_1d, zscore, resample_ffill, yf_close, kelly, current_pct_rank
 from config import _get_secret
-from ui_components import pill, pbar, sec_hdr, plotly_dark, regime_chip, autorefresh_js
+from ui_components import pill, pbar, sec_hdr, plotly_dark, regime_chip, autorefresh_js, colored
 from gex_engine import build_gamma_state, compute_gex_from_chain
 from schwab_api import get_schwab_client, schwab_get_spot, schwab_get_options_chain, schwab_run_auth_flow, schwab_complete_auth, _get_supabase, SCHWAB_AVAILABLE, SUPABASE_AVAILABLE
 from data_loaders import load_macro, get_gex_from_yfinance, get_fwd_pe
 from intel_monitor import load_feeds, geo_shock_score, score_relevance, categorise_items, category_shock_score, _all_feeds_flat, INTEL_CATEGORIES
 from signals import compute_leading_stack, compute_1d_prob
 from probability import compute_prob_composite, get_session_context, evaluate_setups, check_failure_modes, classify_macro_regime_abs, regime_transition_prob, driver_alerts
+from page_wim import render_world_intelligence_monitor
 
 def render_dashboard():
     """Main integrated dashboard."""

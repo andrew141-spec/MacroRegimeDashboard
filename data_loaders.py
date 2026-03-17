@@ -59,69 +59,63 @@ def _load_gex_cache(symbol: str) -> Tuple[Optional[pd.DataFrame], float, str]:
 
 def get_gex_from_yfinance(symbol="SPY") -> Tuple[Optional[pd.DataFrame], float, str]:
     """Pull option chain from yfinance and compute GEX.
-    During non-RTH hours, falls back to disk-cached EOD chain automatically.
+    Always attempts a live fetch first — yfinance returns EOD chain even
+    outside RTH. Falls back to disk cache if fetch fails or returns empty.
     """
     try:
         ticker = yf.Ticker(symbol)
 
-        # ── Determine if market is currently open ─────────────────────────
+        # ── Detect RTH for source labelling only ──────────────────────────
         now_et = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=4)
         total_mins = now_et.hour * 60 + now_et.minute
-        is_weekday = now_et.weekday() < 5
-        market_open = is_weekday and (9*60+30) <= total_mins < (16*60)
+        market_open = (now_et.weekday() < 5) and (9*60+30) <= total_mins < (16*60)
 
-        # ── Spot price ────────────────────────────────────────────────────
+        # ── Spot price — always use history as most reliable method ───────
         spot = None
-        if market_open:
+        try:
+            hist = ticker.history(period="5d")
+            if not hist.empty:
+                spot = float(hist["Close"].iloc[-1])
+        except Exception:
+            pass
+        if not spot:
             try:
                 fi = ticker.fast_info
                 spot = float(fi.last_price or fi.previous_close or 0) or None
             except Exception:
                 pass
-            if not spot:
-                try:
-                    info = ticker.info
-                    spot = float(info.get("regularMarketPrice") or
-                                 info.get("currentPrice") or
-                                 info.get("previousClose") or 0) or None
-                except Exception:
-                    pass
-        if not spot:
-            try:
-                hist = ticker.history(period="5d")
-                if not hist.empty:
-                    spot = float(hist["Close"].iloc[-1])
-            except Exception:
-                pass
         if not spot:
             spot = 580.0
 
-        source_label = "yfinance (live)" if market_open else "yfinance (prev close)"
+        source_label = "yfinance (live)" if market_open else "yfinance (EOD)"
 
-        # ── Options chain ─────────────────────────────────────────────────
-        exps = ticker.options
+        # ── Options chain — always attempt fetch ──────────────────────────
         rows = []
         today = dt.date.today()
+        exps = []
+        try:
+            exps = ticker.options or []
+        except Exception:
+            pass
 
-        if exps:
-            for exp in exps[:3]:
-                try:
-                    exp_dt = dt.datetime.strptime(exp, "%Y-%m-%d").date()
-                    T = max((exp_dt - today).days / 365.0, 1/365)
-                    chain = ticker.option_chain(exp)
-                    calls = chain.calls[["strike","impliedVolatility","openInterest"]].copy()
-                    calls.columns = ["strike","iv","call_oi"]
-                    calls["put_oi"] = 0
-                    puts  = chain.puts[["strike","impliedVolatility","openInterest"]].copy()
-                    puts.columns = ["strike","iv","put_oi"]
-                    puts["call_oi"] = 0
-                    for df_leg in [calls, puts]:
-                        df_leg["expiry_T"] = T
-                        df_leg["iv"] = df_leg["iv"].fillna(0.20).clip(0.05, 5.0)
-                        df_leg[["call_oi","put_oi"]] = df_leg[["call_oi","put_oi"]].fillna(0).astype(int)
-                        rows.append(df_leg)
-                except:
-                    pass
+        for exp in exps[:3]:
+            try:
+                exp_dt = dt.datetime.strptime(exp, "%Y-%m-%d").date()
+                T = max((exp_dt - today).days / 365.0, 1/365)
+                chain = ticker.option_chain(exp)
+                calls = chain.calls[["strike","impliedVolatility","openInterest"]].copy()
+                calls.columns = ["strike","iv","call_oi"]
+                calls["put_oi"] = 0
+                puts  = chain.puts[["strike","impliedVolatility","openInterest"]].copy()
+                puts.columns = ["strike","iv","put_oi"]
+                puts["call_oi"] = 0
+                for df_leg in [calls, puts]:
+                    df_leg["expiry_T"] = T
+                    df_leg["iv"] = df_leg["iv"].fillna(0.20).clip(0.05, 5.0)
+                    df_leg[["call_oi","put_oi"]] = df_leg[["call_oi","put_oi"]].fillna(0).astype(int)
+                    rows.append(df_leg)
+            except:
+                pass
 
         if rows:
             full = pd.concat(rows, ignore_index=True)
@@ -130,19 +124,17 @@ def get_gex_from_yfinance(symbol="SPY") -> Tuple[Optional[pd.DataFrame], float, 
                 agg = full.groupby(["strike","expiry_T"]).agg(
                     iv=("iv","mean"), call_oi=("call_oi","sum"), put_oi=("put_oi","sum")
                 ).reset_index()
-                # Save successful fetch to disk cache
                 _save_gex_cache(symbol, agg.to_dict("records"), spot, source_label)
                 return agg, float(spot), source_label
 
-        # ── Live fetch failed — try disk cache ────────────────────────────
+        # ── Fetch returned nothing — load disk cache ──────────────────────
         cached_chain, cached_spot, cached_label = _load_gex_cache(symbol)
         if cached_chain is not None:
-            return cached_chain, cached_spot, cached_label
+            return cached_chain, float(spot), cached_label  # fresh spot, cached chain
 
-        return None, float(spot), f"{source_label} (no data)"
+        return None, float(spot), "no options data"
 
     except Exception as e:
-        # Last resort — try disk cache before giving up
         cached_chain, cached_spot, cached_label = _load_gex_cache(symbol)
         if cached_chain is not None:
             return cached_chain, cached_spot, cached_label

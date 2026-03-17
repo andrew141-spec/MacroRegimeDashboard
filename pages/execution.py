@@ -1,6 +1,8 @@
 # pages/execution.py — render_execution_page
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import os, re, time, math, datetime as dt, json, tempfile
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional

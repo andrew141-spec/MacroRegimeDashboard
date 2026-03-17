@@ -609,7 +609,7 @@ def render_setups_page():
     st.markdown(f"""<div class='warn-card'>
       <b>Session:</b> {session['window']} · <b>Liquidity:</b> {session['liquidity']} ·
       <b>Size Mult:</b> {sm:.2f}x · <b>Regime:</b> {gs.regime.value} ·
-      <b>Flip:</b> {gs.gamma_flip:.1f if gs.gamma_flip else 'N/A'} ·
+      <b>Flip:</b> {f'{gs.gamma_flip:.1f}' if gs.gamma_flip else 'N/A'} ·
       <b>Vanna:</b> {dg.vanna_direction.upper()} · <b>Charm:</b> {dg.charm_direction.upper()}
     </div>""", unsafe_allow_html=True)
     st.markdown("")

@@ -252,7 +252,7 @@ def evaluate_setups(gex_state: GammaState, session: Dict, spot: float,
     dist_pct = gex_state.distance_to_flip_pct
     stability = gex_state.regime_stability
     size_mult = session["size_mult"]
-    vol_adj = 0.75 if vix_level > 25 else (0.5 if vix_level > 35 else 1.0)
+    vol_adj = 0.5 if vix_level > 35 else (0.75 if vix_level > 25 else 1.0)
 
     near_flip = abs(dist_pct) < 0.75
     at_support = any(abs(spot - s) / spot < 0.003 for s in gex_state.key_support)
@@ -303,13 +303,15 @@ def evaluate_setups(gex_state: GammaState, session: Dict, spot: float,
             note = "LOWEST hit rate. 50% size only. Wait for volume climax + delta divergence. 3:1 R:R minimum."
 
         elif setup_num == 5:
-            active = late_session and len(gex_state.key_resistance) > 0
-            score.gamma_alignment = 0.8 if late_session else 0.2
+            # Note 09: pin trades most potent 10:30AM-12PM on OpEx, and after 14:00 any day
+            morning_opex = session["is_opex_friday"] and session["window"] == "Morning"
+            active = (late_session or morning_opex) and len(gex_state.key_resistance) > 0
+            score.gamma_alignment = 0.9 if morning_opex else (0.8 if late_session else 0.2)
             score.orderflow_confirmation = 0.5
             score.tpo_context = 0.6
             score.level_freshness = 0.95
             score.event_risk = 0.9 if not session["is_data_day"] else 0.3
-            note = "Only valid after 14:00 ET. Pin strengthens as expiry approaches. Exit before 15:50."
+            note = "Only valid after 14:00 ET or OpEx morning 10:30-12:00. Pin strengthens as expiry approaches. Exit before 15:50."
 
         effective_size = base_size * size_mult * vol_adj
         results.append({
@@ -341,13 +343,23 @@ def check_failure_modes(gex_state: GammaState, session: Dict,
     dist = abs(gex_state.distance_to_flip_pct)
 
     fm1 = gex_state.data_source == "yfinance" and session["window"] in ("Afternoon","Close/MOC")
+
+    # FM2: Crowding heuristic — note 10 §2. We can't detect real-time options flow,
+    # but we can flag when the gamma flip level is a round number (high crowd visibility)
+    # and regime stability is high (level has been "sitting there" long enough to be
+    # widely published). Round numbers ending in 0 or 5 at the nearest integer are
+    # most likely to be crowded per note 10 §2.
+    flip = gex_state.gamma_flip
+    flip_is_round = (flip > 0) and (round(flip) % 5 == 0)
+    fm2 = flip_is_round and gex_state.regime_stability > 0.6
+
     fm3 = dist < 0.5
     fm4 = is_data_day or vix_level > 28
     fm6 = vix_level > 25
     fm7 = session["is_opex_friday"]
-    fm8 = True  # Always relevant
+    fm8 = True  # Always relevant — dealers hedge in bursts, not continuously
 
-    active = {1: fm1, 2: False, 3: fm3, 4: fm4, 5: False, 6: fm6, 7: fm7, 8: fm8}
+    active = {1: fm1, 2: fm2, 3: fm3, 4: fm4, 5: False, 6: fm6, 7: fm7, 8: fm8}
     return [(k, FAILURE_MODES[k][0], FAILURE_MODES[k][1], active.get(k, False))
             for k in FAILURE_MODES]
 

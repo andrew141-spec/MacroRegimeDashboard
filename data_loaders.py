@@ -1,4 +1,3 @@
-# data_loaders.py — FRED, yfinance, options chain data fetching
 import os, re, time, math, datetime as dt, json, tempfile
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
@@ -18,26 +17,62 @@ from config import _get_secret, GammaState
 from utils import _to_1d, resample_ffill, yf_close
 from gex_engine import build_gamma_state
 
+# ── Disk cache for GEX chain — persists across Streamlit reloads ─────────────
+_GEX_CACHE_DIR = tempfile.gettempdir()
+
+def _gex_cache_path(symbol: str) -> str:
+    return os.path.join(_GEX_CACHE_DIR, f"gex_chain_{symbol.upper()}.json")
+
+def _save_gex_cache(symbol: str, chain_records: list, spot: float, source: str):
+    try:
+        payload = {
+            "chain": chain_records,
+            "spot": spot,
+            "source": source,
+            "saved_at": dt.datetime.now().isoformat(),
+        }
+        with open(_gex_cache_path(symbol), "w") as f:
+            json.dump(payload, f)
+    except Exception:
+        pass
+
+def _load_gex_cache(symbol: str) -> Tuple[Optional[pd.DataFrame], float, str]:
+    """Load cached chain. Returns (None, 0, '') if missing or too old (>24h)."""
+    try:
+        path = _gex_cache_path(symbol)
+        if not os.path.exists(path):
+            return None, 0.0, ""
+        with open(path, "r") as f:
+            payload = json.load(f)
+        saved_at = dt.datetime.fromisoformat(payload["saved_at"])
+        age_hours = (dt.datetime.now() - saved_at).total_seconds() / 3600
+        if age_hours > 24:
+            return None, 0.0, ""
+        chain = pd.DataFrame(payload["chain"])
+        if chain.empty:
+            return None, 0.0, ""
+        saved_str = saved_at.strftime("%a %b %d %H:%M")
+        return chain, float(payload["spot"]), f"cached (EOD {saved_str})"
+    except Exception:
+        return None, 0.0, ""
+
+
 def get_gex_from_yfinance(symbol="SPY") -> Tuple[Optional[pd.DataFrame], float, str]:
     """Pull option chain from yfinance and compute GEX.
-    During non-RTH hours, uses previous session's closing price as spot.
+    During non-RTH hours, falls back to disk-cached EOD chain automatically.
     """
     try:
         ticker = yf.Ticker(symbol)
 
         # ── Determine if market is currently open ─────────────────────────
         now_et = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=4)
-        h, m = now_et.hour, now_et.minute
-        total_mins = h * 60 + m
+        total_mins = now_et.hour * 60 + now_et.minute
         is_weekday = now_et.weekday() < 5
-        rth_open   = is_weekday and (9*60+30) <= total_mins < (16*60)
-        market_open = rth_open
+        market_open = is_weekday and (9*60+30) <= total_mins < (16*60)
 
         # ── Spot price ────────────────────────────────────────────────────
         spot = None
-
         if market_open:
-            # Live price during RTH
             try:
                 fi = ticker.fast_info
                 spot = float(fi.last_price or fi.previous_close or 0) or None
@@ -51,8 +86,6 @@ def get_gex_from_yfinance(symbol="SPY") -> Tuple[Optional[pd.DataFrame], float, 
                                  info.get("previousClose") or 0) or None
                 except Exception:
                     pass
-
-        # During non-RTH (or as fallback), use last closing price from history
         if not spot:
             try:
                 hist = ticker.history(period="5d")
@@ -60,55 +93,59 @@ def get_gex_from_yfinance(symbol="SPY") -> Tuple[Optional[pd.DataFrame], float, 
                     spot = float(hist["Close"].iloc[-1])
             except Exception:
                 pass
-
         if not spot:
-            spot = 580.0  # last-resort fallback
+            spot = 580.0
 
         source_label = "yfinance (live)" if market_open else "yfinance (prev close)"
 
         # ── Options chain ─────────────────────────────────────────────────
-        # yfinance always returns the last known EOD chain regardless of
-        # market hours — this is exactly what we want for non-RTH GEX context
         exps = ticker.options
-        if not exps:
-            return None, float(spot), f"{source_label} (no options)"
-
         rows = []
         today = dt.date.today()
-        for exp in exps[:3]:
-            try:
-                exp_dt = dt.datetime.strptime(exp, "%Y-%m-%d").date()
-                # Use minimum 1-day T to avoid near-zero gamma explosion
-                T = max((exp_dt - today).days / 365.0, 1/365)
-                chain = ticker.option_chain(exp)
-                calls = chain.calls[["strike","impliedVolatility","openInterest"]].copy()
-                calls.columns = ["strike","iv","call_oi"]
-                calls["put_oi"] = 0
-                puts  = chain.puts[["strike","impliedVolatility","openInterest"]].copy()
-                puts.columns = ["strike","iv","put_oi"]
-                puts["call_oi"] = 0
-                for df_leg in [calls, puts]:
-                    df_leg["expiry_T"] = T
-                    df_leg["iv"] = df_leg["iv"].fillna(0.20).clip(0.05, 5.0)
-                    df_leg[["call_oi","put_oi"]] = df_leg[["call_oi","put_oi"]].fillna(0).astype(int)
-                    rows.append(df_leg)
-            except:
-                pass
 
-        if not rows:
-            return None, float(spot), f"{source_label} (chain error)"
+        if exps:
+            for exp in exps[:3]:
+                try:
+                    exp_dt = dt.datetime.strptime(exp, "%Y-%m-%d").date()
+                    T = max((exp_dt - today).days / 365.0, 1/365)
+                    chain = ticker.option_chain(exp)
+                    calls = chain.calls[["strike","impliedVolatility","openInterest"]].copy()
+                    calls.columns = ["strike","iv","call_oi"]
+                    calls["put_oi"] = 0
+                    puts  = chain.puts[["strike","impliedVolatility","openInterest"]].copy()
+                    puts.columns = ["strike","iv","put_oi"]
+                    puts["call_oi"] = 0
+                    for df_leg in [calls, puts]:
+                        df_leg["expiry_T"] = T
+                        df_leg["iv"] = df_leg["iv"].fillna(0.20).clip(0.05, 5.0)
+                        df_leg[["call_oi","put_oi"]] = df_leg[["call_oi","put_oi"]].fillna(0).astype(int)
+                        rows.append(df_leg)
+                except:
+                    pass
 
-        full = pd.concat(rows, ignore_index=True)
-        # Near-the-money filter
-        full = full[(full["strike"] > spot * 0.88) & (full["strike"] < spot * 1.12)]
-        if full.empty:
-            return None, float(spot), f"{source_label} (no NTM strikes)"
+        if rows:
+            full = pd.concat(rows, ignore_index=True)
+            full = full[(full["strike"] > spot * 0.88) & (full["strike"] < spot * 1.12)]
+            if not full.empty:
+                agg = full.groupby(["strike","expiry_T"]).agg(
+                    iv=("iv","mean"), call_oi=("call_oi","sum"), put_oi=("put_oi","sum")
+                ).reset_index()
+                # Save successful fetch to disk cache
+                _save_gex_cache(symbol, agg.to_dict("records"), spot, source_label)
+                return agg, float(spot), source_label
 
-        agg = full.groupby(["strike","expiry_T"]).agg(
-            iv=("iv","mean"), call_oi=("call_oi","sum"), put_oi=("put_oi","sum")
-        ).reset_index()
-        return agg, float(spot), source_label
+        # ── Live fetch failed — try disk cache ────────────────────────────
+        cached_chain, cached_spot, cached_label = _load_gex_cache(symbol)
+        if cached_chain is not None:
+            return cached_chain, cached_spot, cached_label
+
+        return None, float(spot), f"{source_label} (no data)"
+
     except Exception as e:
+        # Last resort — try disk cache before giving up
+        cached_chain, cached_spot, cached_label = _load_gex_cache(symbol)
+        if cached_chain is not None:
+            return cached_chain, cached_spot, cached_label
         return None, 580.0, f"error: {e}"
 
 # ============================================================

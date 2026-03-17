@@ -161,25 +161,22 @@ def get_schwab_client():
 def schwab_run_auth_flow(client_id: str, client_secret: str,
                           redirect_uri: str) -> Optional[str]:
     """
-    Start the OAuth2 flow. Returns the Schwab authorization URL.
-    The user opens this URL, logs in, and is redirected to redirect_uri.
+    Start the OAuth2 flow using the current schwab-py manual flow API.
+    Returns the Schwab authorization URL for the user to open in their browser.
     """
     if not SCHWAB_AVAILABLE:
         return None
     try:
-        # schwab-py's OAuth2 helper — we use a temp path as placeholder
-        tmp_path = tempfile.mktemp(suffix=".json", prefix="schwab_auth_")
-        oauth    = schwab.auth.OAuth2Client(
-            client_id=client_id,
-            client_secret=client_secret,
-            redirect_uri=redirect_uri,
-            token_path=tmp_path,
-        )
-        auth_url, state = oauth.authorization_url()
-        # Store state for CSRF validation
-        st.session_state["_schwab_oauth_state"]    = state
-        st.session_state["_schwab_oauth_tmp_path"] = tmp_path
-        st.session_state["_schwab_oauth_redir"]    = redirect_uri
+        # Build the auth URL directly via the Schwab OAuth endpoint —
+        # schwab-py no longer exposes OAuth2Client; use the documented URL format.
+        import urllib.parse
+        params = urllib.parse.urlencode({
+            "client_id":     client_id,
+            "redirect_uri":  redirect_uri,
+            "response_type": "code",
+        })
+        auth_url = f"https://api.schwabapi.com/v1/oauth/authorize?{params}"
+        st.session_state["_schwab_oauth_redir"] = redirect_uri
         return auth_url
     except Exception as e:
         return f"error: {e}"
@@ -188,32 +185,39 @@ def schwab_run_auth_flow(client_id: str, client_secret: str,
 def schwab_complete_auth(client_id: str, client_secret: str,
                           redirect_uri: str, callback_url: str) -> Tuple[bool, str]:
     """
-    Complete the OAuth2 flow. Saves the token to Supabase.
+    Complete the OAuth2 flow using schwab.auth.client_from_manual_flow.
+    Saves the resulting token to Supabase.
     Returns (success: bool, message: str).
     """
     if not SCHWAB_AVAILABLE:
         return False, "schwab-py not installed"
     try:
-        tmp_path = st.session_state.get("_schwab_oauth_tmp_path",
-                                         tempfile.mktemp(suffix=".json"))
-        oauth = schwab.auth.OAuth2Client(
-            client_id=client_id,
-            client_secret=client_secret,
-            redirect_uri=redirect_uri,
+        tmp_path = tempfile.mktemp(suffix=".json", prefix="schwab_token_")
+
+        # client_from_manual_flow is the current schwab-py API for server/cloud use.
+        # It takes the full redirected callback URL, exchanges the code, and writes
+        # the token to tmp_path.
+        client = schwab.auth.client_from_manual_flow(
+            api_key=client_id,
+            app_secret=client_secret,
+            callback_url=redirect_uri,
             token_path=tmp_path,
+            redirected_url=callback_url,
         )
-        oauth.fetch_token(authorization_response=callback_url)
+
         token_dict = _token_from_tempfile(tmp_path)
         try:
             os.unlink(tmp_path)
         except Exception:
             pass
+
         if token_dict is None:
             return False, "Token file empty after exchange"
+
         if not SUPABASE_AVAILABLE or _get_supabase() is None:
-            # Fallback: store in session_state only (local dev without Supabase)
             st.session_state["_schwab_token_local"] = token_dict
             return True, "Token stored in session (no Supabase — local mode)"
+
         saved = _supabase_save_token(token_dict)
         if saved:
             get_schwab_client.clear()

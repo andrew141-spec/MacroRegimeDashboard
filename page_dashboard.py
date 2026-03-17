@@ -442,6 +442,10 @@ def render_dashboard():
             st.markdown(f"""<div class='warn-card' style='margin-bottom:8px;'>
               🕐 <b>LAST KNOWN GEX</b> — market closed · data from <b>{gex_stale}</b> · levels valid for context only, not live trading
             </div>""", unsafe_allow_html=True)
+        elif "prev close" in gex_state.data_source:
+            st.markdown("""<div class='warn-card' style='margin-bottom:8px;'>
+              📋 <b>PREV CLOSE GEX</b> — using last session closing price + EOD options chain · levels are indicative until RTH opens
+            </div>""", unsafe_allow_html=True)
         elif gex_state.data_source == "unavailable":
             st.markdown("""<div class='alert-card' style='margin-bottom:8px;'>
               ⚠ <b>GEX UNAVAILABLE</b> — no options data yet · will populate once market opens and a refresh occurs

@@ -14,7 +14,7 @@ from scipy import stats as scipy_stats
 from scipy.stats import norm as scipy_norm
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
-from config import GammaState, GammaRegime, FeedItem, SetupScore, REGIME_COLORS
+from config import GammaState, GammaRegime, FeedItem, SetupScore, REGIME_COLORS, CSS
 from utils import _to_1d, zscore, resample_ffill, yf_close, kelly, current_pct_rank
 from config import _get_secret
 from ui_components import pill, pbar, sec_hdr, plotly_dark, regime_chip, autorefresh_js, colored, gauge
@@ -28,6 +28,7 @@ from page_wim import render_world_intelligence_monitor
 
 def render_dashboard():
     """Main integrated dashboard."""
+    st.markdown(CSS, unsafe_allow_html=True)
     st.sidebar.markdown("### Controls")
     start = st.sidebar.date_input("Start", value=dt.date.today()-dt.timedelta(days=730))
     end   = st.sidebar.date_input("End",   value=dt.date.today())

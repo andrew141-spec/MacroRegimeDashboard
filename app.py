@@ -1,24 +1,13 @@
 # app.py — entry point
 # Run: streamlit run app.py
-#
-# Module structure:
-#   app.py              ← entry point (this file, ~30 lines)
-#   config.py           ← imports, page config, CSS, dataclasses, nav
-#   utils.py            ← math helpers (zscore, kelly, rolling_pct etc)
-#   ui_components.py    ← Streamlit/Plotly display helpers
-#   gex_engine.py       ← GEX computation (gamma, flip, regime)
-#   schwab_api.py       ← Schwab OAuth2 + Supabase token storage
-#   data_loaders.py     ← FRED, yfinance, options chain fetching
-#   intel_monitor.py    ← RSS feeds, geo scoring, World Intel Monitor
-#   signals.py          ← leading indicator stack + 1-day model
-#   probability.py      ← probability composite, session, setups, regime
-#   pages/
-#     dashboard.py      ← main dashboard render
-#     wim.py            ← World Intelligence Monitor page
-#     gex.py            ← GEX Engine + Trade Setups pages
-#     execution.py      ← Execution page
-#     schwab.py         ← Schwab/TOS auth page
-#     guide.py          ← Guide page
+
+import sys
+import os
+
+# Ensure the project root is on the Python path
+# This is required on Streamlit Cloud where the working directory
+# may not be automatically added to sys.path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import streamlit as st
 

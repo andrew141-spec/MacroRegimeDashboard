@@ -382,16 +382,8 @@ class FeedItem:
     published: str
     source: str
 
-# ============================================================
-# SIDEBAR NAVIGATION
-# ============================================================
-st.sidebar.markdown("## ⚡ Quant Dashboard")
-page = st.sidebar.radio(
-    "Module",
-    ["Dashboard", "GEX Engine", "Trade Setups", "Execution", "Probability Engine", "Schwab/TOS", "Guide"],
-    index=0
-)
-st.sidebar.markdown("---")
+# page is set in app.py — imported from there
+page = None  # placeholder; overridden by app.py before any render call
 
 # ============================================================
 # HELPERS — CORE MATH

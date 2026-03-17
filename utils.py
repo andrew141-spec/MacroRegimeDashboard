@@ -111,6 +111,32 @@ def yf_close(symbol, start, end, idx) -> pd.Series:
     except:
         return pd.Series(index=idx, data=np.nan, dtype=float)
 
+def _bs_iv_from_price(S: float, K: float, T: float, option_price: float,
+                      right: str, r: float = 0.05) -> float:
+    """Newton-Raphson Black-Scholes implied volatility solver."""
+    if option_price <= 0.01 or T <= 0:
+        return 0.20
+    intrinsic = max(S - K, 0) if right == "C" else max(K - S, 0)
+    if option_price <= intrinsic:
+        return 0.20
+    sigma = 0.20
+    for _ in range(50):
+        d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+        d2 = d1 - sigma * math.sqrt(T)
+        if right == "C":
+            price = S * scipy_norm.cdf(d1) - K * math.exp(-r * T) * scipy_norm.cdf(d2)
+        else:
+            price = K * math.exp(-r * T) * scipy_norm.cdf(-d2) - S * scipy_norm.cdf(-d1)
+        vega = S * scipy_norm.pdf(d1) * math.sqrt(T)
+        if vega < 1e-8:
+            break
+        diff  = price - option_price
+        sigma -= diff / vega
+        sigma  = max(0.001, min(sigma, 10.0))
+        if abs(diff) < 1e-5:
+            break
+    return float(np.clip(sigma, 0.01, 5.0))
+
 # ============================================================
 # HELPERS — UI
 # ============================================================

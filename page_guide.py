@@ -15,7 +15,7 @@ from scipy.stats import norm as scipy_norm
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 from config import GammaState, GammaRegime, FeedItem, SetupScore, CSS
-from utils import _to_1d, zscore, resample_ffill, yf_close, kelly, current_pct_rank
+from utils import _to_1d, zscore, resample_ffill, yf_close, kelly, current_pct_rank, rolling_pct
 from config import _get_secret
 from ui_components import pill, pbar, sec_hdr, plotly_dark, regime_chip, autorefresh_js
 from gex_engine import build_gamma_state, compute_gex_from_chain

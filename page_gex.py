@@ -15,7 +15,8 @@ from scipy.stats import norm as scipy_norm
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 from config import GammaState, GammaRegime, FeedItem, SetupScore
-from utils import _to_1d, zscore, resample_ffill, yf_close, kelly, current_pct_rank, _get_secret
+from utils import _to_1d, zscore, resample_ffill, yf_close, kelly, current_pct_rank
+from config import _get_secret
 from ui_components import pill, pbar, sec_hdr, plotly_dark, regime_chip, autorefresh_js
 from gex_engine import build_gamma_state, compute_gex_from_chain
 from schwab_api import get_schwab_client, schwab_get_spot, schwab_get_options_chain, schwab_run_auth_flow, schwab_complete_auth, _get_supabase, SCHWAB_AVAILABLE, SUPABASE_AVAILABLE

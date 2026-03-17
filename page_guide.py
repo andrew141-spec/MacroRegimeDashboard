@@ -14,7 +14,7 @@ from scipy import stats as scipy_stats
 from scipy.stats import norm as scipy_norm
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
-from config import GammaState, GammaRegime, FeedItem, SetupScore
+from config import GammaState, GammaRegime, FeedItem, SetupScore, CSS
 from utils import _to_1d, zscore, resample_ffill, yf_close, kelly, current_pct_rank
 from config import _get_secret
 from ui_components import pill, pbar, sec_hdr, plotly_dark, regime_chip, autorefresh_js
@@ -27,6 +27,7 @@ from probability import compute_prob_composite, get_session_context, evaluate_se
 
 def render_probability_page():
     """Probability engine deep-dive: signal overview bar chart + rolling history."""
+    st.markdown(CSS, unsafe_allow_html=True)
     st.markdown("## 📊 Probability Engine")
     st.markdown("Per-signal percentile ranks and rolling history for all leading indicators.")
 
@@ -185,6 +186,7 @@ def render_probability_page():
 
 
 def render_guide():
+    st.markdown(CSS, unsafe_allow_html=True)
     st.markdown("## 📖 Guide — Unified Framework")
     st.markdown("""
 ### Architecture: Three Pillars
@@ -262,3 +264,13 @@ Standard practice: use 25-50% of Kelly fraction to account for estimation error.
 """)
 
 
+# ============================================================
+# ROUTER
+# ============================================================
+if page == "Dashboard":        render_dashboard()
+elif page == "GEX Engine":     render_gex_engine()
+elif page == "Trade Setups":   render_setups_page()
+elif page == "Execution":      render_execution_page()
+elif page == "Probability Engine": render_probability_page()
+elif page == "Schwab/TOS":     render_schwab_page()
+elif page == "Guide":          render_guide()

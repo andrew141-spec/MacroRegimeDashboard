@@ -159,7 +159,6 @@ def render_dashboard():
     chain_df, spot, gex_source = get_gex_from_yfinance(gex_symbol)
     if chain_df is not None:
         gex_state = build_gamma_state(chain_df, spot, gex_source)
-        # Cache the last good state for use when market is closed
         st.session_state["_last_good_gex"] = {
             "state": gex_state,
             "spot":  spot,
@@ -167,7 +166,6 @@ def render_dashboard():
         }
         gex_stale = False
     else:
-        # Try to use last known good state
         cached = st.session_state.get("_last_good_gex")
         if cached:
             gex_state = cached["state"]
@@ -176,6 +174,28 @@ def render_dashboard():
         else:
             gex_state = GammaState(data_source="unavailable", timestamp=dt.datetime.now().strftime("%H:%M:%S"))
             gex_stale = False
+
+    # ── GEX debug (remove once working) ──────────────────────────────────
+    with st.expander("🔧 GEX Debug", expanded=False):
+        st.write(f"**Symbol:** {gex_symbol}")
+        st.write(f"**chain_df:** {'DataFrame shape ' + str(chain_df.shape) if chain_df is not None else 'None'}")
+        st.write(f"**spot:** {spot}")
+        st.write(f"**gex_source:** {gex_source}")
+        st.write(f"**gex_state.data_source:** {gex_state.data_source}")
+        st.write(f"**gex_state.regime:** {gex_state.regime}")
+        st.write(f"**gamma_flip:** {gex_state.gamma_flip}")
+        st.write(f"**total_gex:** {gex_state.total_gex}")
+        # Try a direct yfinance call and show raw result
+        import yfinance as _yf
+        try:
+            _t = _yf.Ticker(gex_symbol)
+            _exps = _t.options
+            st.write(f"**ticker.options:** {_exps[:5] if _exps else 'EMPTY'}")
+            _hist = _t.history(period="2d")
+            st.write(f"**ticker.history tail:**")
+            st.dataframe(_hist.tail(2))
+        except Exception as _e:
+            st.write(f"**Direct yfinance error:** {_e}")
 
     # ── LEADING + PROB ──
     leading = compute_leading_stack(

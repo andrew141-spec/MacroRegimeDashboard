@@ -146,8 +146,23 @@ def render_dashboard():
     chain_df, spot, gex_source = get_gex_from_yfinance(gex_symbol)
     if chain_df is not None:
         gex_state = build_gamma_state(chain_df, spot, gex_source)
+        # Cache the last good state for use when market is closed
+        st.session_state["_last_good_gex"] = {
+            "state": gex_state,
+            "spot":  spot,
+            "saved_at": dt.datetime.now().strftime("%a %b %d %H:%M ET"),
+        }
+        gex_stale = False
     else:
-        gex_state = GammaState(data_source="unavailable", timestamp=dt.datetime.now().strftime("%H:%M:%S"))
+        # Try to use last known good state
+        cached = st.session_state.get("_last_good_gex")
+        if cached:
+            gex_state = cached["state"]
+            spot      = cached["spot"]
+            gex_stale = cached["saved_at"]
+        else:
+            gex_state = GammaState(data_source="unavailable", timestamp=dt.datetime.now().strftime("%H:%M:%S"))
+            gex_stale = False
 
     # ── LEADING + PROB ──
     leading = compute_leading_stack(
@@ -409,6 +424,15 @@ def render_dashboard():
 
         # ── GEX SNAPSHOT ──
         st.markdown(f"{sec_hdr('GAMMA EXPOSURE · ' + gex_state.regime.value + ' · ' + gex_state.timestamp)}", unsafe_allow_html=True)
+
+        if gex_stale:
+            st.markdown(f"""<div class='warn-card' style='margin-bottom:8px;'>
+              🕐 <b>LAST KNOWN GEX</b> — market closed · data from <b>{gex_stale}</b> · levels valid for context only, not live trading
+            </div>""", unsafe_allow_html=True)
+        elif gex_state.data_source == "unavailable":
+            st.markdown("""<div class='alert-card' style='margin-bottom:8px;'>
+              ⚠ <b>GEX UNAVAILABLE</b> — no options data yet · will populate once market opens and a refresh occurs
+            </div>""", unsafe_allow_html=True)
         gx1, gx2, gx3 = st.columns(3)
         with gx1:
             flip_disp = f"{gex_state.gamma_flip:.2f}" if gex_state.gamma_flip else "N/A"

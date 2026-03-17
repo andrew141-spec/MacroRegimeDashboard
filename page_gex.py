@@ -116,7 +116,7 @@ def _module3_setups(dg: DealerGreeks, gs: GammaState, spot: float,
         "active": len(cond1_met) >= 2,
         "conditions_met": cond1_met,
         "conditions_missing": cond1_mis,
-        "action": f"Fade moves away from key node ${dg.key_nodes_gex[0][0]:.0f} if present. Use outer positive nodes as range edges.",
+        "action": f"Fade moves away from key node ${dg.key_nodes_gex[0][0]:.0f} if present. Use outer positive nodes as range edges." if dg.key_nodes_gex else "Identify key node first — no significant nodes detected.",
         "note": "Avoid chasing breakouts unless outer node rapidly shrinks (magnet weakening).",
         "module": "Module 3 §1",
     })
@@ -228,8 +228,7 @@ def _module3_setups(dg: DealerGreeks, gs: GammaState, spot: float,
         "conditions_met": cond5_met,
         "conditions_missing": cond5_mis,
         "action": "Watch for catalysts (earnings, macro). IV spike forces dealers short options to sell underlying — amplifies downside. Short bias.",
-        "note": "Vanna ceiling at ${:.0f}. IV jump reverses dealer delta hedging direction aggressively.".format(
-            max((k for k, v in dg.vex_by_strike.items() if k > spot and v < 0), default=spot)),
+        "note": f"IV jump reverses dealer delta hedging direction aggressively. Vanna ceiling above spot.",
         "module": "Module 3 §5",
     })
 

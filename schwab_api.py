@@ -14,7 +14,21 @@ from scipy import stats as scipy_stats
 from scipy.stats import norm as scipy_norm
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
-from config import GammaState
+from config import GammaState, _get_secret
+
+# ── Optional dependencies ────────────────────────────────────────────────────
+try:
+    import schwab
+    SCHWAB_AVAILABLE = True
+except ImportError:
+    SCHWAB_AVAILABLE = False
+
+try:
+    from supabase import create_client as _supabase_create_client
+    SUPABASE_AVAILABLE = True
+except ImportError:
+    SUPABASE_AVAILABLE = False
+
 
 # SCHWAB API — Connection + Data Functions
 # ============================================================
@@ -45,7 +59,7 @@ def _get_supabase() -> Optional[object]:
     if not url or not key:
         return None
     try:
-        return _supa_create_client(url, key)
+        return _supabase_create_client(url, key)
     except Exception:
         return None
 

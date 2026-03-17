@@ -19,46 +19,66 @@ from utils import _to_1d, resample_ffill, yf_close
 from gex_engine import build_gamma_state
 
 def get_gex_from_yfinance(symbol="SPY") -> Tuple[Optional[pd.DataFrame], float, str]:
-    """Pull option chain from yfinance and compute GEX."""
+    """Pull option chain from yfinance and compute GEX.
+    During non-RTH hours, uses previous session's closing price as spot.
+    """
     try:
         ticker = yf.Ticker(symbol)
 
-        # ── Spot price: try multiple methods robustly ──────────────────────
-        # yfinance .info is unreliable; fall back to fast_info then history
+        # ── Determine if market is currently open ─────────────────────────
+        now_et = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=4)
+        h, m = now_et.hour, now_et.minute
+        total_mins = h * 60 + m
+        is_weekday = now_et.weekday() < 5
+        rth_open   = is_weekday and (9*60+30) <= total_mins < (16*60)
+        market_open = rth_open
+
+        # ── Spot price ────────────────────────────────────────────────────
         spot = None
-        try:
-            fi = ticker.fast_info
-            spot = float(fi.last_price or fi.previous_close or 0) or None
-        except Exception:
-            pass
-        if not spot:
+
+        if market_open:
+            # Live price during RTH
             try:
-                info = ticker.info
-                spot = float(info.get("regularMarketPrice") or
-                             info.get("currentPrice") or
-                             info.get("previousClose") or 0) or None
+                fi = ticker.fast_info
+                spot = float(fi.last_price or fi.previous_close or 0) or None
             except Exception:
                 pass
+            if not spot:
+                try:
+                    info = ticker.info
+                    spot = float(info.get("regularMarketPrice") or
+                                 info.get("currentPrice") or
+                                 info.get("previousClose") or 0) or None
+                except Exception:
+                    pass
+
+        # During non-RTH (or as fallback), use last closing price from history
         if not spot:
             try:
-                hist = ticker.history(period="2d")
+                hist = ticker.history(period="5d")
                 if not hist.empty:
                     spot = float(hist["Close"].iloc[-1])
             except Exception:
                 pass
+
         if not spot:
             spot = 580.0  # last-resort fallback
 
-        # ── Options chain ──────────────────────────────────────────────────
+        source_label = "yfinance (live)" if market_open else "yfinance (prev close)"
+
+        # ── Options chain ─────────────────────────────────────────────────
+        # yfinance always returns the last known EOD chain regardless of
+        # market hours — this is exactly what we want for non-RTH GEX context
         exps = ticker.options
         if not exps:
-            return None, float(spot), "yfinance (no options)"
+            return None, float(spot), f"{source_label} (no options)"
 
         rows = []
         today = dt.date.today()
         for exp in exps[:3]:
             try:
                 exp_dt = dt.datetime.strptime(exp, "%Y-%m-%d").date()
+                # Use minimum 1-day T to avoid near-zero gamma explosion
                 T = max((exp_dt - today).days / 365.0, 1/365)
                 chain = ticker.option_chain(exp)
                 calls = chain.calls[["strike","impliedVolatility","openInterest"]].copy()
@@ -76,18 +96,18 @@ def get_gex_from_yfinance(symbol="SPY") -> Tuple[Optional[pd.DataFrame], float, 
                 pass
 
         if not rows:
-            return None, float(spot), "yfinance (chain error)"
+            return None, float(spot), f"{source_label} (chain error)"
 
         full = pd.concat(rows, ignore_index=True)
         # Near-the-money filter
         full = full[(full["strike"] > spot * 0.88) & (full["strike"] < spot * 1.12)]
         if full.empty:
-            return None, float(spot), "yfinance (no NTM strikes)"
+            return None, float(spot), f"{source_label} (no NTM strikes)"
 
         agg = full.groupby(["strike","expiry_T"]).agg(
             iv=("iv","mean"), call_oi=("call_oi","sum"), put_oi=("put_oi","sum")
         ).reset_index()
-        return agg, float(spot), "yfinance"
+        return agg, float(spot), source_label
     except Exception as e:
         return None, 580.0, f"error: {e}"
 

@@ -459,3 +459,23 @@ def regime_transition_prob(
 # ============================================================
 # DRIVER ALERTS
 # ============================================================
+
+
+def driver_alerts(prev: dict, now: dict) -> list:
+    """Compare prev and now state dicts, return list of alert strings."""
+    alerts = []
+    thresholds = {
+        "Fear": 8, "Three Puts": 8, "Liquidity Anxiety": 10,
+        "Exhaustion": 10, "Market Index": 12, "Bull Prob": 8,
+    }
+    for k, thr in thresholds.items():
+        if k in prev and k in now:
+            import numpy as np
+            if np.isfinite(prev.get(k, float("nan"))) and np.isfinite(now.get(k, float("nan"))):
+                d = now[k] - prev[k]
+                if abs(d) >= thr:
+                    alerts.append(f"{'↑' if d > 0 else '↓'} {k}: {d:+.1f} (thr {thr:.0f})")
+    for k in ["Risk Regime","Macro Regime","Bubble","Stealth QE","Section","Overall","GEX Regime"]:
+        if k in prev and k in now and prev[k] != now[k]:
+            alerts.append(f"⚡ STATE CHANGE → {k}: {prev[k]} ▶ {now[k]}")
+    return alerts[:12]

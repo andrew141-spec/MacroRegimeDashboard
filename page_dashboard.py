@@ -29,16 +29,29 @@ from page_wim import render_world_intelligence_monitor
 def render_dashboard():
     """Main integrated dashboard."""
     st.markdown(CSS, unsafe_allow_html=True)
+
+    # ── Persist user inputs across full page reloads via query params ──────
+    qp = st.query_params
+    def _qp(key, default):
+        v = qp.get(key)
+        return v if v is not None else default
+
     st.sidebar.markdown("### Controls")
     start = st.sidebar.date_input("Start", value=dt.date.today()-dt.timedelta(days=730), key="dash_start")
     end   = st.sidebar.date_input("End",   value=dt.date.today(), key="dash_end")
-    ticker_tile = st.sidebar.text_input("Ticker Tile", "QQQ", key="dash_ticker").upper().strip()
-    cpi_thresh  = st.sidebar.number_input("Core CPI cut threshold", 3.0, step=0.1, key="dash_cpi_thresh")
-    gex_symbol  = st.sidebar.text_input("GEX Symbol", "SPY", key="dash_gex_symbol")
+    ticker_tile = st.sidebar.text_input("Ticker Tile", _qp("ticker", "QQQ"), key="dash_ticker").upper().strip()
+    cpi_thresh  = st.sidebar.number_input("Core CPI cut threshold", float(_qp("cpi", "3.0")), step=0.1, key="dash_cpi_thresh")
+    gex_symbol  = st.sidebar.text_input("GEX Symbol", _qp("gex", "SPY"), key="dash_gex_symbol").upper().strip()
     st.sidebar.markdown("---")
     st.sidebar.markdown("### Live Feed")
     live_enabled = st.sidebar.toggle("Auto refresh", True, key="dash_live_enabled")
     refresh_sec  = int(st.sidebar.slider("Refresh (s)", 30, 300, 90, 15, key="dash_refresh_sec"))
+
+    # Write current values into URL so they survive the next reload
+    qp["ticker"] = ticker_tile
+    qp["gex"]    = gex_symbol
+    qp["cpi"]    = str(round(cpi_thresh, 2))
+
     autorefresh_js(refresh_sec, live_enabled)
 
     idx = pd.date_range(start, end, freq="D")

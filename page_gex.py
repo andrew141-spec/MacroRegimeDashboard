@@ -347,7 +347,24 @@ def render_gex_engine():
             chain_df, spot, source = get_gex_from_yfinance(symbol)
 
     if chain_df is None or len(chain_df) == 0:
-        st.error("No options data available. Check symbol or try again.")
+        st.error(f"No options data available. Source returned: `{source}`")
+        with st.expander("🔧 Debug Info", expanded=True):
+            st.write(f"**Symbol:** {symbol}")
+            st.write(f"**chain_df:** {'None' if chain_df is None else f'Empty DataFrame ({len(chain_df)} rows)'}")
+            st.write(f"**spot:** {spot}")
+            st.write(f"**source:** {source}")
+            try:
+                import yfinance as _yf
+                _t = _yf.Ticker(symbol)
+                _exps = _t.options
+                st.write(f"**ticker.options:** {_exps[:5] if _exps else 'EMPTY LIST'}")
+                _h = _t.history(period="5d")
+                st.write("**ticker.history (last 2 rows):**")
+                st.dataframe(_h.tail(2))
+                _fi = _t.fast_info
+                st.write(f"**fast_info.last_price:** {_fi.last_price}")
+            except Exception as _e:
+                st.write(f"**Direct yfinance error:** {type(_e).__name__}: {_e}")
         return
 
     # ── Compute all Greeks ────────────────────────────────────────────────

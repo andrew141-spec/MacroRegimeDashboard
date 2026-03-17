@@ -6,8 +6,18 @@
 
 import streamlit as st
 
-# config must be imported first — calls st.set_page_config()
-from config import page
+# config must be imported first — calls st.set_page_config() and injects CSS
+from config import CSS
+st.markdown(CSS, unsafe_allow_html=True)
+
+# ── Sidebar navigation ───────────────────────────────────────────────────────
+st.sidebar.markdown("## ⚡ Quant Dashboard")
+page = st.sidebar.radio(
+    "Module",
+    ["Dashboard", "GEX Engine", "Trade Setups", "Execution", "Probability Engine", "Schwab/TOS", "Guide"],
+    index=0
+)
+st.sidebar.markdown("---")
 
 from page_dashboard  import render_dashboard
 from page_wim        import render_world_intelligence_monitor

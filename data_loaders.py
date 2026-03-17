@@ -1,3 +1,4 @@
+# data_loaders.py — FRED, yfinance, options chain data fetching
 import os, re, time, math, datetime as dt, json, tempfile
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
@@ -17,88 +18,16 @@ from config import _get_secret, GammaState
 from utils import _to_1d, resample_ffill, yf_close
 from gex_engine import build_gamma_state
 
-# ── Disk cache for GEX chain — persists across Streamlit reloads ─────────────
-_GEX_CACHE_DIR = tempfile.gettempdir()
-
-def _gex_cache_path(symbol: str) -> str:
-    return os.path.join(_GEX_CACHE_DIR, f"gex_chain_{symbol.upper()}.json")
-
-def _save_gex_cache(symbol: str, chain_records: list, spot: float, source: str):
-    try:
-        payload = {
-            "chain": chain_records,
-            "spot": spot,
-            "source": source,
-            "saved_at": dt.datetime.now().isoformat(),
-        }
-        with open(_gex_cache_path(symbol), "w") as f:
-            json.dump(payload, f)
-    except Exception:
-        pass
-
-def _load_gex_cache(symbol: str) -> Tuple[Optional[pd.DataFrame], float, str]:
-    """Load cached chain. Returns (None, 0, '') if missing or too old (>24h)."""
-    try:
-        path = _gex_cache_path(symbol)
-        if not os.path.exists(path):
-            return None, 0.0, ""
-        with open(path, "r") as f:
-            payload = json.load(f)
-        saved_at = dt.datetime.fromisoformat(payload["saved_at"])
-        age_hours = (dt.datetime.now() - saved_at).total_seconds() / 3600
-        if age_hours > 24:
-            return None, 0.0, ""
-        chain = pd.DataFrame(payload["chain"])
-        if chain.empty:
-            return None, 0.0, ""
-        saved_str = saved_at.strftime("%a %b %d %H:%M")
-        return chain, float(payload["spot"]), f"cached (EOD {saved_str})"
-    except Exception:
-        return None, 0.0, ""
-
-
 def get_gex_from_yfinance(symbol="SPY") -> Tuple[Optional[pd.DataFrame], float, str]:
-    """Pull option chain from yfinance and compute GEX.
-    Always attempts a live fetch first — yfinance returns EOD chain even
-    outside RTH. Falls back to disk cache if fetch fails or returns empty.
-    """
+    """Pull option chain from yfinance and compute GEX."""
     try:
         ticker = yf.Ticker(symbol)
-
-        # ── Detect RTH for source labelling only ──────────────────────────
-        now_et = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=4)
-        total_mins = now_et.hour * 60 + now_et.minute
-        market_open = (now_et.weekday() < 5) and (9*60+30) <= total_mins < (16*60)
-
-        # ── Spot price — always use history as most reliable method ───────
-        spot = None
-        try:
-            hist = ticker.history(period="5d")
-            if not hist.empty:
-                spot = float(hist["Close"].iloc[-1])
-        except Exception:
-            pass
-        if not spot:
-            try:
-                fi = ticker.fast_info
-                spot = float(fi.last_price or fi.previous_close or 0) or None
-            except Exception:
-                pass
-        if not spot:
-            spot = 580.0
-
-        source_label = "yfinance (live)" if market_open else "yfinance (EOD)"
-
-        # ── Options chain — always attempt fetch ──────────────────────────
+        spot = ticker.info.get("regularMarketPrice") or ticker.info.get("previousClose") or 580.0
+        exps = ticker.options
+        if not exps: return None, float(spot), "yfinance (no options)"
         rows = []
         today = dt.date.today()
-        exps = []
-        try:
-            exps = ticker.options or []
-        except Exception:
-            pass
-
-        for exp in exps[:3]:
+        for exp in exps[:10]:  # 10 expirations for OTM anchor / weekly bias coverage
             try:
                 exp_dt = dt.datetime.strptime(exp, "%Y-%m-%d").date()
                 T = max((exp_dt - today).days / 365.0, 1/365)
@@ -114,30 +43,16 @@ def get_gex_from_yfinance(symbol="SPY") -> Tuple[Optional[pd.DataFrame], float, 
                     df_leg["iv"] = df_leg["iv"].fillna(0.20).clip(0.05, 5.0)
                     df_leg[["call_oi","put_oi"]] = df_leg[["call_oi","put_oi"]].fillna(0).astype(int)
                     rows.append(df_leg)
-            except:
-                pass
-
-        if rows:
-            full = pd.concat(rows, ignore_index=True)
-            full = full[(full["strike"] > spot * 0.88) & (full["strike"] < spot * 1.12)]
-            if not full.empty:
-                agg = full.groupby(["strike","expiry_T"]).agg(
-                    iv=("iv","mean"), call_oi=("call_oi","sum"), put_oi=("put_oi","sum")
-                ).reset_index()
-                _save_gex_cache(symbol, agg.to_dict("records"), spot, source_label)
-                return agg, float(spot), source_label
-
-        # ── Fetch returned nothing — load disk cache ──────────────────────
-        cached_chain, cached_spot, cached_label = _load_gex_cache(symbol)
-        if cached_chain is not None:
-            return cached_chain, float(spot), cached_label  # fresh spot, cached chain
-
-        return None, float(spot), "no options data"
-
+            except: pass
+        if not rows: return None, float(spot), "yfinance (chain error)"
+        full = pd.concat(rows, ignore_index=True)
+        # Near-the-money filter
+        full = full[(full["strike"] > spot * 0.88) & (full["strike"] < spot * 1.12)]
+        agg = full.groupby(["strike","expiry_T"]).agg(
+            iv=("iv","mean"), call_oi=("call_oi","sum"), put_oi=("put_oi","sum")
+        ).reset_index()
+        return agg, float(spot), "yfinance"
     except Exception as e:
-        cached_chain, cached_spot, cached_label = _load_gex_cache(symbol)
-        if cached_chain is not None:
-            return cached_chain, cached_spot, cached_label
         return None, 580.0, f"error: {e}"
 
 # ============================================================

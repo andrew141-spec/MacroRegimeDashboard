@@ -264,13 +264,3 @@ Standard practice: use 25-50% of Kelly fraction to account for estimation error.
 """)
 
 
-# ============================================================
-# ROUTER
-# ============================================================
-if page == "Dashboard":        render_dashboard()
-elif page == "GEX Engine":     render_gex_engine()
-elif page == "Trade Setups":   render_setups_page()
-elif page == "Execution":      render_execution_page()
-elif page == "Probability Engine": render_probability_page()
-elif page == "Schwab/TOS":     render_schwab_page()
-elif page == "Guide":          render_guide()

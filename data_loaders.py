@@ -14,8 +14,8 @@ from scipy import stats as scipy_stats
 from scipy.stats import norm as scipy_norm
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
-from config import GammaState
-from utils import _to_1d, resample_ffill, yf_close, _get_secret
+from config import _get_secret, GammaState
+from utils import _to_1d, resample_ffill, yf_close
 from gex_engine import build_gamma_state
 
 def get_gex_from_yfinance(symbol="SPY") -> Tuple[Optional[pd.DataFrame], float, str]:

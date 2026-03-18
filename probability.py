@@ -1,21 +1,27 @@
 # probability.py — probability composite, session context, setups, regime
-import math, datetime as dt
+import os, re, time, math, datetime as dt, json, tempfile
+from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 from enum import Enum
 import numpy as np
 import pandas as pd
 import streamlit as st
+import plotly.graph_objects as go
+import plotly.express as px
+import yfinance as yf
+from fredapi import Fred
+from scipy import stats as scipy_stats
+from scipy.stats import norm as scipy_norm
+from urllib.request import Request, urlopen
+import xml.etree.ElementTree as ET
 from config import GammaState, GammaRegime, SetupScore
 from utils import _to_1d, kelly, current_pct_rank
 
-def compute_prob_composite(leading, fear_score, geo_shock, regime_change_p,
+def compute_prob_composite(leading, fear_score, three_puts_score, liq_anxiety,
+                            exhaustion, market_index, geo_shock, regime_change_p,
                             gex_state: GammaState,
                             nfci_coincident: float = 50.0,
                             liq_dir_coincident: float = 50.0) -> Dict:
-    # NOTE: three_puts_score, liq_anxiety, exhaustion, market_index removed from
-    # signature — they shared underlying yield curve data with signals already in
-    # the short/medium buckets, making the effective signal count ~2 not 5.
-    # They are still computed in render_dashboard and displayed as CONTEXT ONLY.
     """
     Three-horizon probability composite — separating signals by forecast window.
 
@@ -194,6 +200,99 @@ def compute_prob_composite(leading, fear_score, geo_shock, regime_change_p,
     }
 
 # ============================================================
+# ECONOMIC CALENDAR
+# ============================================================
+
+# FOMC meeting dates (decision day = second day of 2-day meeting)
+# Updated through end of 2026. Add new dates as Fed publishes schedule.
+_FOMC_DATES = {
+    # 2024
+    "2024-01-31","2024-03-20","2024-05-01","2024-06-12",
+    "2024-07-31","2024-09-18","2024-11-07","2024-12-18",
+    # 2025
+    "2025-01-29","2025-03-19","2025-05-07","2025-06-18",
+    "2025-07-30","2025-09-17","2025-10-29","2025-12-17",
+    # 2026
+    "2026-01-28","2026-03-18","2026-04-29","2026-06-17",
+    "2026-07-29","2026-09-16","2026-10-28","2026-12-16",
+}
+
+# CPI release dates (BLS releases ~13th of following month)
+# These are approximate — BLS announces exact dates ~1 year ahead.
+_CPI_DATES = {
+    # 2025
+    "2025-01-15","2025-02-12","2025-03-12","2025-04-10",
+    "2025-05-13","2025-06-11","2025-07-11","2025-08-13",
+    "2025-09-10","2025-10-15","2025-11-13","2025-12-10",
+    # 2026
+    "2026-01-14","2026-02-11","2026-03-11","2026-04-09",
+    "2026-05-13","2026-06-10","2026-07-09","2026-08-12",
+    "2026-09-09","2026-10-14","2026-11-12","2026-12-09",
+}
+
+# NFP / Jobs report (BLS, first Friday of each month)
+_NFP_DATES = {
+    # 2025
+    "2025-01-10","2025-02-07","2025-03-07","2025-04-04",
+    "2025-05-02","2025-06-06","2025-07-03","2025-08-01",
+    "2025-09-05","2025-10-03","2025-11-07","2025-12-05",
+    # 2026
+    "2026-01-09","2026-02-06","2026-03-06","2026-04-03",
+    "2026-05-08","2026-06-05","2026-07-02","2026-08-07",
+    "2026-09-04","2026-10-02","2026-11-06","2026-12-04",
+}
+
+# PCE / Core PCE (BEA, ~last business day of following month)
+_PCE_DATES = {
+    # 2025
+    "2025-01-31","2025-02-28","2025-03-28","2025-04-30",
+    "2025-05-30","2025-06-27","2025-07-31","2025-08-29",
+    "2025-09-26","2025-10-31","2025-11-26","2025-12-19",
+    # 2026
+    "2026-01-30","2026-02-27","2026-03-27","2026-04-30",
+    "2026-05-29","2026-06-26","2026-07-31","2026-08-28",
+    "2026-09-25","2026-10-30","2026-11-25","2026-12-18",
+}
+
+# GDP advance estimate (BEA, ~last Wednesday of month following quarter end)
+_GDP_DATES = {
+    "2025-01-29","2025-04-30","2025-07-30","2025-10-29",
+    "2026-01-28","2026-04-29","2026-07-29","2026-10-28",
+}
+
+_ALL_DATA_DAYS = _FOMC_DATES | _CPI_DATES | _NFP_DATES | _PCE_DATES | _GDP_DATES
+
+
+def get_calendar_context(date: dt.date = None) -> Dict:
+    """
+    Return what economic events are scheduled today (or on the given date).
+    Used to set is_data_day and event_type in session context.
+    """
+    d = date or dt.date.today()
+    d_str = d.isoformat()
+
+    events = []
+    if d_str in _FOMC_DATES: events.append("FOMC")
+    if d_str in _CPI_DATES:  events.append("CPI")
+    if d_str in _NFP_DATES:  events.append("NFP")
+    if d_str in _PCE_DATES:  events.append("PCE")
+    if d_str in _GDP_DATES:  events.append("GDP")
+
+    is_data_day = len(events) > 0
+    is_fomc     = "FOMC" in events
+    # FOMC days get extra penalty: entire session is event-driven
+    size_penalty = 0.5 if is_fomc else (0.75 if is_data_day else 1.0)
+
+    return {
+        "is_data_day":  is_data_day,
+        "is_fomc":      is_fomc,
+        "events":       events,
+        "event_label":  " + ".join(events) if events else "",
+        "size_penalty": size_penalty,   # multiply onto session size_mult
+    }
+
+
+# ============================================================
 # SESSION CONTEXT
 # ============================================================
 def get_session_context() -> Dict:
@@ -215,17 +314,31 @@ def get_session_context() -> Dict:
     for start_m, end_m, name, liq, mult, note in sessions:
         if start_m <= total_mins < end_m:
             is_opex_friday = (weekday == 4)
-            is_data_day = False  # Could extend with calendar API
+            cal = get_calendar_context(now_et.date())
+            is_data_day   = cal["is_data_day"]
+            # Reduce size mult on high-impact data days
+            effective_mult = mult * cal["size_penalty"]
+            event_note = f" · ⚠ {cal['event_label']} TODAY" if is_data_day else ""
             return {
-                "window": name, "liquidity": liq, "size_mult": mult,
-                "note": note, "time_et": now_et.strftime("%H:%M ET"),
+                "window": name, "liquidity": liq,
+                "size_mult": effective_mult,
+                "size_mult_base": mult,
+                "note": note + event_note,
+                "time_et": now_et.strftime("%H:%M ET"),
                 "is_opex_friday": is_opex_friday,
                 "is_data_day": is_data_day,
+                "is_fomc": cal["is_fomc"],
+                "events": cal["events"],
+                "event_label": cal["event_label"],
                 "prime_time": name == "Morning",
             }
+    cal = get_calendar_context()
     return {"window": "Unknown", "liquidity": "Unknown", "size_mult": 0.5,
-            "note": "Cannot determine session", "time_et": now_et.strftime("%H:%M ET"),
-            "is_opex_friday": False, "is_data_day": False, "prime_time": False}
+            "size_mult_base": 0.5, "note": "Cannot determine session",
+            "time_et": now_et.strftime("%H:%M ET"),
+            "is_opex_friday": False, "is_data_day": cal["is_data_day"],
+            "is_fomc": cal["is_fomc"], "events": cal["events"],
+            "event_label": cal["event_label"], "prime_time": False}
 
 # ============================================================
 # TRADE SETUP EVALUATOR (5 setups from note 07)

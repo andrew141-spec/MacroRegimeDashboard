@@ -804,3 +804,4 @@ def render_setups_page():
                 "Rec. Risk%": f"{min(f_star/2*100, 15):.0f}%",
             })
         st.dataframe(pd.DataFrame(kelly_data), hide_index=True, use_container_width=True)
+  

@@ -66,7 +66,7 @@ def _fetch_with_retry(fn, retries=3, delay=2):
     return None, "max retries exceeded"
 
 
-@st.cache_data(ttl=60)   # short TTL — GEX page controls refresh interval via sidebar
+@st.cache_data(ttl=1800)
 def get_gex_from_yfinance(symbol="SPY") -> Tuple[Optional[pd.DataFrame], float, str]:
     """Pull option chain from yfinance. Retries on rate limits, falls back to disk cache."""
     today = dt.date.today()
@@ -197,6 +197,13 @@ def load_macro(start_iso, end_iso):
     # GDPC1: quarterly real GDP, will be interpolated to daily
     try:    out["GDPC1"] = fs("GDPC1")
     except: out["GDPC1"] = pd.Series(dtype=float)
+
+    # ── NEW: HY Credit Spread (ICE BofA HY OAS) ──────────────────────────
+    # BAMLH0A0HYM2: the level of HY spreads matters for cycle positioning.
+    # <300bp = complacency | 300-600bp = normal | 600-1000bp = recession pricing
+    # >1000bp = systemic stress. The HYG/LQD momentum ratio misses this.
+    try:    out["BAMLH0A0HYM2"] = fs("BAMLH0A0HYM2")
+    except: out["BAMLH0A0HYM2"] = pd.Series(dtype=float)
 
     # ── Market series (keep + no change) ─────────────────────────────────
     idx = pd.date_range(start, end, freq="D")

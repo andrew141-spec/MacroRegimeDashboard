@@ -18,24 +18,97 @@ from config import _get_secret, GammaState
 from utils import _to_1d, resample_ffill, yf_close
 from gex_engine import build_gamma_state
 
+# ── Disk cache for GEX chain — survives rate limits and Streamlit reloads ────
+_GEX_CACHE_DIR = tempfile.gettempdir()
+
+def _gex_cache_path(symbol: str) -> str:
+    return os.path.join(_GEX_CACHE_DIR, f"gex_chain_{symbol.upper()}.json")
+
+def _save_gex_cache(symbol: str, records: list, spot: float, source: str):
+    try:
+        with open(_gex_cache_path(symbol), "w") as f:
+            json.dump({"chain": records, "spot": spot, "source": source,
+                       "saved_at": dt.datetime.now().isoformat()}, f)
+    except Exception:
+        pass
+
+def _load_gex_cache(symbol: str) -> Tuple[Optional[pd.DataFrame], float, str]:
+    try:
+        path = _gex_cache_path(symbol)
+        if not os.path.exists(path):
+            return None, 0.0, ""
+        with open(path) as f:
+            p = json.load(f)
+        age_h = (dt.datetime.now() - dt.datetime.fromisoformat(p["saved_at"])).total_seconds() / 3600
+        if age_h > 24:
+            return None, 0.0, ""
+        chain = pd.DataFrame(p["chain"])
+        if chain.empty:
+            return None, 0.0, ""
+        saved = dt.datetime.fromisoformat(p["saved_at"]).strftime("%a %b %d %H:%M")
+        return chain, float(p["spot"]), f"cached (EOD {saved})"
+    except Exception:
+        return None, 0.0, ""
+
+
+def _fetch_with_retry(fn, retries=3, delay=2):
+    """Call fn() with retries on rate limit errors."""
+    for attempt in range(retries):
+        try:
+            return fn(), None
+        except Exception as e:
+            err = str(e)
+            if "Too Many Requests" in err or "Rate" in err or "429" in err:
+                if attempt < retries - 1:
+                    time.sleep(delay * (attempt + 1))
+                    continue
+            return None, err
+    return None, "max retries exceeded"
+
+
+@st.cache_data(ttl=1800)
 def get_gex_from_yfinance(symbol="SPY") -> Tuple[Optional[pd.DataFrame], float, str]:
-    """Pull option chain from yfinance and compute GEX."""
+    """Pull option chain from yfinance. Retries on rate limits, falls back to disk cache."""
+    today = dt.date.today()
+    now_et = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=4)
+    total_mins = now_et.hour * 60 + now_et.minute
+    market_open = (now_et.weekday() < 5) and (9*60+30) <= total_mins < (16*60)
+
     try:
         ticker = yf.Ticker(symbol)
-        spot = ticker.info.get("regularMarketPrice") or ticker.info.get("previousClose") or 580.0
-        exps = ticker.options
-        if not exps: return None, float(spot), "yfinance (no options)"
+
+        # ── Spot price ────────────────────────────────────────────────────
+        spot = None
+        hist_result, hist_err = _fetch_with_retry(lambda: ticker.history(period="5d"))
+        if hist_result is not None and not hist_result.empty:
+            spot = float(hist_result["Close"].iloc[-1])
+        if not spot:
+            try:
+                fi = ticker.fast_info
+                spot = float(fi.last_price or fi.previous_close or 0) or None
+            except Exception:
+                pass
+        if not spot:
+            spot = 580.0
+
+        source_label = "yfinance (live)" if market_open else "yfinance (EOD)"
+
+        # ── Options chain with retry ──────────────────────────────────────
+        exps_result, exps_err = _fetch_with_retry(lambda: ticker.options)
+        exps = exps_result or []
+
         rows = []
-        today = dt.date.today()
-        for exp in exps[:10]:  # 10 expirations for OTM anchor / weekly bias coverage
+        for exp in exps[:10]:
             try:
                 exp_dt = dt.datetime.strptime(exp, "%Y-%m-%d").date()
                 T = max((exp_dt - today).days / 365.0, 1/365)
-                chain = ticker.option_chain(exp)
-                calls = chain.calls[["strike","impliedVolatility","openInterest"]].copy()
+                chain_result, _ = _fetch_with_retry(lambda e=exp: ticker.option_chain(e), retries=2, delay=1)
+                if chain_result is None:
+                    continue
+                calls = chain_result.calls[["strike","impliedVolatility","openInterest"]].copy()
                 calls.columns = ["strike","iv","call_oi"]
                 calls["put_oi"] = 0
-                puts  = chain.puts[["strike","impliedVolatility","openInterest"]].copy()
+                puts  = chain_result.puts[["strike","impliedVolatility","openInterest"]].copy()
                 puts.columns = ["strike","iv","put_oi"]
                 puts["call_oi"] = 0
                 for df_leg in [calls, puts]:
@@ -43,16 +116,31 @@ def get_gex_from_yfinance(symbol="SPY") -> Tuple[Optional[pd.DataFrame], float, 
                     df_leg["iv"] = df_leg["iv"].fillna(0.20).clip(0.05, 5.0)
                     df_leg[["call_oi","put_oi"]] = df_leg[["call_oi","put_oi"]].fillna(0).astype(int)
                     rows.append(df_leg)
-            except: pass
-        if not rows: return None, float(spot), "yfinance (chain error)"
-        full = pd.concat(rows, ignore_index=True)
-        # Near-the-money filter
-        full = full[(full["strike"] > spot * 0.88) & (full["strike"] < spot * 1.12)]
-        agg = full.groupby(["strike","expiry_T"]).agg(
-            iv=("iv","mean"), call_oi=("call_oi","sum"), put_oi=("put_oi","sum")
-        ).reset_index()
-        return agg, float(spot), "yfinance"
+            except Exception:
+                pass
+
+        if rows:
+            full = pd.concat(rows, ignore_index=True)
+            full = full[(full["strike"] > spot * 0.88) & (full["strike"] < spot * 1.12)]
+            if not full.empty:
+                agg = full.groupby(["strike","expiry_T"]).agg(
+                    iv=("iv","mean"), call_oi=("call_oi","sum"), put_oi=("put_oi","sum")
+                ).reset_index()
+                _save_gex_cache(symbol, agg.to_dict("records"), spot, source_label)
+                return agg, float(spot), source_label
+
+        # ── Rate limited or empty — use disk cache ────────────────────────
+        cached_chain, cached_spot, cached_label = _load_gex_cache(symbol)
+        if cached_chain is not None:
+            return cached_chain, float(spot), cached_label
+
+        err_detail = exps_err or hist_err or "empty chain"
+        return None, float(spot), f"no data ({err_detail})"
+
     except Exception as e:
+        cached_chain, cached_spot, cached_label = _load_gex_cache(symbol)
+        if cached_chain is not None:
+            return cached_chain, cached_spot, cached_label
         return None, 580.0, f"error: {e}"
 
 # ============================================================

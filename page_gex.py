@@ -202,24 +202,30 @@ def _module3_setups(dg: DealerGreeks, gs: GammaState, spot: float,
         "active": len(cond4_met) >= 2,
         "conditions_met": cond4_met,
         "conditions_missing": cond4_mis,
-        "action": "Look for consolidation with positive vanna band. Once IV compresses, look for upside break targeting next largest node.",
-        "note": "Rising spot + falling IV both reduce put deltas — dealers amplify upside. Post-event (earnings/FOMC) ideal.",
+        "action": "Positive vanna + elevated IV = self-reinforcing squeeze. IV drops → call deltas rise → dealers BUY → price rallies → IV drops further. Look for accumulation below positive GEX node. Target: next largest positive GEX level.",
+        "note": "Most powerful post-event (FOMC/earnings): uncertainty resolves → IV crushes → dealers buy. Feedback loop: falling IV forces dealer buying which further reduces IV.",
         "module": "Module 3 §4",
     })
 
     # ── 5. Vanna Rug / Vol Shock ──────────────────────────────────────────
-    neg_vanna_above = sum(v for k, v in dg.vex_by_strike.items() if k > spot and v < 0)
-    iv_compressed   = vix_level < 18
+    # Per notes: negative vanna NEAR spot (ITM/ATM) + IV compressed + catalyst
+    neg_vanna_ntm = sum(v for k, v in dg.vex_by_strike.items()
+                        if abs(k - spot) / spot < 0.03 and v < 0)
+    iv_compressed = vix_level < 18
     cond5_met = []
     cond5_mis = []
-    if neg_vanna_above < -50e6:
-        cond5_met.append(f"Strong negative vanna above spot (${neg_vanna_above/1e6:.0f}M) ✓")
+    if neg_vanna_ntm < -30e6:
+        cond5_met.append(f"Negative vanna near spot (${neg_vanna_ntm/1e6:.0f}M) ✓")
     else:
-        cond5_mis.append("Need negative vanna ceiling above spot ($-50M+)")
+        cond5_mis.append("Need negative vanna near/ITM spot ($-30M+)")
     if iv_compressed:
         cond5_met.append(f"IV compressed (VIX {vix_level:.1f}) — shock potential ✓")
     else:
-        cond5_mis.append(f"IV not compressed (VIX {vix_level:.1f}, need <18 for maximum effect)")
+        cond5_mis.append(f"IV not compressed enough (VIX {vix_level:.1f}, need <18)")
+    if session.get("is_data_day") or session.get("is_opex_friday"):
+        cond5_met.append("Catalyst present (data day / OpEx) ✓")
+    else:
+        cond5_mis.append("Watch for upcoming catalyst: FOMC/CPI/NFP/earnings (when IV typically spikes)")
 
     setups.append({
         "name": "Vanna Rug / Vol Shock",
@@ -227,8 +233,8 @@ def _module3_setups(dg: DealerGreeks, gs: GammaState, spot: float,
         "active": len(cond5_met) >= 2,
         "conditions_met": cond5_met,
         "conditions_missing": cond5_mis,
-        "action": "Watch for catalysts (earnings, macro). IV spike forces dealers short options to sell underlying — amplifies downside. Short bias.",
-        "note": f"IV jump reverses dealer delta hedging direction aggressively. Vanna ceiling above spot.",
+        "action": "Negative vanna + compressed IV = cascade risk on any catalyst. IV spikes → dealers short options SELL underlying → price drops → IV spikes further. Self-reinforcing selloff. Short bias or hedge BEFORE catalyst hits.",
+        "note": "Opposite of Vanna Squeeze. IV rise forces dealer selling cascade. Most dangerous: low VIX + negative vanna + known catalyst. Selloffs, fear events, macro misses all cause IV to spike.",
         "module": "Module 3 §5",
     })
 
@@ -445,24 +451,35 @@ def render_gex_engine():
         st.plotly_chart(fig_vex, use_container_width=True)
 
         v1, v2 = st.columns(2)
+        ntm_vex_val = sum(v for k,v in dg.vex_by_strike.items() if abs(k-spot)/spot < 0.02)
         with v1:
-            st.markdown(f"**Net Vanna near spot:** ${sum(v for k,v in dg.vex_by_strike.items() if abs(k-spot)/spot < 0.02)/1e6:.1f}M")
-            st.markdown(f"**Direction:** {dg.vanna_direction.upper()}")
+            st.markdown(f"**Net Vanna near spot:** ${ntm_vex_val/1e6:.1f}M")
+            st.markdown(f"**Vanna Sign:** {dg.vanna_sign.upper()}")
         with v2:
             st.markdown("**Interpretation:**")
-            if dg.vanna_direction == "bullish":
-                st.success("Positive vanna: If IV compresses → dealers forced to BUY. Bullish drift on calm tape.")
-            elif dg.vanna_direction == "bearish":
-                st.error("Negative vanna: If IV compresses → dealers forced to SELL. Bearish drift on calm tape.")
+            if dg.vanna_sign == "positive":
+                st.markdown("""
+**Positive Vanna near spot:**
+- 📈 **IV rises** → dealers forced to **BUY** underlying (bullish pressure)
+- 📉 **IV falls** → dealers forced to **SELL** underlying (bearish pressure)
+- → **Vanna Squeeze**: IV elevated + likely to compress → dealer selling phase → then upside break
+""")
+            elif dg.vanna_sign == "negative":
+                st.markdown("""
+**Negative Vanna near spot:**
+- 📈 **IV rises** → dealers forced to **SELL** underlying (bearish — amplifies selloff)
+- 📉 **IV falls** → dealers forced to **BUY** underlying (bullish on vol crush)
+- → **Vanna Rug risk**: catalyst spikes IV → dealers sell → cascading selloff
+""")
             else:
                 st.info("Neutral vanna — no strong IV-driven directional pressure.")
 
         st.markdown("""
 **VEX = Reaction to Volatility**
-- **Positive (purple)**: IV falling → dealers buy underlying → upward pressure
-- **Negative (red)**: IV falling → dealers sell underlying → downward pressure
-- **Vanna Squeeze**: High positive vanna + IV likely to compress = powerful rally setup
-- **Vanna Rug**: Negative vanna ceiling + IV spike = amplified selloff
+- **Positive vanna**: IV rises → dealers BUY · IV falls → dealers SELL
+- **Negative vanna**: IV rises → dealers SELL · IV falls → dealers BUY
+- **Vanna Squeeze**: Positive vanna + IV elevated → IV compresses → dealers forced to buy → self-reinforcing rally
+- **Vanna Rug**: Negative vanna near spot + IV compressed + catalyst → IV spikes → dealers forced to sell → cascading selloff
 """)
 
     with tab_cex:

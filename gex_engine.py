@@ -181,53 +181,142 @@ def compute_dealer_greeks(chain: pd.DataFrame, spot: float,
 
 def find_gamma_flip(chain: pd.DataFrame) -> float:
     """
-    Zero-gamma level: the spot price S* where Σᵢ(Γᵢ(S*) · OIᵢ · C · S*²) = 0.
+    Zero-gamma (gamma flip) level.
 
-    Vectorised scan: for each candidate spot price across the strike range,
-    compute total net GEX and interpolate the zero-crossing.
-    This is correct — the flip is where TOTAL exposure across ALL strikes = 0,
-    not a cumulative-sum-by-strike crossing.
+    Finds the strike where the net GEX profile crosses zero by:
+    1. Aggregating net_gex by strike (summing across expirations)
+    2. Sorting strikes
+    3. Interpolating the zero-crossing between adjacent strikes
+
+    This uses the already-computed net_gex column from compute_gex_from_chain,
+    finding where: net_gex(K_i) changes sign between adjacent strikes.
+    The interpolated zero is the gamma flip level.
     """
     if "strike" not in chain.columns or len(chain) == 0:
         return np.nan
 
-    # Pre-extract arrays for speed
-    K    = chain["strike"].values.astype(float)
-    T    = chain["expiry_T"].values.astype(float)
-    iv   = chain["iv"].values.astype(float)
-    c_oi = chain["call_oi"].values.astype(float)
-    p_oi = chain["put_oi"].values.astype(float)
-    net_oi = c_oi - p_oi   # calls positive, puts negative
+    # Aggregate by strike (sum across expirations for same strike)
+    agg = chain.groupby("strike")["net_gex"].sum().reset_index()
+    agg = agg.sort_values("strike").reset_index(drop=True)
 
-    s_min = K.min() * 0.97
-    s_max = K.max() * 1.03
-    candidates = np.linspace(s_min, s_max, 400)
+    strikes = agg["strike"].values
+    gex_vals = agg["net_gex"].values
 
-    total_gex = np.empty(len(candidates))
-    for j, s in enumerate(candidates):
-        # Vectorised BS gamma across all strikes at this spot
-        mask = (T > 0) & (iv > 0)
-        d1 = np.where(mask,
-            (np.log(s / np.where(K > 0, K, 1)) +
-             (0.05 + 0.5 * iv**2) * T) / (iv * np.sqrt(np.maximum(T, 1e-10))),
-            0.0)
-        gamma_vec = np.where(mask,
-            (1.0 / (np.sqrt(2 * math.pi)) * np.exp(-0.5 * d1**2)) /
-            (s * iv * np.sqrt(np.maximum(T, 1e-10))),
-            0.0)
-        S2 = s * s / 100.0
-        total_gex[j] = float(np.sum(net_oi * gamma_vec * 100 * S2))
+    # Find all zero crossings (sign changes between adjacent strikes)
+    signs = gex_vals[:-1] * gex_vals[1:]
+    crossings = np.where(signs < 0)[0]
 
-    signs = total_gex[:-1] * total_gex[1:]
-    idx   = np.where(signs < 0)[0]
-    if len(idx) == 0:
+    if len(crossings) == 0:
         return np.nan
-    i  = idx[0]
-    s1, s2 = candidates[i], candidates[i + 1]
-    g1, g2 = total_gex[i], total_gex[i + 1]
+
+    # Pick the zero crossing closest to the current spot (most actionable flip)
+    # We don't have spot here so use the midpoint of the strike range as proxy,
+    # but caller should pass spot — for now use the crossing with largest
+    # adjacent GEX magnitude (most dealer flow around it = most meaningful flip)
+    crossing_mids = np.array([(strikes[i] + strikes[i+1]) / 2.0 for i in crossings])
+    crossing_mag  = np.array([abs(gex_vals[i]) + abs(gex_vals[i+1]) for i in crossings])
+    best_i = crossings[np.argmax(crossing_mag)]
+
+    # Linear interpolation between the two bracketing strikes
+    s1, s2 = strikes[best_i], strikes[best_i + 1]
+    g1, g2 = gex_vals[best_i], gex_vals[best_i + 1]
     if (g2 - g1) == 0:
         return float(s1)
     return float(s1 + (s2 - s1) * (-g1) / (g2 - g1))
+
+
+def find_local_extrema(chain: pd.DataFrame) -> Dict[str, List[Tuple[float, float]]]:
+    """
+    Find local maxima and minima of the per-strike net GEX profile.
+
+    Local maxima = GEX peaks (strongest resistance walls / dealer selling zones)
+    Local minima = GEX troughs (strongest support walls / dealer amplification zones)
+    Zero crossings = gamma flip candidates
+
+    Returns dict with keys: 'maxima', 'minima', 'zero_crossings'
+    Each value is a list of (strike, net_gex) tuples sorted by abs(gex) descending.
+    """
+    if "strike" not in chain.columns or len(chain) == 0:
+        return {"maxima": [], "minima": [], "zero_crossings": []}
+
+    agg = chain.groupby("strike")["net_gex"].sum().reset_index()
+    agg = agg.sort_values("strike").reset_index(drop=True)
+    strikes = agg["strike"].values
+    gex_vals = agg["net_gex"].values
+    n = len(strikes)
+
+    maxima, minima, zero_crossings = [], [], []
+
+    for i in range(1, n - 1):
+        prev, curr, nxt = gex_vals[i-1], gex_vals[i], gex_vals[i+1]
+        if curr > prev and curr > nxt:
+            maxima.append((float(strikes[i]), float(curr)))
+        elif curr < prev and curr < nxt:
+            minima.append((float(strikes[i]), float(curr)))
+
+    # Zero crossings via interpolation
+    sign_changes = np.where(gex_vals[:-1] * gex_vals[1:] < 0)[0]
+    for i in sign_changes:
+        s1, s2 = strikes[i], strikes[i+1]
+        g1, g2 = gex_vals[i], gex_vals[i+1]
+        if (g2 - g1) != 0:
+            zc = s1 + (s2 - s1) * (-g1) / (g2 - g1)
+            zero_crossings.append((float(zc), 0.0))
+
+    # Sort by absolute GEX magnitude descending
+    maxima.sort(key=lambda x: -abs(x[1]))
+    minima.sort(key=lambda x: -abs(x[1]))
+
+    return {"maxima": maxima, "minima": minima, "zero_crossings": zero_crossings}
+
+def find_local_extrema(gex_by_strike: Dict[float, float],
+                       min_prominence: float = 0.0
+                       ) -> Tuple[List[Tuple[float,float]], List[Tuple[float,float]]]:
+    """
+    Find local maxima and minima in the per-strike GEX profile.
+    A local maximum is a strike whose GEX value is greater than both neighbours.
+    A local minimum is a strike whose GEX value is less than both neighbours.
+    Returns (maxima, minima) each as list of (strike, gex_value).
+    """
+    if len(gex_by_strike) < 3:
+        return [], []
+    strikes = sorted(gex_by_strike.keys())
+    vals    = [gex_by_strike[s] for s in strikes]
+    maxima, minima = [], []
+    for i in range(1, len(strikes) - 1):
+        v_prev, v, v_next = vals[i-1], vals[i], vals[i+1]
+        if v > v_prev and v > v_next:
+            maxima.append((strikes[i], v))
+        elif v < v_prev and v < v_next:
+            minima.append((strikes[i], v))
+    # Sort by absolute magnitude — largest effects first
+    maxima.sort(key=lambda x: abs(x[1]), reverse=True)
+    minima.sort(key=lambda x: abs(x[1]), reverse=True)
+    return maxima, minima
+
+
+def find_zero_crossings(gex_by_strike: Dict[float, float]) -> List[float]:
+    """
+    Find strikes where per-strike net GEX crosses zero (sign changes).
+    These are local transition points — where individual strike gamma
+    flips from stabilizing to destabilizing (or vice versa).
+    Distinct from the gamma flip (total GEX = 0).
+    Uses linear interpolation between adjacent strikes.
+    """
+    if len(gex_by_strike) < 2:
+        return []
+    strikes = sorted(gex_by_strike.keys())
+    vals    = [gex_by_strike[s] for s in strikes]
+    crossings = []
+    for i in range(len(strikes) - 1):
+        v1, v2 = vals[i], vals[i+1]
+        if v1 * v2 < 0:  # sign change
+            s1, s2 = strikes[i], strikes[i+1]
+            # Linear interpolation: x where v1 + (v2-v1)*(x-s1)/(s2-s1) = 0
+            x = s1 + (-v1) * (s2 - s1) / (v2 - v1)
+            crossings.append(float(x))
+    return crossings
+
 
 def classify_gex_regime(spot: float, flip: float) -> Tuple[GammaRegime, float, float]:
     if not np.isfinite(flip): return GammaRegime.NEUTRAL, 0.0, 0.5
@@ -244,15 +333,27 @@ def build_gamma_state(chain: pd.DataFrame, spot: float, source: str = "yfinance"
     gex_chain = compute_gex_from_chain(chain, spot)
     flip = find_gamma_flip(gex_chain)
     regime, dist, stability = classify_gex_regime(spot, flip)
-    by_strike = dict(zip(gex_chain["strike"].tolist(), gex_chain["net_gex"].tolist()))
+
+    # Aggregate net_gex by strike (sum across expirations)
+    by_strike_series = gex_chain.groupby("strike")["net_gex"].sum()
+    by_strike = by_strike_series.to_dict()
+
     top_support    = gex_chain[gex_chain["net_gex"] < 0].nsmallest(5, "net_gex")["strike"].tolist()
     top_resistance = gex_chain[gex_chain["net_gex"] > 0].nlargest(5, "net_gex")["strike"].tolist()
+
+    # Local structure
+    local_maxima, local_minima = find_local_extrema(by_strike)
+    zero_crossings = find_zero_crossings(by_strike)
+
     return GammaState(
         regime=regime, gamma_flip=float(flip) if np.isfinite(flip) else 0.0,
         distance_to_flip_pct=dist, total_gex=float(gex_chain["net_gex"].sum()),
         gex_by_strike=by_strike, key_support=top_support, key_resistance=top_resistance,
         regime_stability=stability, data_source=source,
         timestamp=dt.datetime.now().strftime("%H:%M:%S"),
+        local_maxima=local_maxima[:5],
+        local_minima=local_minima[:5],
+        zero_crossings=zero_crossings,
     )
 
 # ============================================================

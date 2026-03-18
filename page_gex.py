@@ -36,12 +36,84 @@ def _greek_bar_chart(by_strike: dict, spot: float, title: str,
     near    = [s for s in strikes if spot * 0.90 < s < spot * 1.10]
     vals    = [by_strike[s] / 1e6 for s in near]
     colors  = [pos_color if v > 0 else neg_color for v in vals]
-    fig = go.Figure(go.Bar(x=near, y=vals, marker_color=colors, opacity=0.85, name=title))
+
+    # Cumulative GEX across all strikes (not just NTM) — flip is where this crosses zero
+    all_strikes_sorted = sorted(by_strike.keys())
+    cum_vals = []
+    running = 0.0
+    for s in all_strikes_sorted:
+        running += by_strike[s] / 1e6
+        cum_vals.append(running)
+
+    fig = go.Figure()
+
+    # Primary: net GEX bars
+    fig.add_trace(go.Bar(
+        x=near, y=vals,
+        marker_color=colors, opacity=0.85, name="Net GEX ($M)",
+        yaxis="y1",
+    ))
+
+    # Secondary: cumulative GEX line — zero-crossing IS the gamma flip
+    # Only show the NTM window for clarity
+    near_set  = set(near)
+    cum_near_x = [s for s in all_strikes_sorted if s in near_set]
+    cum_near_y = []
+    running2 = 0.0
+    for s in all_strikes_sorted:
+        running2 += by_strike[s] / 1e6
+        if s in near_set:
+            cum_near_y.append(running2)
+
+    if cum_near_x and cum_near_y:
+        fig.add_trace(go.Scatter(
+            x=cum_near_x, y=cum_near_y,
+            mode="lines",
+            line=dict(color=_C_FLIP, width=2, dash="dot"),
+            name="Cumulative GEX",
+            yaxis="y2",
+            opacity=0.80,
+        ))
+        # Zero line on secondary axis
+        fig.add_hline(
+            y=0, line_dash="solid", line_color=_C_FLIP,
+            line_width=1, opacity=0.4,
+            annotation_text="Zero-gamma",
+            annotation_font_size=9,
+            annotation_font_color=_C_FLIP,
+        )
+
+    fig.update_layout(
+        yaxis2=dict(
+            overlaying="y", side="right",
+            showgrid=False, zeroline=False,
+            tickfont=dict(color=_C_FLIP, size=9),
+            title=dict(text="Cumulative GEX ($M)", font=dict(color=_C_FLIP, size=9)),
+        ),
+        legend=dict(orientation="h", y=1.08, font=dict(size=9)),
+        barmode="relative",
+    )
+
+    # SPOT marker
     fig.add_vline(x=spot, line_dash="dot", line_color="rgba(255,255,255,0.6)",
                   annotation_text="SPOT", annotation_font_size=10)
+
+    # FLIP marker — where cumulative GEX = 0
     if flip_level:
-        fig.add_vline(x=flip_level, line_dash="dash", line_color=_C_FLIP,
-                      annotation_text=f"FLIP {flip_level:.0f}", annotation_font_size=10)
+        fig.add_vline(
+            x=flip_level, line_dash="dash", line_color=_C_FLIP, line_width=2,
+            annotation_text=f"FLIP {flip_level:.0f} (ΣγOI=0)",
+            annotation_font_size=10,
+            annotation_font_color=_C_FLIP,
+        )
+        # Shaded flip zone (±0.3%)
+        zone = flip_level * 0.003
+        fig.add_vrect(
+            x0=flip_level - zone, x1=flip_level + zone,
+            fillcolor=_C_FLIP, opacity=0.08, layer="below",
+            line_width=0,
+        )
+
     return plotly_dark(fig, title, height)
 
 

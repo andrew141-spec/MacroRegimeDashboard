@@ -193,18 +193,28 @@ def compute_dealer_greeks(chain: pd.DataFrame, spot: float,
 
 def find_gamma_flip(chain: pd.DataFrame) -> float:
     """
-    Zero-gamma level where: Sigma_i (Gamma_i * OI_i * ContractSize * S^2) = 0
-    Linearly interpolates the zero-crossing of cumulative net_gex across strikes.
-    net_gex already embeds S^2 from compute_gex_from_chain.
+    Zero-gamma level: the strike price where cumulative net GEX crosses zero.
+
+    IMPORTANT: aggregate by strike first (sum across all expirations).
+    Without this, the chain has multiple rows per strike (one per expiry),
+    and the cumulative sum zigzags through expirations producing false
+    zero-crossings that return nan.
     """
-    sc = chain.sort_values("strike").reset_index(drop=True)
-    cum = sc["net_gex"].cumsum()
+    # Sum net_gex across all expirations for each strike
+    by_strike = (chain.groupby("strike")["net_gex"]
+                      .sum()
+                      .reset_index()
+                      .sort_values("strike")
+                      .reset_index(drop=True))
+
+    cum   = by_strike["net_gex"].cumsum()
     signs = cum.values[:-1] * cum.values[1:]
-    idx = np.where(signs < 0)[0]
-    if len(idx) == 0: return np.nan
+    idx   = np.where(signs < 0)[0]
+    if len(idx) == 0:
+        return np.nan
     i = idx[0]
-    s1, s2 = sc["strike"].iloc[i], sc["strike"].iloc[i+1]
-    g1, g2 = cum.iloc[i], cum.iloc[i+1]
+    s1, s2 = by_strike["strike"].iloc[i], by_strike["strike"].iloc[i + 1]
+    g1, g2 = cum.iloc[i], cum.iloc[i + 1]
     return s1 + (s2 - s1) * (-g1) / (g2 - g1) if (g2 - g1) != 0 else s1
 
 def classify_gex_regime(spot: float, flip: float) -> Tuple[GammaRegime, float, float]:

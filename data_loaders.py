@@ -46,6 +46,13 @@ def _load_gex_cache(symbol: str) -> Tuple[Optional[pd.DataFrame], float, str]:
         if chain.empty:
             return None, 0.0, ""
         saved = dt.datetime.fromisoformat(p["saved_at"]).strftime("%a %b %d %H:%M")
+        # If we're in market hours and serving cached data, label it clearly as
+        # stale/rate-limited rather than "EOD" which implies market is closed.
+        now_et2 = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=4)
+        mins2 = now_et2.hour * 60 + now_et2.minute
+        is_open = (now_et2.weekday() < 5) and (9*60+30) <= mins2 < (16*60)
+        if is_open:
+            return chain, float(p["spot"]), f"cached (stale — yfinance rate limited, last good: {saved})"
         return chain, float(p["spot"]), f"cached (EOD {saved})"
     except Exception:
         return None, 0.0, ""
@@ -197,13 +204,6 @@ def load_macro(start_iso, end_iso):
     # GDPC1: quarterly real GDP, will be interpolated to daily
     try:    out["GDPC1"] = fs("GDPC1")
     except: out["GDPC1"] = pd.Series(dtype=float)
-
-    # ── NEW: HY Credit Spread (ICE BofA HY OAS) ──────────────────────────
-    # BAMLH0A0HYM2: the level of HY spreads matters for cycle positioning.
-    # <300bp = complacency | 300-600bp = normal | 600-1000bp = recession pricing
-    # >1000bp = systemic stress. The HYG/LQD momentum ratio misses this.
-    try:    out["BAMLH0A0HYM2"] = fs("BAMLH0A0HYM2")
-    except: out["BAMLH0A0HYM2"] = pd.Series(dtype=float)
 
     # ── Market series (keep + no change) ─────────────────────────────────
     idx = pd.date_range(start, end, freq="D")

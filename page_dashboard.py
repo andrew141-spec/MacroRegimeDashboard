@@ -462,9 +462,13 @@ def render_dashboard():
             st.markdown(f"""<div class='warn-card' style='margin-bottom:8px;'>
               🕐 <b>LAST KNOWN GEX</b> — market closed · data from <b>{gex_stale}</b> · levels valid for context only, not live trading
             </div>""", unsafe_allow_html=True)
-        elif "EOD" in gex_state.data_source or "prev close" in gex_state.data_source or "cached" in gex_state.data_source:
+        elif "rate limited" in gex_state.data_source or "stale" in gex_state.data_source:
             st.markdown(f"""<div class='warn-card' style='margin-bottom:8px;'>
-              📋 <b>EOD GEX</b> — market closed · {gex_state.data_source} · levels are indicative until RTH opens
+              ⚡ <b>CACHED GEX</b> — yfinance rate limited · serving last good data · {gex_state.data_source}
+            </div>""", unsafe_allow_html=True)
+        elif "prev close" in gex_state.data_source or "cached" in gex_state.data_source or "EOD" in gex_state.data_source:
+            st.markdown(f"""<div class='warn-card' style='margin-bottom:8px;'>
+              📋 <b>EOD GEX</b> — market closed · levels are indicative until RTH opens
             </div>""", unsafe_allow_html=True)
         elif gex_state.data_source == "unavailable":
             st.markdown("""<div class='alert-card' style='margin-bottom:8px;'>
@@ -479,7 +483,7 @@ def render_dashboard():
               <div style='font-size:24px;font-weight:700;font-family:var(--mono);color:var(--yellow);'>{flip_disp}</div>
               <div class='small'>Distance: <span style='color:{dist_c};font-weight:700;'>{gex_state.distance_to_flip_pct:+.2f}%</span></div>
               <div style='margin-top:6px;'>{pbar(50+gex_state.distance_to_flip_pct*5, "var(--yellow)")}</div>
-              <div class='small' style='margin-top:4px;'>Stability: {gex_state.regime_stability:.2f} · {"🟢 live (15m delay)" if session.get("prime_time") or session.get("window") not in ("Globex","Post-RTH","Unknown") else "📋 EOD"}</div>
+              <div class='small' style='margin-top:4px;'>Stability: {gex_state.regime_stability:.2f} · Source: {gex_state.data_source}</div>
             </div>""", unsafe_allow_html=True)
         with gx2:
             res_str = " · ".join([f"{r:.0f}" for r in gex_state.key_resistance[:3]]) or "N/A"

@@ -93,20 +93,23 @@ def compute_gex_from_chain(chain: pd.DataFrame, spot: float,
     chain["charm"] = chain.apply(
         lambda row: bs_charm(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
 
-    # GEX: calls stabilizing (+), puts destabilizing (-)
-    chain["call_gex"] =  chain["call_oi"] * chain["gamma"] * multiplier * spot
-    chain["put_gex"]  = -chain["put_oi"] * chain["gamma"] * multiplier * spot
+    # GEX per the equation: Σ(Γᵢ · OIᵢ · ContractSize · S²)
+    # calls: dealers long gamma = stabilizing (+)
+    # puts:  dealers short gamma = destabilizing (-)
+    # S² = spot² — the dollar gamma term that gives GEX its units of $ per 1% move
+    chain["call_gex"] =  chain["call_oi"] * chain["gamma"] * multiplier * (spot ** 2)
+    chain["put_gex"]  = -chain["put_oi"] * chain["gamma"] * multiplier * (spot ** 2)
     chain["net_gex"]  =  chain["call_gex"] + chain["put_gex"]
 
     # VEX: positive vanna + rising IV → dealers buy (bullish pressure on IV spike)
     #      positive vanna + falling IV → dealers sell (bearish on vol crush)
-    chain["call_vex"] =  chain["call_oi"] * chain["vanna"] * multiplier * spot
-    chain["put_vex"]  = -chain["put_oi"] * chain["vanna"] * multiplier * spot
+    chain["call_vex"] =  chain["call_oi"] * chain["vanna"] * multiplier * (spot ** 2)
+    chain["put_vex"]  = -chain["put_oi"] * chain["vanna"] * multiplier * (spot ** 2)
     chain["net_vex"]  =  chain["call_vex"] + chain["put_vex"]
 
     # CEX: positive charm → time decay forces dealers to buy (upward drift)
-    chain["call_cex"] =  chain["call_oi"] * chain["charm"] * multiplier * spot
-    chain["put_cex"]  = -chain["put_oi"] * chain["charm"] * multiplier * spot
+    chain["call_cex"] =  chain["call_oi"] * chain["charm"] * multiplier * (spot ** 2)
+    chain["put_cex"]  = -chain["put_oi"] * chain["charm"] * multiplier * (spot ** 2)
     chain["net_cex"]  =  chain["call_cex"] + chain["put_cex"]
 
     return chain
@@ -176,6 +179,11 @@ def compute_dealer_greeks(chain: pd.DataFrame, spot: float,
     )
 
 def find_gamma_flip(chain: pd.DataFrame) -> float:
+    """
+    Zero-gamma level where: Sigma_i (Gamma_i * OI_i * ContractSize * S^2) = 0
+    Linearly interpolates the zero-crossing of cumulative net_gex across strikes.
+    net_gex already embeds S^2 from compute_gex_from_chain.
+    """
     sc = chain.sort_values("strike").reset_index(drop=True)
     cum = sc["net_gex"].cumsum()
     signs = cum.values[:-1] * cum.values[1:]

@@ -175,7 +175,30 @@ def render_dashboard():
             gex_state = GammaState(data_source="unavailable", timestamp=dt.datetime.now().strftime("%H:%M:%S"))
             gex_stale = False
 
+    # ── GEX debug (remove once working) ──────────────────────────────────
+    with st.expander("🔧 GEX Debug", expanded=False):
+        st.write(f"**Symbol:** {gex_symbol}")
+        st.write(f"**chain_df:** {'DataFrame shape ' + str(chain_df.shape) if chain_df is not None else 'None'}")
+        st.write(f"**spot:** {spot}")
+        st.write(f"**gex_source:** {gex_source}")
+        st.write(f"**gex_state.data_source:** {gex_state.data_source}")
+        st.write(f"**gex_state.regime:** {gex_state.regime}")
+        st.write(f"**gamma_flip:** {gex_state.gamma_flip}")
+        st.write(f"**total_gex:** {gex_state.total_gex}")
+        # Try a direct yfinance call and show raw result
+        import yfinance as _yf
+        try:
+            _t = _yf.Ticker(gex_symbol)
+            _exps = _t.options
+            st.write(f"**ticker.options:** {_exps[:5] if _exps else 'EMPTY'}")
+            _hist = _t.history(period="2d")
+            st.write(f"**ticker.history tail:**")
+            st.dataframe(_hist.tail(2))
+        except Exception as _e:
+            st.write(f"**Direct yfinance error:** {_e}")
+
     # ── LEADING + PROB ──
+    hy_spread_raw = raw.get("BAMLH0A0HYM2", pd.Series(dtype=float))
     leading = compute_leading_stack(
         y2, y3m, y10, y30, s_2s10s, vix, m2, claims,
         copx, gld, hyg, lqd, dxy, spy, qqq, iwm,
@@ -183,6 +206,7 @@ def render_dashboard():
         tips_10y=tips_10y, bank_reserves=bank_reserves,
         bank_credit=bank_credit, ism_no=ism_no,
         gdp_quarterly=gdp_quarterly, mmmf=mmmf,
+        unrate=unrate, hy_spread=hy_spread_raw,
     )
     meta = regime_transition_prob(macro_regime, core_yoy, s_2s10s)
     all_rss = load_feeds(tuple(_all_feeds_flat().items()), 120)
@@ -195,7 +219,8 @@ def render_dashboard():
     liq_dir_coincident = float(50.0 + np.sign(liq_dir_now) * 20)   # 70=expanding, 30=draining
 
     prob = compute_prob_composite(
-        leading, fear_score, geo_shock, meta["p_change_20d"], gex_state,
+        leading, fear_score, three_puts, liq_anxiety, exhaustion,
+        market_index_score, geo_shock, meta["p_change_20d"], gex_state,
         nfci_coincident=nfci_coincident,
         liq_dir_coincident=liq_dir_coincident,
     )
@@ -282,19 +307,26 @@ def render_dashboard():
 </div>""", unsafe_allow_html=True)
 
         # SESSION CONTEXT BAR
-        sm = session["size_mult"]
-        sc = "var(--green)" if sm >= 0.9 else ("var(--yellow)" if sm >= 0.5 else ("var(--orange)" if sm > 0 else "var(--red)"))
+        sm   = session["size_mult"]
+        sbase= session.get("size_mult_base", sm)
+        sc   = "var(--green)" if sm >= 0.9 else ("var(--yellow)" if sm >= 0.5 else ("var(--orange)" if sm > 0 else "var(--red)"))
+        ev_label = session.get("event_label", "")
+        ev_html  = (f"<span style='margin-left:10px;font-family:var(--mono);font-size:10px;"
+                    f"color:var(--yellow);font-weight:700;'>⚠ {ev_label}</span>") if ev_label else ""
+        size_note = (f" · Base {sbase:.2f}x → {sm:.2f}x (data day penalty)"
+                     if session.get("is_data_day") else f" · {sm:.2f}x")
         st.markdown(f"""
 <div class='warn-card' style='{"background:rgba(16,185,129,0.07);border-color:rgba(16,185,129,0.30);" if session["prime_time"] else ""}margin-bottom:8px;'>
   <span style="font-family:var(--mono);font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--muted);">SESSION</span>
   <span style="margin-left:10px;font-weight:700;color:{sc};">{session['window']}</span>
-  <span style="margin-left:8px;font-size:11px;color:var(--muted);">Liquidity: <b>{session['liquidity']}</b> · Size mult: <b>{sm:.2f}x</b></span>
+  <span style="margin-left:8px;font-size:11px;color:var(--muted);">Liquidity: <b>{session['liquidity']}</b>{size_note}</span>
+  {ev_html}
   <span style="margin-left:8px;font-size:11px;color:var(--dim);">{session['note']}</span>
 </div>""", unsafe_allow_html=True)
 
         st.markdown("<hr/>", unsafe_allow_html=True)
 
-        # ── PROBABILITY ROW — 1D hero + three forward horizons ──
+        # ── PROBABILITY ROW — 1D + three forward horizons ──
         st.markdown(f"{sec_hdr('DIRECTIONAL SIGNAL — BY HORIZON')}", unsafe_allow_html=True)
 
         p1d  = prob_1d.get("prob_1d",  50.0)
@@ -313,91 +345,48 @@ def render_dashboard():
                     f"<div style='width:{p:.0f}%;height:3px;border-radius:999px;"
                     f"background:{color};'></div></div>")
 
-        # ── 1D HERO ROW — full-width, dominant visual ───────────────────
-        c1d    = _hcol(p1d)
-        lo1d   = prob_1d.get("lo_1d", p1d - 15)
-        hi1d   = prob_1d.get("hi_1d", p1d + 15)
-        unc1d  = prob_1d.get("unc_1d", 15.0)
-        dom    = prob_1d.get("dominant_signal", "")
-        dom_d  = prob_1d.get("dominant_dir", "")
-        gex_c  = prob_1d.get("gex_confidence", 0.5)
-        sess_ok = prob_1d.get("session_valid", True)
-        gex_regime_str = gex_state.regime.value
-        flip_px = prob_1d.get("flip_proximity", 1.0)
+        ph0, ph1, ph2, ph3 = st.columns(4)
 
-        # Full-width 1D card — this is the most actionable number for an intraday trader
-        hero_col, meta_col = st.columns([1.6, 1.0])
-        with hero_col:
-            sess_warn = "⚠ Thin session — signal less reliable" if not sess_ok else ""
-            st.markdown(f"""
-<div style='background:linear-gradient(135deg,rgba(16,185,129,0.10),rgba(16,185,129,0.04));
-            border:1.5px solid rgba(16,185,129,0.35);border-radius:16px;padding:18px 22px;'>
-  <div style='display:flex;align-items:baseline;gap:14px;'>
-    <div>
-      <div style='font-family:var(--mono);font-size:10px;letter-spacing:1.2px;
-                  text-transform:uppercase;color:var(--green);margin-bottom:4px;'>
-        1-Day Bull Probability · GEX-Conditioned
-      </div>
-      <div style='font-size:52px;font-weight:700;color:{c1d};font-family:var(--mono);
-                  line-height:1;letter-spacing:-1px;'>{p1d:.0f}%</div>
-      <div style='font-family:var(--mono);font-size:10px;color:var(--muted);margin-top:4px;'>
-        Range {lo1d:.0f}–{hi1d:.0f}% · ±{unc1d:.0f}pp uncertainty
-      </div>
-    </div>
-    <div style='flex:1;'>
-      {_hbar(p1d, c1d)}
-      <div style='margin-top:8px;display:flex;gap:14px;flex-wrap:wrap;'>
-        <span style='font-family:var(--mono);font-size:10px;color:var(--muted);'>
-          35%K: <b style='color:{c1d};'>{k1d*100:.0f}%</b>
-        </span>
-        <span style='font-family:var(--mono);font-size:10px;color:var(--muted);'>
-          GEX regime: <b>{gex_regime_str}</b>
-        </span>
-        <span style='font-family:var(--mono);font-size:10px;color:var(--muted);'>
-          Dominant: <b>{dom}</b> ({dom_d})
-        </span>
-        <span style='font-family:var(--mono);font-size:10px;color:var(--muted);'>
-          Conf: <b>{gex_c:.2f}</b> · Flip prox: <b>{flip_px:.2f}</b>
-        </span>
-      </div>
-      {f"<div style='margin-top:6px;font-family:var(--mono);font-size:10px;color:var(--yellow);'>{sess_warn}</div>" if sess_warn else ""}
-    </div>
-  </div>
-</div>""", unsafe_allow_html=True)
+        # ── 1D CARD — primary GEX-driven model ───────────────────────────
+        with ph0:
+            c1d   = _hcol(p1d)
+            lo1d  = prob_1d.get("lo_1d", p1d - 15)
+            hi1d  = prob_1d.get("hi_1d", p1d + 15)
+            unc1d = prob_1d.get("unc_1d", 15.0)
+            dom   = prob_1d.get("dominant_signal", "")
+            dom_d = prob_1d.get("dominant_dir", "")
+            gex_c = prob_1d.get("gex_confidence", 0.5)
+            sess_ok = prob_1d.get("session_valid", True)
+            gex_regime_str = gex_state.regime.value
+            st.markdown(f"""<div style='background:rgba(16,185,129,0.07);border:1px solid rgba(16,185,129,0.28);
+                          border-radius:14px;padding:14px;'>
+              <div style='font-family:var(--mono);font-size:9px;letter-spacing:1px;
+                          text-transform:uppercase;color:var(--green);margin-bottom:3px;'>
+                1-Day Bull Prob <span style='color:var(--dim);'>· GEX-conditioned</span>
+              </div>
+              <div style='font-size:30px;font-weight:700;color:{c1d};font-family:var(--mono);'>{p1d:.0f}%</div>
+              {_hbar(p1d, c1d)}
+              <div style='font-family:var(--mono);font-size:9px;color:var(--muted);margin-top:2px;'>
+                Range: {lo1d:.0f}–{hi1d:.0f}% · ±{unc1d:.0f}pp
+              </div>
+              <div style='font-family:var(--mono);font-size:9px;color:var(--dim);margin-top:3px;'>
+                35%K: {k1d*100:.0f}% · GEX conf: {gex_c:.2f}
+              </div>
+              <div style='margin-top:5px;padding-top:5px;border-top:1px solid rgba(255,255,255,0.07);
+                          font-size:10px;color:var(--muted);'>
+                {gex_regime_str}
+              </div>
+              <div style='font-size:9px;color:var(--dim);margin-top:2px;'>
+                Lead: <b>{dom}</b> ({dom_d})
+                {"· ⚠ Thin session" if not sess_ok else ""}
+              </div>
+            </div>""", unsafe_allow_html=True)
 
-        with meta_col:
-            # 1D component breakdown inline (no expander)
-            scores_1d = {
-                "VIX TS":      prob_1d.get("score_vts",   50),
-                "Momentum":    prob_1d.get("score_mom",   50),
-                "Credit/FX":   prob_1d.get("score_micro", 50),
-                "Curve":       prob_1d.get("score_curve", 50),
-                "Liquidity":   prob_1d.get("score_liq",   50),
-            }
-            rows_html = "".join([
-                f"<div style='display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.04);'>"
-                f"<span style='font-family:var(--mono);font-size:10px;color:var(--muted);'>{k}</span>"
-                f"<span style='font-family:var(--mono);font-size:10px;color:{_hcol(v)};font-weight:700;'>{v:.0f}</span>"
-                f"</div>"
-                for k, v in scores_1d.items()
-            ])
-            st.markdown(f"""<div class='panel' style='height:100%;'>
-  <div class='panel-title'>1D Component Scores</div>
-  {rows_html}
-  <div style='font-family:var(--mono);font-size:9px;color:var(--dim);margin-top:6px;'>
-    AUC realistic: 0.52–0.55 · Not investment advice
-  </div>
-</div>""", unsafe_allow_html=True)
-
-        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-
-        # ── FORWARD HORIZONS ROW — smaller cards below 1D ──────────────
-        ph1, ph2, ph3 = st.columns(3)
         with ph1:
             c = _hcol(p5d)
             st.markdown(f"""<div class='prob-card'>
               <div class='panel-title'>5-Day <span style='color:var(--dim);font-size:9px;'>(Tactical)</span></div>
-              <div style='font-size:26px;font-weight:700;color:{c};font-family:var(--mono);'>{p5d:.0f}%</div>
+              <div style='font-size:28px;font-weight:700;color:{c};font-family:var(--mono);'>{p5d:.0f}%</div>
               {_hbar(p5d, c)}
               <div class='small'>35%K: {k5d*100:.0f}% · R:R~1.3</div>
               <div class='small' style='color:var(--dim);'>VIX TS · DXY 5D</div>
@@ -406,25 +395,62 @@ def render_dashboard():
             c = _hcol(p21d)
             st.markdown(f"""<div class='prob-card'>
               <div class='panel-title'>21-Day <span style='color:var(--dim);font-size:9px;'>(Short-term)</span></div>
-              <div style='font-size:26px;font-weight:700;color:{c};font-family:var(--mono);'>{p21d:.0f}%</div>
+              <div style='font-size:28px;font-weight:700;color:{c};font-family:var(--mono);'>{p21d:.0f}%</div>
               {_hbar(p21d, c)}
               <div class='small'>½K: {k21d*100:.0f}% · R:R~2.0</div>
               <div class='small' style='color:var(--dim);'>HYG/LQD · SC · Liq 4W · ISM</div>
             </div>""", unsafe_allow_html=True)
         with ph3:
             c = _hcol(p63d)
+            unc  = prob.get("uncertainty", 10.0)
+            bp   = prob["bull_prob"]
+            bull_lo = prob.get("bull_lo", bp - unc); bull_hi = prob.get("bull_hi", bp + unc)
             p_ch = meta["p_change_20d"]; persist = meta["persistence"]
             pc_c = "#ef4444" if p_ch>55 else ("#f59e0b" if p_ch>35 else "#10b981")
             st.markdown(f"""<div class='prob-card'>
               <div class='panel-title'>63-Day <span style='color:var(--dim);font-size:9px;'>(Medium-term)</span></div>
-              <div style='font-size:26px;font-weight:700;color:{c};font-family:var(--mono);'>{p63d:.0f}%</div>
+              <div style='font-size:28px;font-weight:700;color:{c};font-family:var(--mono);'>{p63d:.0f}%</div>
               {_hbar(p63d, c)}
               <div class='small'>½K: {k63d*100:.0f}% · R:R~2.5</div>
               <div class='small' style='color:var(--dim);'>Curve · Cu/Au · Credit · Real Rate</div>
-              <div style='margin-top:4px;font-size:9px;font-family:var(--mono);color:{pc_c};'>
+              <div style='margin-top:5px;padding-top:4px;border-top:1px solid rgba(255,255,255,0.07);
+                          font-size:9px;font-family:var(--mono);color:{pc_c};'>
                 P(regime Δ 20d): {p_ch:.0f}% · held {persist}d
               </div>
             </div>""", unsafe_allow_html=True)
+
+        # 1D component breakdown
+        with st.expander("1-Day Signal Components", expanded=False):
+            scores = {
+                "VIX Term Structure":   prob_1d.get("score_vts", 50),
+                "SPY 5D Momentum":      prob_1d.get("score_mom", 50),
+                "Credit/Dollar Micro":  prob_1d.get("score_micro", 50),
+                "Yield Curve":          prob_1d.get("score_curve", 50),
+                "Net Liquidity":        prob_1d.get("score_liq", 50),
+            }
+            regime_interp = prob_1d.get("regime_interp", "")
+            vts_r  = prob_1d.get("vts_ratio", 1.0)
+            spy_r  = prob_1d.get("spy_5d_ret", 0.0)
+            cr_sig = prob_1d.get("credit_1d", 0.0)
+            dl_sig = prob_1d.get("dollar_1d", 0.0)
+            gc_val = prob_1d.get("gex_confidence", 0.5)
+            fp_val = prob_1d.get("flip_proximity", 1.0)
+
+            st.markdown(f"**GEX Regime:** {gex_state.regime.value} · {regime_interp}", unsafe_allow_html=True)
+            st.markdown(f"**GEX confidence:** {gc_val:.2f} · **Flip proximity multiplier:** {fp_val:.2f}")
+            st.markdown(f"**Inputs:** VIX/RVol5D = {vts_r:.2f} · SPY 5D = {spy_r*100:+.1f}% · Credit 1D = {cr_sig*10000:.0f}bps · Dollar 1D = {dl_sig*100:+.2f}%")
+
+            fig_comp = go.Figure(go.Bar(
+                x=[v - 50 for v in scores.values()],
+                y=list(scores.keys()),
+                orientation="h",
+                marker_color=["#10b981" if v > 50 else "#ef4444" for v in scores.values()],
+                text=[f"{v:.0f}" for v in scores.values()],
+                textposition="outside",
+            ))
+            fig_comp.add_vline(x=0, line_dash="dot", line_color="rgba(255,255,255,0.3)")
+            st.plotly_chart(plotly_dark(fig_comp, "1D Component Scores (deviation from 50)", 220), use_container_width=True)
+            st.caption("1-day AUC realistic expectation: 0.52–0.55. This is a positioning aid, not a prediction. Not investment advice.")
 
         # Cross-horizon divergence
         if prob["divergent"] or abs(p1d - p63d) > 20:
@@ -437,6 +463,58 @@ def render_dashboard():
             </div>""", unsafe_allow_html=True)
 
         st.markdown("<hr/>", unsafe_allow_html=True)
+
+        # ── STRUCTURAL RISK INDICATORS (Sahm Rule + HY Spread) ──
+        sahm_val    = leading.get("sahm_indicator", np.nan)
+        sahm_trig   = leading.get("sahm_triggered", False)
+        sahm_appr   = leading.get("sahm_approaching", False)
+        sahm_regime = leading.get("sahm_regime", "Unavailable")
+        hy_level    = leading.get("hy_spread_level", np.nan)
+        hy_regime   = leading.get("hy_spread_regime", "Unavailable")
+        hy_stress   = leading.get("hy_stress_gate", False)
+
+        # Only show if triggered or approaching — don't clutter normal days
+        show_sahm = sahm_trig or sahm_appr or (np.isfinite(sahm_val) and sahm_val > 0.05)
+        show_hy   = np.isfinite(hy_level)
+
+        if show_sahm or show_hy:
+            sri1, sri2 = st.columns(2)
+            if show_sahm and np.isfinite(sahm_val):
+                sahm_c = "var(--red)" if sahm_trig else ("var(--yellow)" if sahm_appr else "var(--green)")
+                sahm_bg = "rgba(239,68,68,0.08)" if sahm_trig else ("rgba(245,158,11,0.06)" if sahm_appr else "rgba(16,185,129,0.05)")
+                sahm_border = "rgba(239,68,68,0.35)" if sahm_trig else ("rgba(245,158,11,0.30)" if sahm_appr else "rgba(16,185,129,0.20)")
+                with sri1:
+                    st.markdown(f"""<div style='background:{sahm_bg};border:1px solid {sahm_border};border-radius:12px;padding:12px 16px;'>
+  <div style='font-family:var(--mono);font-size:9px;letter-spacing:1px;text-transform:uppercase;color:{sahm_c};'>
+    Sahm Rule {'⚠ TRIGGERED' if sahm_trig else ('⚡ Watch Zone' if sahm_appr else '✓ Clear')}
+  </div>
+  <div style='display:flex;align-items:baseline;gap:10px;margin-top:4px;'>
+    <span style='font-size:26px;font-weight:700;color:{sahm_c};font-family:var(--mono);'>{sahm_val:.2f}</span>
+    <span style='font-size:11px;color:var(--muted);'>threshold: 0.50pp</span>
+  </div>
+  <div style='font-size:10px;color:var(--muted);margin-top:3px;'>{sahm_regime} · 3M avg UNRATE − 12M low UNRATE</div>
+  {'<div style="font-size:10px;color:var(--red);margin-top:3px;">⚠ Recession onset signal — every post-WWII recession triggered this</div>' if sahm_trig else ''}
+  {'<div style="font-size:10px;color:var(--yellow);margin-top:3px;">📡 Rising — monitor closely. ≥0.50 = recession onset signal</div>' if (sahm_appr and not sahm_trig) else ''}
+</div>""", unsafe_allow_html=True)
+
+            if show_hy and np.isfinite(hy_level):
+                hy_c  = "var(--red)" if hy_stress else ("var(--yellow)" if hy_level > 450 else "var(--green)")
+                hy_bg = "rgba(239,68,68,0.08)" if hy_stress else ("rgba(245,158,11,0.06)" if hy_level > 450 else "rgba(16,185,129,0.05)")
+                hy_border = "rgba(239,68,68,0.35)" if hy_stress else ("rgba(245,158,11,0.30)" if hy_level > 450 else "rgba(16,185,129,0.20)")
+                with sri2:
+                    st.markdown(f"""<div style='background:{hy_bg};border:1px solid {hy_border};border-radius:12px;padding:12px 16px;'>
+  <div style='font-family:var(--mono);font-size:9px;letter-spacing:1px;text-transform:uppercase;color:{hy_c};'>
+    HY Credit Spread (ICE BofA OAS)
+  </div>
+  <div style='display:flex;align-items:baseline;gap:10px;margin-top:4px;'>
+    <span style='font-size:26px;font-weight:700;color:{hy_c};font-family:var(--mono);'>{hy_level:.0f}bp</span>
+    <span style='font-size:11px;color:var(--muted);'>{hy_regime}</span>
+  </div>
+  <div style='font-size:10px;color:var(--muted);margin-top:3px;'>&lt;300=Complacency · 300-450=Normal · 450-600=Elevated · &gt;600=Recession · &gt;1000=Systemic</div>
+  {'<div style="font-size:10px;color:var(--red);margin-top:3px;">⚠ Recession pricing zone — risk assets pricing significant stress</div>' if hy_stress else ''}
+</div>""", unsafe_allow_html=True)
+
+            st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
         # ── GEX SNAPSHOT ──
         st.markdown(f"{sec_hdr('GAMMA EXPOSURE · ' + gex_state.regime.value + ' · ' + gex_state.timestamp)}", unsafe_allow_html=True)
@@ -523,20 +601,16 @@ def render_dashboard():
         with right_ov:
             st.markdown("<div class='panel'><div class='panel-title'>Score Drivers</div></div>", unsafe_allow_html=True)
             for item in [
-                f"GEX: {gex_state.regime.value} · flip dist: {gex_state.distance_to_flip_pct:+.2f}%",
+                f"Fear {'high' if fear_score>=70 else 'elevated' if fear_score>=55 else 'contained'} ({fear_score:.0f}/100)",
+                f"Three Puts {'strong' if three_puts>=65 else 'mixed' if three_puts>=45 else 'weak'} ({three_puts:.0f}/100)",
+                f"GEX Regime: {gex_state.regime.value} · dist to flip: {gex_state.distance_to_flip_pct:+.2f}%",
                 f"Bubble: {bubble_label} · Mag7 PE: {'N/A' if not np.isfinite(mag7_pe) else f'{mag7_pe:.1f}x'}",
                 f"Stealth QE: {stealth_label} · TGA 4W: {tga_4w:+.0f}B",
-                f"5D: {prob['prob_5d']:.0f}% | 21D: {prob['prob_21d']:.0f}% | 63D: {prob['prob_63d']:.0f}% {'⚡ DIVERGENCE' if prob['divergent'] else ''}",
-                f"Fwd {prob['fwd_prob']:.0f}% vs Coincident {prob['coincident_prob']:.0f}%",
+                f"Liq Anxiety: {'high' if liq_anxiety>=70 else 'elevated' if liq_anxiety>=55 else 'contained'} ({liq_anxiety:.0f})",
+                f"Exhaustion: {'elevated' if exhaustion>=60 else 'mild' if exhaustion>0 else '0/100'}",
+                f"Fwd-looking {prob['fwd_prob']:.0f}% vs Coincident {prob['coincident_prob']:.0f}% {'⚡ DIVERGENCE' if prob['divergent'] else ''}",
             ]:
                 st.markdown(f"- {item}")
-            st.markdown("<div class='small' style='margin-top:6px;color:var(--dim);letter-spacing:0.5px;'>NARRATIVE CONTEXT (not in probability model):</div>", unsafe_allow_html=True)
-            for item in [
-                f"Fear: {'HIGH' if fear_score>=70 else 'elevated' if fear_score>=55 else 'contained'} ({fear_score:.0f})",
-                f"Three Puts: {'strong' if three_puts>=65 else 'mixed' if three_puts>=45 else 'weak'} ({three_puts:.0f})",
-                f"Liq Anxiety: {liq_anxiety:.0f} · Exhaustion: {exhaustion:.0f}",
-            ]:
-                st.markdown(f"<div class='small' style='color:var(--dim);'>· {item}</div>", unsafe_allow_html=True)
 
         st.markdown("<hr/>", unsafe_allow_html=True)
 

@@ -66,7 +66,7 @@ def _fetch_with_retry(fn, retries=3, delay=2):
     return None, "max retries exceeded"
 
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=60)   # short TTL — GEX page controls refresh interval via sidebar
 def get_gex_from_yfinance(symbol="SPY") -> Tuple[Optional[pd.DataFrame], float, str]:
     """Pull option chain from yfinance. Retries on rate limits, falls back to disk cache."""
     today = dt.date.today()

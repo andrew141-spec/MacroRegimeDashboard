@@ -198,7 +198,6 @@ def render_dashboard():
             st.write(f"**Direct yfinance error:** {_e}")
 
     # ── LEADING + PROB ──
-    hy_spread_raw = raw.get("BAMLH0A0HYM2", pd.Series(dtype=float))
     leading = compute_leading_stack(
         y2, y3m, y10, y30, s_2s10s, vix, m2, claims,
         copx, gld, hyg, lqd, dxy, spy, qqq, iwm,
@@ -206,7 +205,6 @@ def render_dashboard():
         tips_10y=tips_10y, bank_reserves=bank_reserves,
         bank_credit=bank_credit, ism_no=ism_no,
         gdp_quarterly=gdp_quarterly, mmmf=mmmf,
-        unrate=unrate, hy_spread=hy_spread_raw,
     )
     meta = regime_transition_prob(macro_regime, core_yoy, s_2s10s)
     all_rss = load_feeds(tuple(_all_feeds_flat().items()), 120)
@@ -307,20 +305,13 @@ def render_dashboard():
 </div>""", unsafe_allow_html=True)
 
         # SESSION CONTEXT BAR
-        sm   = session["size_mult"]
-        sbase= session.get("size_mult_base", sm)
-        sc   = "var(--green)" if sm >= 0.9 else ("var(--yellow)" if sm >= 0.5 else ("var(--orange)" if sm > 0 else "var(--red)"))
-        ev_label = session.get("event_label", "")
-        ev_html  = (f"<span style='margin-left:10px;font-family:var(--mono);font-size:10px;"
-                    f"color:var(--yellow);font-weight:700;'>⚠ {ev_label}</span>") if ev_label else ""
-        size_note = (f" · Base {sbase:.2f}x → {sm:.2f}x (data day penalty)"
-                     if session.get("is_data_day") else f" · {sm:.2f}x")
+        sm = session["size_mult"]
+        sc = "var(--green)" if sm >= 0.9 else ("var(--yellow)" if sm >= 0.5 else ("var(--orange)" if sm > 0 else "var(--red)"))
         st.markdown(f"""
 <div class='warn-card' style='{"background:rgba(16,185,129,0.07);border-color:rgba(16,185,129,0.30);" if session["prime_time"] else ""}margin-bottom:8px;'>
   <span style="font-family:var(--mono);font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--muted);">SESSION</span>
   <span style="margin-left:10px;font-weight:700;color:{sc};">{session['window']}</span>
-  <span style="margin-left:8px;font-size:11px;color:var(--muted);">Liquidity: <b>{session['liquidity']}</b>{size_note}</span>
-  {ev_html}
+  <span style="margin-left:8px;font-size:11px;color:var(--muted);">Liquidity: <b>{session['liquidity']}</b> · Size mult: <b>{sm:.2f}x</b></span>
   <span style="margin-left:8px;font-size:11px;color:var(--dim);">{session['note']}</span>
 </div>""", unsafe_allow_html=True)
 
@@ -464,58 +455,6 @@ def render_dashboard():
 
         st.markdown("<hr/>", unsafe_allow_html=True)
 
-        # ── STRUCTURAL RISK INDICATORS (Sahm Rule + HY Spread) ──
-        sahm_val    = leading.get("sahm_indicator", np.nan)
-        sahm_trig   = leading.get("sahm_triggered", False)
-        sahm_appr   = leading.get("sahm_approaching", False)
-        sahm_regime = leading.get("sahm_regime", "Unavailable")
-        hy_level    = leading.get("hy_spread_level", np.nan)
-        hy_regime   = leading.get("hy_spread_regime", "Unavailable")
-        hy_stress   = leading.get("hy_stress_gate", False)
-
-        # Only show if triggered or approaching — don't clutter normal days
-        show_sahm = sahm_trig or sahm_appr or (np.isfinite(sahm_val) and sahm_val > 0.05)
-        show_hy   = np.isfinite(hy_level)
-
-        if show_sahm or show_hy:
-            sri1, sri2 = st.columns(2)
-            if show_sahm and np.isfinite(sahm_val):
-                sahm_c = "var(--red)" if sahm_trig else ("var(--yellow)" if sahm_appr else "var(--green)")
-                sahm_bg = "rgba(239,68,68,0.08)" if sahm_trig else ("rgba(245,158,11,0.06)" if sahm_appr else "rgba(16,185,129,0.05)")
-                sahm_border = "rgba(239,68,68,0.35)" if sahm_trig else ("rgba(245,158,11,0.30)" if sahm_appr else "rgba(16,185,129,0.20)")
-                with sri1:
-                    st.markdown(f"""<div style='background:{sahm_bg};border:1px solid {sahm_border};border-radius:12px;padding:12px 16px;'>
-  <div style='font-family:var(--mono);font-size:9px;letter-spacing:1px;text-transform:uppercase;color:{sahm_c};'>
-    Sahm Rule {'⚠ TRIGGERED' if sahm_trig else ('⚡ Watch Zone' if sahm_appr else '✓ Clear')}
-  </div>
-  <div style='display:flex;align-items:baseline;gap:10px;margin-top:4px;'>
-    <span style='font-size:26px;font-weight:700;color:{sahm_c};font-family:var(--mono);'>{sahm_val:.2f}</span>
-    <span style='font-size:11px;color:var(--muted);'>threshold: 0.50pp</span>
-  </div>
-  <div style='font-size:10px;color:var(--muted);margin-top:3px;'>{sahm_regime} · 3M avg UNRATE − 12M low UNRATE</div>
-  {'<div style="font-size:10px;color:var(--red);margin-top:3px;">⚠ Recession onset signal — every post-WWII recession triggered this</div>' if sahm_trig else ''}
-  {'<div style="font-size:10px;color:var(--yellow);margin-top:3px;">📡 Rising — monitor closely. ≥0.50 = recession onset signal</div>' if (sahm_appr and not sahm_trig) else ''}
-</div>""", unsafe_allow_html=True)
-
-            if show_hy and np.isfinite(hy_level):
-                hy_c  = "var(--red)" if hy_stress else ("var(--yellow)" if hy_level > 450 else "var(--green)")
-                hy_bg = "rgba(239,68,68,0.08)" if hy_stress else ("rgba(245,158,11,0.06)" if hy_level > 450 else "rgba(16,185,129,0.05)")
-                hy_border = "rgba(239,68,68,0.35)" if hy_stress else ("rgba(245,158,11,0.30)" if hy_level > 450 else "rgba(16,185,129,0.20)")
-                with sri2:
-                    st.markdown(f"""<div style='background:{hy_bg};border:1px solid {hy_border};border-radius:12px;padding:12px 16px;'>
-  <div style='font-family:var(--mono);font-size:9px;letter-spacing:1px;text-transform:uppercase;color:{hy_c};'>
-    HY Credit Spread (ICE BofA OAS)
-  </div>
-  <div style='display:flex;align-items:baseline;gap:10px;margin-top:4px;'>
-    <span style='font-size:26px;font-weight:700;color:{hy_c};font-family:var(--mono);'>{hy_level:.0f}bp</span>
-    <span style='font-size:11px;color:var(--muted);'>{hy_regime}</span>
-  </div>
-  <div style='font-size:10px;color:var(--muted);margin-top:3px;'>&lt;300=Complacency · 300-450=Normal · 450-600=Elevated · &gt;600=Recession · &gt;1000=Systemic</div>
-  {'<div style="font-size:10px;color:var(--red);margin-top:3px;">⚠ Recession pricing zone — risk assets pricing significant stress</div>' if hy_stress else ''}
-</div>""", unsafe_allow_html=True)
-
-            st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-
         # ── GEX SNAPSHOT ──
         st.markdown(f"{sec_hdr('GAMMA EXPOSURE · ' + gex_state.regime.value + ' · ' + gex_state.timestamp)}", unsafe_allow_html=True)
 
@@ -523,7 +462,7 @@ def render_dashboard():
             st.markdown(f"""<div class='warn-card' style='margin-bottom:8px;'>
               🕐 <b>LAST KNOWN GEX</b> — market closed · data from <b>{gex_stale}</b> · levels valid for context only, not live trading
             </div>""", unsafe_allow_html=True)
-        elif "prev close" in gex_state.data_source or "cached" in gex_state.data_source:
+        elif "EOD" in gex_state.data_source or "prev close" in gex_state.data_source or "cached" in gex_state.data_source:
             st.markdown(f"""<div class='warn-card' style='margin-bottom:8px;'>
               📋 <b>EOD GEX</b> — market closed · {gex_state.data_source} · levels are indicative until RTH opens
             </div>""", unsafe_allow_html=True)
@@ -540,7 +479,7 @@ def render_dashboard():
               <div style='font-size:24px;font-weight:700;font-family:var(--mono);color:var(--yellow);'>{flip_disp}</div>
               <div class='small'>Distance: <span style='color:{dist_c};font-weight:700;'>{gex_state.distance_to_flip_pct:+.2f}%</span></div>
               <div style='margin-top:6px;'>{pbar(50+gex_state.distance_to_flip_pct*5, "var(--yellow)")}</div>
-              <div class='small' style='margin-top:4px;'>Stability: {gex_state.regime_stability:.2f} · Source: {gex_state.data_source}</div>
+              <div class='small' style='margin-top:4px;'>Stability: {gex_state.regime_stability:.2f} · {"🟢 live (15m delay)" if session.get("prime_time") or session.get("window") not in ("Globex","Post-RTH","Unknown") else "📋 EOD"}</div>
             </div>""", unsafe_allow_html=True)
         with gx2:
             res_str = " · ".join([f"{r:.0f}" for r in gex_state.key_resistance[:3]]) or "N/A"

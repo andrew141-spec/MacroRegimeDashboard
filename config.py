@@ -350,6 +350,9 @@ class GammaState:
     regime_stability: float = 0.5
     data_source: str = "unavailable"
     timestamp: str = ""
+    local_maxima:   List[Tuple[float, float]] = field(default_factory=list)
+    local_minima:   List[Tuple[float, float]] = field(default_factory=list)
+    zero_crossings: List[float] = field(default_factory=list)
 
 @dataclass
 class SetupScore:
@@ -382,8 +385,16 @@ class FeedItem:
     published: str
     source: str
 
-# page is set in app.py — imported from there
-page = None  # placeholder; overridden by app.py before any render call
+# ============================================================
+# SIDEBAR NAVIGATION
+# ============================================================
+st.sidebar.markdown("## ⚡ Quant Dashboard")
+page = st.sidebar.radio(
+    "Module",
+    ["Dashboard", "GEX Engine", "Trade Setups", "Execution", "Probability Engine", "Schwab/TOS", "Guide"],
+    index=0
+)
+st.sidebar.markdown("---")
 
 # ============================================================
 # HELPERS — CORE MATH

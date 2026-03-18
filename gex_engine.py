@@ -180,19 +180,41 @@ def compute_dealer_greeks(chain: pd.DataFrame, spot: float,
 
 def find_gamma_flip(chain: pd.DataFrame) -> float:
     """
-    Zero-gamma level where: Sigma_i (Gamma_i * OI_i * ContractSize * S^2) = 0
-    Linearly interpolates the zero-crossing of cumulative net_gex across strikes.
-    net_gex already embeds S^2 from compute_gex_from_chain.
+    Gamma flip = the strike where per-strike net_gex transitions from
+    positive (dealers net long gamma) to negative (dealers net short gamma).
+
+    Method: sort by strike, find adjacent pairs where net_gex changes sign,
+    interpolate the exact zero-crossing price between those two strikes.
+
+    This is NOT based on cumulative GEX — it finds where the individual
+    strike's net_gex (call_gex + put_gex) crosses zero on a per-bar basis,
+    which matches what GEXBot and OptionsCC display as the "vol trigger".
     """
-    sc = chain.sort_values("strike").reset_index(drop=True)
-    cum = sc["net_gex"].cumsum()
-    signs = cum.values[:-1] * cum.values[1:]
-    idx = np.where(signs < 0)[0]
-    if len(idx) == 0: return np.nan
-    i = idx[0]
-    s1, s2 = sc["strike"].iloc[i], sc["strike"].iloc[i+1]
-    g1, g2 = cum.iloc[i], cum.iloc[i+1]
-    return s1 + (s2 - s1) * (-g1) / (g2 - g1) if (g2 - g1) != 0 else s1
+    sc = chain.groupby("strike")["net_gex"].sum().reset_index()
+    sc = sc.sort_values("strike").reset_index(drop=True)
+
+    gex_vals = sc["net_gex"].values
+    strikes  = sc["strike"].values
+
+    # Find all sign changes in per-strike net_gex
+    sign_changes = np.where(gex_vals[:-1] * gex_vals[1:] < 0)[0]
+
+    if len(sign_changes) == 0:
+        return np.nan
+
+    # Take the sign change closest to the largest absolute GEX transition
+    # (most significant flip, not just the first one)
+    best_i = sign_changes[
+        np.argmax([abs(gex_vals[i+1] - gex_vals[i]) for i in sign_changes])
+    ]
+
+    s1, s2 = float(strikes[best_i]),   float(strikes[best_i + 1])
+    g1, g2 = float(gex_vals[best_i]),  float(gex_vals[best_i + 1])
+
+    # Linear interpolation to find exact zero-crossing
+    if (g2 - g1) == 0:
+        return s1
+    return s1 + (s2 - s1) * (-g1) / (g2 - g1)
 
 def classify_gex_regime(spot: float, flip: float) -> Tuple[GammaRegime, float, float]:
     if not np.isfinite(flip): return GammaRegime.NEUTRAL, 0.0, 0.5

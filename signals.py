@@ -1,12 +1,19 @@
 # signals.py — leading indicator stack and 1-day GEX-conditioned probability
-import os, math, datetime as dt
+import os, re, time, math, datetime as dt, json, tempfile
+from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 from enum import Enum
 import numpy as np
 import pandas as pd
 import streamlit as st
+import plotly.graph_objects as go
+import plotly.express as px
+import yfinance as yf
+from fredapi import Fred
 from scipy import stats as scipy_stats
 from scipy.stats import norm as scipy_norm
+from urllib.request import Request, urlopen
+import xml.etree.ElementTree as ET
 from config import GammaState, GammaRegime
 from utils import _to_1d, zscore, current_pct_rank, resample_ffill, kelly, _bs_iv_from_price
 
@@ -17,6 +24,8 @@ def compute_leading_stack(
     # NEW signals
     tips_10y=None, bank_reserves=None, bank_credit=None,
     ism_no=None, gdp_quarterly=None, mmmf=None,
+    # Structural risk indicators
+    unrate=None, hy_spread=None,
 ) -> Dict:
     """
     Signal stack reorganised by forecast horizon per the architecture critique.
@@ -235,6 +244,72 @@ def compute_leading_stack(
     R["liq_impulse_13w_pct"]   = current_pct_rank(liq_13w, 252)
     R["liq_impulse_13w_level"] = float(liq_13w.dropna().iloc[-1]) if liq_13w.dropna().size else 0.0
 
+    # ════════════════════════════════════════════════════════════════
+    # STRUCTURAL RISK INDICATORS
+    # Not bucketed into tactical/short/medium — these are regime
+    # context signals that gate the probability model.
+    # ════════════════════════════════════════════════════════════════
+
+    # SR1. Sahm Rule (Claudia Sahm, 2019)
+    # Triggered when 3M avg unemployment rises ≥0.5pp above its 12M low.
+    # Perfect post-WWII recession onset record. Already have UNRATE loaded.
+    # Recession risk does NOT feed as a directional probability — it is a
+    # regime gate that compresses all bullish signals toward 50.
+    if "unrate" in dir() or True:   # unrate passed as argument
+        unrate_s = _to_1d(unrate).reindex(idx).ffill()
+        unrate_3m_avg  = unrate_s.rolling(91, min_periods=60).mean()
+        unrate_12m_low = unrate_s.rolling(365, min_periods=200).min()
+        sahm_series    = unrate_3m_avg - unrate_12m_low
+        sahm_now       = float(sahm_series.dropna().iloc[-1]) if sahm_series.dropna().size else 0.0
+        R["sahm_indicator"]  = sahm_now
+        R["sahm_triggered"]  = sahm_now >= 0.50
+        R["sahm_approaching"] = 0.30 <= sahm_now < 0.50   # watch zone
+        # Regime label
+        if sahm_now >= 0.50:
+            R["sahm_regime"] = "RECESSION ONSET"
+        elif sahm_now >= 0.30:
+            R["sahm_regime"] = "Watch Zone"
+        elif sahm_now >= 0.10:
+            R["sahm_regime"] = "Elevated"
+        else:
+            R["sahm_regime"] = "Normal"
+    else:
+        R["sahm_indicator"] = np.nan
+        R["sahm_triggered"] = False
+        R["sahm_approaching"] = False
+        R["sahm_regime"] = "Unavailable"
+
+    # SR2. HY Spread Level (ICE BofA BAMLH0A0HYM2)
+    # The LEVEL of HY spreads is a distinct signal from the HYG/LQD momentum ratio.
+    # Momentum tells you direction; level tells you whether you're in a stress regime.
+    if hy_spread is not None and len(_to_1d(hy_spread).dropna()) > 20:
+        hy_r = resample_ffill(hy_spread, idx)
+        hy_now = float(hy_r.dropna().iloc[-1]) if hy_r.dropna().size else np.nan
+        if np.isfinite(hy_now):
+            # Regime classification
+            if hy_now < 300:
+                hy_regime = "Complacency"
+            elif hy_now < 450:
+                hy_regime = "Normal"
+            elif hy_now < 600:
+                hy_regime = "Elevated"
+            elif hy_now < 1000:
+                hy_regime = "Recession Pricing"
+            else:
+                hy_regime = "Systemic Stress"
+            R["hy_spread_level"] = hy_now
+            R["hy_spread_regime"] = hy_regime
+            # Percentile rank for use in composite if desired
+            R["hy_spread_pct"]   = current_pct_rank(-hy_r, 252)  # inverted: lower = better
+            # Gate signal: in Recession Pricing or above, compress bull signals
+            R["hy_stress_gate"] = hy_now >= 600
+        else:
+            R["hy_spread_level"] = np.nan; R["hy_spread_regime"] = "Unavailable"
+            R["hy_spread_pct"] = 50.0;     R["hy_stress_gate"] = False
+    else:
+        R["hy_spread_level"] = np.nan; R["hy_spread_regime"] = "Unavailable"
+        R["hy_spread_pct"] = 50.0;     R["hy_stress_gate"] = False
+
     return R
 
 # ============================================================
@@ -398,16 +473,9 @@ def compute_1d_prob(
     # Dollar weakening = risk-on = bullish (inverted)
     dollar_signal    = -dxy_1d
 
-    # Combine: both pointing same direction = stronger signal.
-    # Normalise by rolling std so a typical daily move = 1 unit.
-    # This avoids the clip doing all the work (old bug: 0.5% HYG move → micro_raw=10 → clips to 80).
-    # Now treat as an explicit 3-state signal (-1 / 0 / +1) with a thin neutral zone.
-    credit_z = credit_1d_signal / 0.003   # 0.3% daily spread change ≈ 1 sigma
-    dollar_z = dollar_signal    / 0.002   # 0.2% daily DXY change   ≈ 1 sigma
-    # Clip each to [-2, 2] so extreme days don't dominate, then blend
-    combined_z = float(np.clip(credit_z * 0.55 + dollar_z * 0.45, -2.0, 2.0))
-    # Map z → probability: z=+2 → ~70, z=0 → 50, z=-2 → ~30
-    micro_score = float(np.clip(50.0 + combined_z * 10.0, 20, 80))
+    # Combine: both pointing same direction = stronger signal
+    micro_raw = credit_1d_signal * 2000 + dollar_signal * 1500  # scale to approx -1/+1
+    micro_score = float(np.clip(50.0 + micro_raw * 20, 20, 80))
 
     # ── Factor 5: Curve inversion (structural 1D headwind/tailwind) ───────
     curve_bp = float(s_2s10s.dropna().iloc[-1]) if s_2s10s.dropna().size else 0.0

@@ -32,53 +32,16 @@ _C_MUTED = "rgba(255,255,255,0.52)"
 def _greek_bar_chart(by_strike: dict, spot: float, title: str,
                      pos_color: str, neg_color: str,
                      flip_level: float = None, height=340) -> go.Figure:
-    """
-    Vertical bar chart — strikes on X axis, GEX $M on Y axis.
-    Green = positive GEX (dealers net long gamma, stabilising).
-    Red   = negative GEX (dealers net short gamma, amplifying).
-    Gamma flip marker = the strike where bars cross from + to -.
-    """
     strikes = sorted(by_strike.keys())
     near    = [s for s in strikes if spot * 0.90 < s < spot * 1.10]
     vals    = [by_strike[s] / 1e6 for s in near]
-    colors  = [pos_color if v >= 0 else neg_color for v in vals]
-
-    fig = go.Figure(go.Bar(
-        x=near, y=vals,
-        marker_color=colors,
-        opacity=0.85,
-        name="Net GEX ($M)",
-    ))
-
-    # Zero line — where bars cross this on Y axis = zero gamma
-    fig.add_hline(y=0, line_color="rgba(255,255,255,0.25)", line_width=1)
-
-    # SPOT marker
-    fig.add_vline(
-        x=spot,
-        line_dash="dot",
-        line_color="rgba(255,255,255,0.60)",
-        line_width=1.5,
-        annotation_text=f"SPOT ${spot:.2f}",
-        annotation_font_size=10,
-        annotation_position="top right",
-    )
-
-    # GAMMA FLIP / VOL TRIGGER marker
-    # This is the strike where net_gex transitions + → -
-    # i.e. where the bars visually cross from green to red
-    if flip_level and np.isfinite(float(flip_level)):
-        fig.add_vline(
-            x=float(flip_level),
-            line_dash="dash",
-            line_color=_C_FLIP,
-            line_width=2,
-            annotation_text=f"FLIP ${flip_level:.2f}",
-            annotation_font_size=10,
-            annotation_font_color=_C_FLIP,
-            annotation_position="top left",
-        )
-
+    colors  = [pos_color if v > 0 else neg_color for v in vals]
+    fig = go.Figure(go.Bar(x=near, y=vals, marker_color=colors, opacity=0.85, name=title))
+    fig.add_vline(x=spot, line_dash="dot", line_color="rgba(255,255,255,0.6)",
+                  annotation_text="SPOT", annotation_font_size=10)
+    if flip_level:
+        fig.add_vline(x=flip_level, line_dash="dash", line_color=_C_FLIP,
+                      annotation_text=f"FLIP {flip_level:.0f}", annotation_font_size=10)
     return plotly_dark(fig, title, height)
 
 
@@ -362,6 +325,50 @@ def render_gex_engine():
     """Deep-dive GEX analysis page with GEX / VEX / CEX tabs."""
     st.markdown(CSS, unsafe_allow_html=True)
     st.markdown("## ⚡ GEX Engine — Dealer Greeks")
+
+    # ── Sidebar refresh controls ──────────────────────────────────────────
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### ⚡ GEX Refresh")
+
+    auto_refresh = st.sidebar.toggle("Auto refresh", value=True, key="gex_auto_refresh")
+
+    refresh_options = {
+        "30 seconds":  30,
+        "1 minute":    60,
+        "2 minutes":   120,
+        "5 minutes":   300,
+        "10 minutes":  600,
+        "15 minutes":  900,
+        "30 minutes":  1800,
+    }
+    refresh_label = st.sidebar.selectbox(
+        "Refresh interval",
+        options=list(refresh_options.keys()),
+        index=2,   # default: 2 minutes
+        key="gex_refresh_interval",
+        disabled=not auto_refresh,
+    )
+    refresh_sec = refresh_options[refresh_label]
+
+    # Manual refresh button — clears cache so fresh data is fetched immediately
+    if st.sidebar.button("🔄 Refresh now", use_container_width=True, key="gex_manual_refresh"):
+        st.cache_data.clear()
+        st.rerun()
+
+    # Status display
+    if auto_refresh:
+        st.sidebar.caption(f"🟢 Auto-refreshing every {refresh_label}")
+    else:
+        st.sidebar.caption("⚫ Auto-refresh off — use button above")
+
+    st.sidebar.markdown("---")
+    st.sidebar.caption(
+        "ℹ️ yfinance OI data updates once per day (after market close). "
+        "Live IV from Schwab updates on every refresh."
+    )
+
+    # Fire the JS auto-refresh
+    autorefresh_js(refresh_sec, auto_refresh)
 
     col_s, col_m = st.columns([1, 3])
     with col_s:

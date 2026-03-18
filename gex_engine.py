@@ -38,7 +38,8 @@ class DealerGreeks:
     otm_anchors:     List[Tuple[float, float]] = field(default_factory=list)  # (strike, net_gex)
     # Vanna/Charm alignment signal
     vanna_charm_aligned: bool  = False
-    vanna_direction:     str   = "neutral"  # "bullish", "bearish", "neutral"
+    vanna_direction:     str   = "neutral"  # pressure direction when IV rising
+    vanna_sign:          str   = "neutral"  # "positive", "negative", "neutral" — raw sign
     charm_direction:     str   = "neutral"
     data_source:         str   = "unknown"
 
@@ -58,7 +59,9 @@ def bs_vanna(S, K, T, sigma, r=0.05) -> float:
     """Vanna = dDelta/dIV = d2Delta/dSdSigma.
     Measures how dealer delta changes when IV changes.
     Vanna = -phi(d1) * d2 / sigma
-    Sign convention: positive vanna + falling IV → dealers buy underlying (bullish).
+    Sign convention (per notes):
+    Positive vanna: IV rises → dealers BUY, IV falls → dealers SELL
+    Negative vanna: IV rises → dealers SELL, IV falls → dealers BUY
     """
     if T <= 0 or sigma <= 0: return 0.0
     d1, d2 = _d1d2(S, K, T, sigma, r)
@@ -95,7 +98,8 @@ def compute_gex_from_chain(chain: pd.DataFrame, spot: float,
     chain["put_gex"]  = -chain["put_oi"] * chain["gamma"] * multiplier * spot
     chain["net_gex"]  =  chain["call_gex"] + chain["put_gex"]
 
-    # VEX: positive vanna + falling IV → dealers buy (bullish pressure)
+    # VEX: positive vanna + rising IV → dealers buy (bullish pressure on IV spike)
+    #      positive vanna + falling IV → dealers sell (bearish on vol crush)
     chain["call_vex"] =  chain["call_oi"] * chain["vanna"] * multiplier * spot
     chain["put_vex"]  = -chain["put_oi"] * chain["vanna"] * multiplier * spot
     chain["net_vex"]  =  chain["call_vex"] + chain["put_vex"]
@@ -138,8 +142,16 @@ def compute_dealer_greeks(chain: pd.DataFrame, spot: float,
     otm_anchors = sorted(otm.items(), key=lambda x: abs(x[1]), reverse=True)[:10]
 
     # Vanna direction: net VEX near spot (within 2%)
+    # Convention per notes:
+    #   Positive vanna: IV rises → dealers BUY, IV falls → dealers SELL
+    #   Negative vanna: IV rises → dealers SELL, IV falls → dealers BUY
+    # We store the vanna sign and let the UI interpret based on IV regime.
+    # vanna_direction here = pressure direction IF IV IS RISING (most actionable context)
     ntm_vex = sum(v for k, v in vex_by_strike.items() if abs(k - spot) / spot < 0.02)
+    # Positive vanna + rising IV = dealers buy = bullish pressure
+    # Negative vanna + rising IV = dealers sell = bearish pressure
     vanna_direction = "bullish" if ntm_vex > 0 else ("bearish" if ntm_vex < 0 else "neutral")
+    vanna_sign = "positive" if ntm_vex > 0 else ("negative" if ntm_vex < 0 else "neutral")
 
     # Charm direction: net CEX near spot
     ntm_cex = sum(v for k, v in cex_by_strike.items() if abs(k - spot) / spot < 0.02)
@@ -158,6 +170,7 @@ def compute_dealer_greeks(chain: pd.DataFrame, spot: float,
         otm_anchors=otm_anchors,
         vanna_charm_aligned=vanna_charm_aligned,
         vanna_direction=vanna_direction,
+        vanna_sign=vanna_sign,
         charm_direction=charm_direction,
         data_source=source,
     )

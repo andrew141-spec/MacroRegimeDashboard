@@ -1,19 +1,12 @@
 # signals.py — leading indicator stack and 1-day GEX-conditioned probability
-import os, re, time, math, datetime as dt, json, tempfile
-from dataclasses import dataclass, field
+import os, math, datetime as dt
 from typing import List, Dict, Tuple, Optional
 from enum import Enum
 import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.graph_objects as go
-import plotly.express as px
-import yfinance as yf
-from fredapi import Fred
 from scipy import stats as scipy_stats
 from scipy.stats import norm as scipy_norm
-from urllib.request import Request, urlopen
-import xml.etree.ElementTree as ET
 from config import GammaState, GammaRegime
 from utils import _to_1d, zscore, current_pct_rank, resample_ffill, kelly, _bs_iv_from_price
 
@@ -405,9 +398,16 @@ def compute_1d_prob(
     # Dollar weakening = risk-on = bullish (inverted)
     dollar_signal    = -dxy_1d
 
-    # Combine: both pointing same direction = stronger signal
-    micro_raw = credit_1d_signal * 2000 + dollar_signal * 1500  # scale to approx -1/+1
-    micro_score = float(np.clip(50.0 + micro_raw * 20, 20, 80))
+    # Combine: both pointing same direction = stronger signal.
+    # Normalise by rolling std so a typical daily move = 1 unit.
+    # This avoids the clip doing all the work (old bug: 0.5% HYG move → micro_raw=10 → clips to 80).
+    # Now treat as an explicit 3-state signal (-1 / 0 / +1) with a thin neutral zone.
+    credit_z = credit_1d_signal / 0.003   # 0.3% daily spread change ≈ 1 sigma
+    dollar_z = dollar_signal    / 0.002   # 0.2% daily DXY change   ≈ 1 sigma
+    # Clip each to [-2, 2] so extreme days don't dominate, then blend
+    combined_z = float(np.clip(credit_z * 0.55 + dollar_z * 0.45, -2.0, 2.0))
+    # Map z → probability: z=+2 → ~70, z=0 → 50, z=-2 → ~30
+    micro_score = float(np.clip(50.0 + combined_z * 10.0, 20, 80))
 
     # ── Factor 5: Curve inversion (structural 1D headwind/tailwind) ───────
     curve_bp = float(s_2s10s.dropna().iloc[-1]) if s_2s10s.dropna().size else 0.0

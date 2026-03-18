@@ -46,13 +46,6 @@ def _load_gex_cache(symbol: str) -> Tuple[Optional[pd.DataFrame], float, str]:
         if chain.empty:
             return None, 0.0, ""
         saved = dt.datetime.fromisoformat(p["saved_at"]).strftime("%a %b %d %H:%M")
-        # If we're in market hours and serving cached data, label it clearly as
-        # stale/rate-limited rather than "EOD" which implies market is closed.
-        now_et2 = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=4)
-        mins2 = now_et2.hour * 60 + now_et2.minute
-        is_open = (now_et2.weekday() < 5) and (9*60+30) <= mins2 < (16*60)
-        if is_open:
-            return chain, float(p["spot"]), f"cached (stale — yfinance rate limited, last good: {saved})"
         return chain, float(p["spot"]), f"cached (EOD {saved})"
     except Exception:
         return None, 0.0, ""
@@ -73,7 +66,7 @@ def _fetch_with_retry(fn, retries=3, delay=2):
     return None, "max retries exceeded"
 
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=60)   # short TTL — GEX page controls refresh interval via sidebar
 def get_gex_from_yfinance(symbol="SPY") -> Tuple[Optional[pd.DataFrame], float, str]:
     """Pull option chain from yfinance. Retries on rate limits, falls back to disk cache."""
     today = dt.date.today()
@@ -226,4 +219,3 @@ def get_fwd_pe(ticker):
 # Organised into 7 signal categories matching the thesis document.
 # Each category has: feeds, keywords, impact weights, and a colour.
 # ============================================================
-

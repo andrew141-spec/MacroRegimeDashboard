@@ -33,79 +33,51 @@ def _greek_bar_chart(by_strike: dict, spot: float, title: str,
                      pos_color: str, neg_color: str,
                      flip_level: float = None, height=340) -> go.Figure:
     """
-    Horizontal GEX bar chart — strikes on Y axis, GEX ($M) on X axis.
-    Positive = green (calls), Negative = blue (puts).
-    Zero line at x=0 IS the zero-gamma level. Flip marked as horizontal line.
+    Vertical bar chart — strikes on X axis, GEX $M on Y axis.
+    Green = positive GEX (dealers net long gamma, stabilising).
+    Red   = negative GEX (dealers net short gamma, amplifying).
+    Gamma flip marker = the strike where bars cross from + to -.
     """
     strikes = sorted(by_strike.keys())
     near    = [s for s in strikes if spot * 0.90 < s < spot * 1.10]
     vals    = [by_strike[s] / 1e6 for s in near]
-    colors  = [pos_color if v >= 0 else "#3b82f6" for v in vals]
+    colors  = [pos_color if v >= 0 else neg_color for v in vals]
 
     fig = go.Figure(go.Bar(
-        x=vals,
-        y=near,
-        orientation="h",
+        x=near, y=vals,
         marker_color=colors,
         opacity=0.85,
-        name="Net GEX",
+        name="Net GEX ($M)",
     ))
 
-    # Zero-gamma line — x=0 is where net GEX = 0 (the vol trigger)
+    # Zero line — where bars cross this on Y axis = zero gamma
+    fig.add_hline(y=0, line_color="rgba(255,255,255,0.25)", line_width=1)
+
+    # SPOT marker
     fig.add_vline(
-        x=0,
-        line_dash="solid",
-        line_color="rgba(255,255,255,0.45)",
+        x=spot,
+        line_dash="dot",
+        line_color="rgba(255,255,255,0.60)",
         line_width=1.5,
+        annotation_text=f"SPOT ${spot:.2f}",
+        annotation_font_size=10,
+        annotation_position="top right",
     )
 
-    # SPOT line — horizontal at spot price (numeric y)
-    fig.add_hline(
-        y=spot,
-        line_dash="dash",
-        line_color="#06b6d4",
-        line_width=1.5,
-    )
-    # SPOT annotation as a scatter point to avoid string-y issue
-    fig.add_trace(go.Scatter(
-        x=[max(abs(v) for v in vals) * 0.95] if vals else [1],
-        y=[spot],
-        mode="text",
-        text=[f"SPOT ${spot:.2f}"],
-        textfont=dict(color="#06b6d4", size=10),
-        showlegend=False,
-    ))
-
-    # VOL TRIGGER / GAMMA FLIP — horizontal line at flip strike (numeric y)
-    if flip_level and np.isfinite(flip_level):
-        fig.add_hline(
-            y=flip_level,
-            line_dash="dashdot",
+    # GAMMA FLIP / VOL TRIGGER marker
+    # This is the strike where net_gex transitions + → -
+    # i.e. where the bars visually cross from green to red
+    if flip_level and np.isfinite(float(flip_level)):
+        fig.add_vline(
+            x=float(flip_level),
+            line_dash="dash",
             line_color=_C_FLIP,
             line_width=2,
+            annotation_text=f"FLIP ${flip_level:.2f}",
+            annotation_font_size=10,
+            annotation_font_color=_C_FLIP,
+            annotation_position="top left",
         )
-        fig.add_trace(go.Scatter(
-            x=[-(max(abs(v) for v in vals) * 0.95)] if vals else [-1],
-            y=[flip_level],
-            mode="text",
-            text=[f"VOL TRIGGER ${flip_level:.2f}"],
-            textfont=dict(color=_C_FLIP, size=10),
-            showlegend=False,
-        ))
-
-    fig.update_layout(
-        xaxis=dict(
-            title="GEX ($M)",
-            zeroline=True,
-            zerolinecolor="rgba(255,255,255,0.25)",
-            zerolinewidth=2,
-        ),
-        yaxis=dict(
-            title="STRIKE",
-            autorange="reversed",
-            tickformat="$.2f",
-        ),
-    )
 
     return plotly_dark(fig, title, height)
 

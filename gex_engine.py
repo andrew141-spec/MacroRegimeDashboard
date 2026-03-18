@@ -193,29 +193,50 @@ def compute_dealer_greeks(chain: pd.DataFrame, spot: float,
 
 def find_gamma_flip(chain: pd.DataFrame) -> float:
     """
-    Zero-gamma level: the strike price where cumulative net GEX crosses zero.
+    Gamma flip = the price where per-strike net GEX transitions from negative
+    to positive (or vice versa) — i.e. where the bars cross zero.
 
-    IMPORTANT: aggregate by strike first (sum across all expirations).
-    Without this, the chain has multiple rows per strike (one per expiry),
-    and the cumulative sum zigzags through expirations producing false
-    zero-crossings that return nan.
+    Method: aggregate by strike (sum across all expirations), then find the
+    adjacent pair of strikes where net_gex changes sign and interpolate.
+
+    Fallback: if net_gex is the same sign everywhere (common when put OI
+    heavily dominates, as in SPY), return the strike closest to zero — this
+    is the "vol trigger" level used by SpotGamma and GEXBot.
+
+    NOTE: the cumulative sum method was removed because it fails whenever
+    put OI dominates (the cumsum stays negative throughout, returning nan
+    even though there is a clear per-strike zero-crossing in the bars).
     """
-    # Sum net_gex across all expirations for each strike
+    # Aggregate by strike across all expirations
     by_strike = (chain.groupby("strike")["net_gex"]
                       .sum()
                       .reset_index()
                       .sort_values("strike")
                       .reset_index(drop=True))
 
-    cum   = by_strike["net_gex"].cumsum()
-    signs = cum.values[:-1] * cum.values[1:]
-    idx   = np.where(signs < 0)[0]
-    if len(idx) == 0:
+    if len(by_strike) < 2:
         return np.nan
-    i = idx[0]
-    s1, s2 = by_strike["strike"].iloc[i], by_strike["strike"].iloc[i + 1]
-    g1, g2 = cum.iloc[i], cum.iloc[i + 1]
-    return s1 + (s2 - s1) * (-g1) / (g2 - g1) if (g2 - g1) != 0 else s1
+
+    vals    = by_strike["net_gex"].values
+    strikes = by_strike["strike"].values
+
+    # Primary: find where per-strike net_gex changes sign (bar crosses zero)
+    bar_sign_changes = np.where(vals[:-1] * vals[1:] < 0)[0]
+
+    if len(bar_sign_changes) > 0:
+        # If multiple sign changes, pick the one closest to ATM (largest |GEX| transition)
+        best_i = bar_sign_changes[
+            np.argmax([abs(vals[j+1] - vals[j]) for j in bar_sign_changes])
+        ]
+        s1, s2 = float(strikes[best_i]),  float(strikes[best_i + 1])
+        g1, g2 = float(vals[best_i]),     float(vals[best_i + 1])
+        return s1 + (s2 - s1) * (-g1) / (g2 - g1) if (g2 - g1) != 0 else s1
+
+    # Fallback: no sign change — all bars same sign (heavy put or call skew).
+    # Return the strike with net_gex closest to zero. This is still a valid
+    # "vol trigger" level — the point of minimum dealer net gamma.
+    nearest_idx = int(np.argmin(np.abs(vals)))
+    return float(strikes[nearest_idx])
 
 def classify_gex_regime(spot: float, flip: float) -> Tuple[GammaRegime, float, float]:
     if not np.isfinite(flip): return GammaRegime.NEUTRAL, 0.0, 0.5

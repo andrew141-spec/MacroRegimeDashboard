@@ -1,15 +1,9 @@
 # schwab_api.py — Schwab OAuth2 client, Supabase token storage, options chain
-import os, re, time, math, datetime as dt, json, tempfile
-from dataclasses import dataclass, field
+import os, time, math, datetime as dt, json, tempfile
 from typing import List, Dict, Tuple, Optional
-from enum import Enum
 import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.graph_objects as go
-import plotly.express as px
-import yfinance as yf
-from fredapi import Fred
 from scipy import stats as scipy_stats
 from scipy.stats import norm as scipy_norm
 from urllib.request import Request, urlopen
@@ -338,6 +332,10 @@ def schwab_get_options_chain(client, symbol: str = "SPY",
                     iv=("iv", "mean"),
                     call_oi=("call_oi", "sum"),
                     put_oi=("put_oi", "sum"),
+                    # Preserve Schwab's model gamma — averaged across contracts
+                    # at the same strike/expiry. gex_engine prefers this over
+                    # recomputing from BS when it's available and non-zero.
+                    schwab_gamma=("schwab_gamma", "mean"),
                 )
                 .reset_index())
         return df

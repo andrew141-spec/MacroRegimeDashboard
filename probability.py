@@ -1,27 +1,21 @@
 # probability.py — probability composite, session context, setups, regime
-import os, re, time, math, datetime as dt, json, tempfile
-from dataclasses import dataclass, field
+import math, datetime as dt
 from typing import List, Dict, Tuple, Optional
 from enum import Enum
 import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.graph_objects as go
-import plotly.express as px
-import yfinance as yf
-from fredapi import Fred
-from scipy import stats as scipy_stats
-from scipy.stats import norm as scipy_norm
-from urllib.request import Request, urlopen
-import xml.etree.ElementTree as ET
 from config import GammaState, GammaRegime, SetupScore
 from utils import _to_1d, kelly, current_pct_rank
 
-def compute_prob_composite(leading, fear_score, three_puts_score, liq_anxiety,
-                            exhaustion, market_index, geo_shock, regime_change_p,
+def compute_prob_composite(leading, fear_score, geo_shock, regime_change_p,
                             gex_state: GammaState,
                             nfci_coincident: float = 50.0,
                             liq_dir_coincident: float = 50.0) -> Dict:
+    # NOTE: three_puts_score, liq_anxiety, exhaustion, market_index removed from
+    # signature — they shared underlying yield curve data with signals already in
+    # the short/medium buckets, making the effective signal count ~2 not 5.
+    # They are still computed in render_dashboard and displayed as CONTEXT ONLY.
     """
     Three-horizon probability composite — separating signals by forecast window.
 

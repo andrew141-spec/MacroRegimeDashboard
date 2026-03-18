@@ -93,23 +93,24 @@ def compute_gex_from_chain(chain: pd.DataFrame, spot: float,
     chain["charm"] = chain.apply(
         lambda row: bs_charm(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
 
-    # GEX per the equation: Σ(Γᵢ · OIᵢ · ContractSize · S²)
+    # GEX per equation: Σᵢ (Γᵢ · OIᵢ · ContractSize · S²)
+    # bs_gamma = φ(d1) / (S·σ·√T), so: bs_gamma * OI * C * S² = φ(d1)*OI*C*S / (σ·√T)
+    # This is dollar gamma — the $ move in dealer delta per 1% move in spot.
+    # We then divide by 100 to normalise to "per 1-point move" for display.
     # calls: dealers long gamma = stabilizing (+)
     # puts:  dealers short gamma = destabilizing (-)
-    # S² = spot² — the dollar gamma term that gives GEX its units of $ per 1% move
-    chain["call_gex"] =  chain["call_oi"] * chain["gamma"] * multiplier * (spot ** 2)
-    chain["put_gex"]  = -chain["put_oi"] * chain["gamma"] * multiplier * (spot ** 2)
+    S2 = spot * spot / 100.0   # S²/100 — standard GEX normalisation
+    chain["call_gex"] =  chain["call_oi"] * chain["gamma"] * multiplier * S2
+    chain["put_gex"]  = -chain["put_oi"] * chain["gamma"] * multiplier * S2
     chain["net_gex"]  =  chain["call_gex"] + chain["put_gex"]
 
-    # VEX: positive vanna + rising IV → dealers buy (bullish pressure on IV spike)
-    #      positive vanna + falling IV → dealers sell (bearish on vol crush)
-    chain["call_vex"] =  chain["call_oi"] * chain["vanna"] * multiplier * (spot ** 2)
-    chain["put_vex"]  = -chain["put_oi"] * chain["vanna"] * multiplier * (spot ** 2)
+    # VEX and CEX use same normalisation
+    chain["call_vex"] =  chain["call_oi"] * chain["vanna"] * multiplier * S2
+    chain["put_vex"]  = -chain["put_oi"] * chain["vanna"] * multiplier * S2
     chain["net_vex"]  =  chain["call_vex"] + chain["put_vex"]
 
-    # CEX: positive charm → time decay forces dealers to buy (upward drift)
-    chain["call_cex"] =  chain["call_oi"] * chain["charm"] * multiplier * (spot ** 2)
-    chain["put_cex"]  = -chain["put_oi"] * chain["charm"] * multiplier * (spot ** 2)
+    chain["call_cex"] =  chain["call_oi"] * chain["charm"] * multiplier * S2
+    chain["put_cex"]  = -chain["put_oi"] * chain["charm"] * multiplier * S2
     chain["net_cex"]  =  chain["call_cex"] + chain["put_cex"]
 
     return chain
@@ -180,19 +181,53 @@ def compute_dealer_greeks(chain: pd.DataFrame, spot: float,
 
 def find_gamma_flip(chain: pd.DataFrame) -> float:
     """
-    Zero-gamma level where: Sigma_i (Gamma_i * OI_i * ContractSize * S^2) = 0
-    Linearly interpolates the zero-crossing of cumulative net_gex across strikes.
-    net_gex already embeds S^2 from compute_gex_from_chain.
+    Zero-gamma level: the spot price S* where Σᵢ(Γᵢ(S*) · OIᵢ · C · S*²) = 0.
+
+    Vectorised scan: for each candidate spot price across the strike range,
+    compute total net GEX and interpolate the zero-crossing.
+    This is correct — the flip is where TOTAL exposure across ALL strikes = 0,
+    not a cumulative-sum-by-strike crossing.
     """
-    sc = chain.sort_values("strike").reset_index(drop=True)
-    cum = sc["net_gex"].cumsum()
-    signs = cum.values[:-1] * cum.values[1:]
-    idx = np.where(signs < 0)[0]
-    if len(idx) == 0: return np.nan
-    i = idx[0]
-    s1, s2 = sc["strike"].iloc[i], sc["strike"].iloc[i+1]
-    g1, g2 = cum.iloc[i], cum.iloc[i+1]
-    return s1 + (s2 - s1) * (-g1) / (g2 - g1) if (g2 - g1) != 0 else s1
+    if "strike" not in chain.columns or len(chain) == 0:
+        return np.nan
+
+    # Pre-extract arrays for speed
+    K    = chain["strike"].values.astype(float)
+    T    = chain["expiry_T"].values.astype(float)
+    iv   = chain["iv"].values.astype(float)
+    c_oi = chain["call_oi"].values.astype(float)
+    p_oi = chain["put_oi"].values.astype(float)
+    net_oi = c_oi - p_oi   # calls positive, puts negative
+
+    s_min = K.min() * 0.97
+    s_max = K.max() * 1.03
+    candidates = np.linspace(s_min, s_max, 400)
+
+    total_gex = np.empty(len(candidates))
+    for j, s in enumerate(candidates):
+        # Vectorised BS gamma across all strikes at this spot
+        mask = (T > 0) & (iv > 0)
+        d1 = np.where(mask,
+            (np.log(s / np.where(K > 0, K, 1)) +
+             (0.05 + 0.5 * iv**2) * T) / (iv * np.sqrt(np.maximum(T, 1e-10))),
+            0.0)
+        gamma_vec = np.where(mask,
+            (1.0 / (np.sqrt(2 * math.pi)) * np.exp(-0.5 * d1**2)) /
+            (s * iv * np.sqrt(np.maximum(T, 1e-10))),
+            0.0)
+        S2 = s * s / 100.0
+        total_gex[j] = float(np.sum(net_oi * gamma_vec * 100 * S2))
+
+    signs = total_gex[:-1] * total_gex[1:]
+    idx   = np.where(signs < 0)[0]
+    if len(idx) == 0:
+        return np.nan
+    i  = idx[0]
+    s1, s2 = candidates[i], candidates[i + 1]
+    g1, g2 = total_gex[i], total_gex[i + 1]
+    if (g2 - g1) == 0:
+        return float(s1)
+    return float(s1 + (s2 - s1) * (-g1) / (g2 - g1))
 
 def classify_gex_regime(spot: float, flip: float) -> Tuple[GammaRegime, float, float]:
     if not np.isfinite(flip): return GammaRegime.NEUTRAL, 0.0, 0.5

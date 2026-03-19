@@ -597,7 +597,6 @@ def render_gex_engine():
         # No 'value=' arg — Streamlit reads from session_state[key] automatically
         symbol    = st.text_input("Options Symbol", key="gex_symbol_input").strip().upper()
         # Write back the uppercased value so it persists correctly
-        st.session_state["gex_symbol_input"] = symbol
         use_schwab = st.toggle("Use Schwab/TOS (live IV)", key="gex_use_schwab")
 
     # ── Data fetch ────────────────────────────────────────────────────────
@@ -980,7 +979,6 @@ def render_setups_page():
     col_sym, col_sch, col_info = st.columns([1, 1, 3])
     with col_sym:
         symbol = st.text_input("Symbol", key="setups_symbol").strip().upper()
-        st.session_state["setups_symbol"] = symbol
     with col_sch:
         use_schwab = st.toggle("Schwab (live IV)", key="setups_schwab")
 

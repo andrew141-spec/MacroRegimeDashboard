@@ -744,7 +744,7 @@ def render_gex_engine():
 
             fig_gex = _make_heatmap(chain_df, spot, "net_gex",
                                     f"{symbol} GEX", int(hm_height))
-            st.plotly_chart(fig_gex, use_container_width=True)
+            st.plotly_chart(fig_gex, use_container_width=True, key="gex_chart_heatmap")
         else:
             st.caption("Green = positive gamma (dealers stabilize). Red = negative gamma (dealers amplify). Yellow line = gamma flip.")
             # Use same strike range setting as heatmap
@@ -756,7 +756,7 @@ def render_gex_engine():
             fig_gex = _greek_bar_chart(filtered, spot,
                                        "Net GEX by Strike ($M)", _C_POS, _C_NEG, gs.gamma_flip,
                                        height=int(st.session_state["gex_hm_height"]))
-            st.plotly_chart(fig_gex, use_container_width=True)
+            st.plotly_chart(fig_gex, use_container_width=True, key="gex_chart_bar")
 
         c1, c2 = st.columns(2)
         with c1:
@@ -797,11 +797,11 @@ def render_gex_engine():
         if view_mode_vex == "Heatmap":
             st.caption("Strike × Expiry matrix · Purple/green = positive vanna · Red = negative vanna · TOTAL = net across all expiries")
             fig_vex = _make_heatmap(chain_df, spot, "net_vex", f"{symbol} VEX", int(st.session_state.get("gex_hm_height", 1000)))
-            st.plotly_chart(fig_vex, use_container_width=True)
+            st.plotly_chart(fig_vex, use_container_width=True, key="gex_chart_vex_heatmap")
         else:
             fig_vex = _greek_bar_chart(dg.vex_by_strike, spot,
                                        "Net VEX by Strike ($M)", _C_VEX, _C_NEG, gs.gamma_flip)
-            st.plotly_chart(fig_vex, use_container_width=True)
+            st.plotly_chart(fig_vex, use_container_width=True, key="gex_chart_vex_bar")
 
         v1, v2 = st.columns(2)
         ntm_vex_val = sum(v for k,v in dg.vex_by_strike.items() if abs(k-spot)/spot < 0.02)
@@ -845,11 +845,11 @@ def render_gex_engine():
         if view_mode_cex == "Heatmap":
             st.caption("Strike × Expiry matrix · Teal/green = positive charm (dealers buy as time passes) · Red = negative · TOTAL = net")
             fig_cex = _make_heatmap(chain_df, spot, "net_cex", f"{symbol} CEX", int(st.session_state.get("gex_hm_height", 1000)))
-            st.plotly_chart(fig_cex, use_container_width=True)
+            st.plotly_chart(fig_cex, use_container_width=True, key="gex_chart_cex_heatmap")
         else:
             fig_cex = _greek_bar_chart(dg.cex_by_strike, spot,
                                        "Net CEX by Strike ($M)", _C_CEX, _C_NEG, gs.gamma_flip)
-            st.plotly_chart(fig_cex, use_container_width=True)
+            st.plotly_chart(fig_cex, use_container_width=True, key="gex_chart_cex_bar")
 
         c1, c2 = st.columns(2)
         with c1:

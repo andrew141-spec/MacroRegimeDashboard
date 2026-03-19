@@ -177,24 +177,17 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
         ygap=0.5,
     ))
 
-    # Highlight the spot row with a box shape
-    if spot_row_idx is not None:
-        fig.add_shape(
-            type="rect",
-            x0=-0.5, x1=len(cols) - 0.5,
-            y0=spot_row_idx - 0.5, y1=spot_row_idx + 0.5,
-            xref="x", yref="y",
-            line=dict(color="#06b6d4", width=2),
-            fillcolor="rgba(6,182,212,0.04)",
-        )
+    # Spot row highlight — use paper y-reference so it doesn't distort the axis
+    # We just annotate the y-axis label instead of drawing a shape
+    spot_label = y_labels[spot_row_idx] if spot_row_idx is not None else None
 
-    # Highlight TOTAL column with subtle border
+    # TOTAL column border — use paper coords so no axis distortion
     fig.add_shape(
         type="rect",
         x0=len(cols) - 1.5, x1=len(cols) - 0.5,
-        y0=-0.5, y1=len(strikes) - 0.5,
-        xref="x", yref="y",
-        line=dict(color="rgba(255,255,255,0.25)", width=1, dash="dot"),
+        y0=0, y1=1,
+        xref="x", yref="paper",
+        line=dict(color="rgba(255,255,255,0.20)", width=1, dash="dot"),
         fillcolor="rgba(0,0,0,0)",
     )
 
@@ -220,7 +213,9 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
             tickfont=dict(size=8 if n_rows > 30 else 10),
             gridcolor="rgba(255,255,255,0.04)",
             fixedrange=False,
-            autorange=True,
+            # Lock range to exactly the strikes — prevents axis expanding to 0
+            range=[-0.5, n_rows - 0.5],
+            autorange=False,
         ),
     )
 

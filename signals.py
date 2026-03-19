@@ -406,8 +406,22 @@ def compute_1d_prob(
     dollar_signal    = -dxy_1d
 
     # Combine: both pointing same direction = stronger signal
-    micro_raw = credit_1d_signal * 2000 + dollar_signal * 1500  # scale to approx -1/+1
-    micro_score = float(np.clip(50.0 + micro_raw * 20, 20, 80))
+    # Threshold-based scoring (same approach as vts/mom/curve — avoids clipping)
+    # credit_1d_signal: HYG daily change minus half LQD daily change
+    # dollar_signal: negative of DXY daily change (dollar up = bearish)
+    if credit_1d_signal >  0.003:  credit_score = 65.0   # strong risk-on
+    elif credit_1d_signal >  0.001: credit_score = 57.0
+    elif credit_1d_signal > -0.001: credit_score = 50.0   # neutral
+    elif credit_1d_signal > -0.003: credit_score = 43.0
+    else:                           credit_score = 35.0   # strong risk-off
+
+    if dollar_signal >  0.002:   dollar_score = 60.0   # dollar weak = bullish
+    elif dollar_signal >  0.0005: dollar_score = 54.0
+    elif dollar_signal > -0.0005: dollar_score = 50.0
+    elif dollar_signal > -0.002:  dollar_score = 46.0
+    else:                         dollar_score = 40.0   # dollar strong = bearish
+
+    micro_score = float(credit_score * 0.6 + dollar_score * 0.4)
 
     # ── Factor 5: Curve inversion (structural 1D headwind/tailwind) ───────
     curve_bp = float(s_2s10s.dropna().iloc[-1]) if s_2s10s.dropna().size else 0.0
@@ -432,11 +446,14 @@ def compute_1d_prob(
     # In NEUTRAL:          equal weights, all compressed toward 50
     #
     if regime in (GammaRegime.STRONG_POSITIVE, GammaRegime.POSITIVE):
-        w = {"vts": 0.18, "mom": 0.12, "micro": 0.35, "curve": 0.12, "liq": 0.23}
+        # Positive gamma: mean-reversion dominant, credit confirms, momentum faded
+        w = {"vts": 0.20, "mom": 0.15, "micro": 0.25, "curve": 0.15, "liq": 0.25}
     elif regime in (GammaRegime.NEGATIVE, GammaRegime.STRONG_NEGATIVE):
-        w = {"vts": 0.22, "mom": 0.30, "micro": 0.25, "curve": 0.10, "liq": 0.13}
+        # Negative gamma: momentum matters most, VIX term structure critical
+        w = {"vts": 0.25, "mom": 0.30, "micro": 0.20, "curve": 0.10, "liq": 0.15}
     else:
-        w = {"vts": 0.20, "mom": 0.20, "micro": 0.25, "curve": 0.15, "liq": 0.20}
+        # Neutral: balanced weights
+        w = {"vts": 0.22, "mom": 0.20, "micro": 0.22, "curve": 0.16, "liq": 0.20}
 
     raw_1d = (
         w["vts"]   * vts_score   +

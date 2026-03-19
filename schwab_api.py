@@ -169,9 +169,13 @@ def schwab_run_auth_flow(client_id: str, client_secret: str,
         return None
     try:
         auth_context = schwab.auth.get_auth_context(client_id, redirect_uri)
-        # Store the full auth_context — needed by client_from_received_url later
-        st.session_state["_schwab_auth_context"] = auth_context
-        st.session_state["_schwab_oauth_redir"]  = redirect_uri
+        # Persist as plain strings — AuthContext is a namedtuple and session_state
+        # can lose complex objects across reruns (especially when the user opens
+        # the auth URL in a new tab). Strings survive reliably.
+        st.session_state["_schwab_auth_callback_url"]      = auth_context.callback_url
+        st.session_state["_schwab_auth_authorization_url"]  = auth_context.authorization_url
+        st.session_state["_schwab_auth_state"]              = auth_context.state
+        st.session_state["_schwab_oauth_redir"]             = redirect_uri
         return auth_context.authorization_url
     except Exception as e:
         return f"error: {e}"
@@ -191,11 +195,22 @@ def schwab_complete_auth(client_id: str, client_secret: str,
     try:
         tmp_path = tempfile.mktemp(suffix=".json", prefix="schwab_token_")
 
-        # Retrieve the AuthContext stored when schwab_run_auth_flow was called.
-        # If missing (e.g. session was reset), rebuild it from the redirect_uri.
-        auth_context = st.session_state.get("_schwab_auth_context")
-        if auth_context is None:
-            auth_context = schwab.auth.get_auth_context(client_id, redirect_uri)
+        # Reconstruct AuthContext from the three strings saved during run_auth_flow.
+        # We store as plain strings because Streamlit session_state can lose complex
+        # objects across reruns (the user opens auth URL in a new tab → state is gone).
+        # Reconstructing from saved strings guarantees the state value matches.
+        saved_callback_url = st.session_state.get("_schwab_auth_callback_url", redirect_uri)
+        saved_auth_url     = st.session_state.get("_schwab_auth_authorization_url", "")
+        saved_state        = st.session_state.get("_schwab_auth_state", "")
+
+        if not saved_state:
+            return False, ("Auth state missing — session was reset. "                           "Please click 'Generate Auth URL' again and complete "                           "the flow without refreshing the page.")
+
+        auth_context = schwab.auth.AuthContext(
+            callback_url=saved_callback_url,
+            authorization_url=saved_auth_url,
+            state=saved_state,
+        )
 
         def _write_token(token):
             with open(tmp_path, "w") as f:

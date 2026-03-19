@@ -29,6 +29,178 @@ _C_VEX   = "#8b5cf6"   # purple — vanna
 _C_CEX   = "#06b6d4"   # teal   — charm
 _C_MUTED = "rgba(255,255,255,0.52)"
 
+def _make_heatmap(chain_df: pd.DataFrame, spot: float,
+                  greek: str = "net_gex",
+                  title: str = "GEX Heatmap",
+                  height: int = 620) -> go.Figure:
+    """
+    Build a GEX/VEX/CEX heatmap matching the reference layout:
+      - Rows    = strike prices (high at top, low at bottom)
+      - Columns = expiration dates
+      - Values  = greek exposure in $M for that strike × expiry
+      - Colour  = green (positive) → red (negative), intensity ∝ magnitude
+      - Rightmost column = total across all expirations
+      - Left annotation = spot price arrow row
+    """
+    from gex_engine import compute_gex_from_chain
+
+    if chain_df is None or len(chain_df) == 0:
+        fig = go.Figure()
+        fig.add_annotation(text="No data", x=0.5, y=0.5, showarrow=False,
+                           xref="paper", yref="paper", font=dict(color="white"))
+        return fig
+
+    # Compute all Greeks on the full chain
+    gex_chain = compute_gex_from_chain(chain_df, spot)
+
+    # Map greek arg to column
+    col_map = {"net_gex": "net_gex", "net_vex": "net_vex", "net_cex": "net_cex"}
+    greek_col = col_map.get(greek, "net_gex")
+
+    # Build expiry date labels
+    gex_chain["exp_label"] = (gex_chain["expiry_T"] * 365).round(0).astype(int).apply(
+        lambda d: (dt.date.today() + dt.timedelta(days=int(d))).strftime("%b %-d")
+    )
+
+    # Pivot: rows=strike, cols=exp_label, values=greek_col (in $M)
+    pivot = (gex_chain
+             .groupby(["strike", "exp_label"])[greek_col]
+             .sum()
+             .reset_index()
+             .pivot(index="strike", columns="exp_label", values=greek_col)
+             .fillna(0)
+             / 1e6)
+
+    # Sort strikes descending (high at top like reference image)
+    pivot = pivot.sort_index(ascending=False)
+
+    # Filter to ±12% of spot for readability
+    pivot = pivot[(pivot.index >= spot * 0.88) & (pivot.index <= spot * 1.12)]
+
+    # Sort columns by date
+    try:
+        col_order = sorted(pivot.columns,
+                           key=lambda x: dt.datetime.strptime(x, "%b %d"))
+        pivot = pivot[col_order]
+    except Exception:
+        pass
+
+    # Add total column
+    pivot["TOTAL"] = pivot.sum(axis=1)
+
+    strikes  = list(pivot.index)
+    cols     = list(pivot.columns)
+    z_vals   = pivot.values.tolist()
+
+    # Text annotations: show value if |val| > 0.5M, else blank
+    text_vals = [
+        [f"${v:.1f}M" if abs(v) >= 0.5 else "" for v in row]
+        for row in z_vals
+    ]
+
+    # Color scale: red → black → green, centred at 0
+    colorscale = [
+        [0.0,  "#b91c1c"],   # deep red
+        [0.35, "#ef4444"],   # red
+        [0.48, "#1a1a1a"],   # near-black at zero
+        [0.52, "#1a1a1a"],
+        [0.65, "#10b981"],   # green
+        [1.0,  "#065f46"],   # deep green
+    ]
+
+    # Cap colour range at 95th percentile to avoid outliers swamping scale
+    flat = [abs(v) for row in z_vals for v in row if v != 0]
+    zmax = float(np.percentile(flat, 95)) if flat else 10.0
+
+    # Spot row highlight: find nearest strike to spot
+    nearest_strike = min(strikes, key=lambda s: abs(s - spot)) if strikes else spot
+    spot_row_idx   = strikes.index(nearest_strike) if nearest_strike in strikes else None
+
+    # Y-axis labels with spot marker
+    y_labels = []
+    for s in strikes:
+        if abs(s - spot) / spot < 0.0015:
+            y_labels.append(f"→ ${s:.2f}")
+        else:
+            y_labels.append(f"${s:.0f}")
+
+    fig = go.Figure(go.Heatmap(
+        z=z_vals,
+        x=cols,
+        y=y_labels,
+        text=text_vals,
+        texttemplate="%{text}",
+        textfont=dict(size=9, color="rgba(255,255,255,0.85)"),
+        colorscale=colorscale,
+        zmid=0,
+        zmin=-zmax,
+        zmax=zmax,
+        showscale=True,
+        colorbar=dict(
+            title=dict(text="$M", font=dict(size=10, color="rgba(255,255,255,0.6)")),
+            tickfont=dict(size=9, color="rgba(255,255,255,0.6)"),
+            thickness=12,
+            len=0.85,
+            bgcolor="rgba(0,0,0,0)",
+            bordercolor="rgba(255,255,255,0.1)",
+        ),
+        hoverongaps=False,
+        hovertemplate="Strike: %{y}<br>Expiry: %{x}<br>Value: %{z:.2f}M<extra></extra>",
+        xgap=1,
+        ygap=0.5,
+    ))
+
+    # Highlight the spot row with a box shape
+    if spot_row_idx is not None:
+        fig.add_shape(
+            type="rect",
+            x0=-0.5, x1=len(cols) - 0.5,
+            y0=spot_row_idx - 0.5, y1=spot_row_idx + 0.5,
+            xref="x", yref="y",
+            line=dict(color="#06b6d4", width=2),
+            fillcolor="rgba(6,182,212,0.04)",
+        )
+
+    # Highlight TOTAL column with subtle border
+    fig.add_shape(
+        type="rect",
+        x0=len(cols) - 1.5, x1=len(cols) - 0.5,
+        y0=-0.5, y1=len(strikes) - 0.5,
+        xref="x", yref="y",
+        line=dict(color="rgba(255,255,255,0.25)", width=1, dash="dot"),
+        fillcolor="rgba(0,0,0,0)",
+    )
+
+    fig.update_layout(
+        title=dict(
+            text=f"{title} — {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} — Current Price: ${spot:.2f}",
+            font=dict(size=12, color="rgba(255,255,255,0.7)"),
+            x=0.5,
+        ),
+        paper_bgcolor="rgba(15,15,15,1)",
+        plot_bgcolor="rgba(15,15,15,1)",
+        font=dict(color="rgba(255,255,255,0.75)", family="monospace"),
+        height=height,
+        margin=dict(l=80, r=80, t=50, b=50),
+        xaxis=dict(
+            side="bottom",
+            tickfont=dict(size=10),
+            gridcolor="rgba(255,255,255,0.04)",
+            fixedrange=False,
+        ),
+        yaxis=dict(
+            tickfont=dict(size=9),
+            gridcolor="rgba(255,255,255,0.04)",
+            fixedrange=False,
+            autorange=True,
+        ),
+    )
+
+    return fig
+
+
+
+
 def _greek_bar_chart(by_strike: dict, spot: float, title: str,
                      pos_color: str, neg_color: str,
                      flip_level: float = None, height=340) -> go.Figure:
@@ -326,50 +498,6 @@ def render_gex_engine():
     st.markdown(CSS, unsafe_allow_html=True)
     st.markdown("## ⚡ GEX Engine — Dealer Greeks")
 
-    # ── Sidebar refresh controls ──────────────────────────────────────────
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### ⚡ GEX Refresh")
-
-    auto_refresh = st.sidebar.toggle("Auto refresh", value=True, key="gex_auto_refresh")
-
-    refresh_options = {
-        "30 seconds":  30,
-        "1 minute":    60,
-        "2 minutes":   120,
-        "5 minutes":   300,
-        "10 minutes":  600,
-        "15 minutes":  900,
-        "30 minutes":  1800,
-    }
-    refresh_label = st.sidebar.selectbox(
-        "Refresh interval",
-        options=list(refresh_options.keys()),
-        index=2,   # default: 2 minutes
-        key="gex_refresh_interval",
-        disabled=not auto_refresh,
-    )
-    refresh_sec = refresh_options[refresh_label]
-
-    # Manual refresh button — clears cache so fresh data is fetched immediately
-    if st.sidebar.button("🔄 Refresh now", use_container_width=True, key="gex_manual_refresh"):
-        st.cache_data.clear()
-        st.rerun()
-
-    # Status display
-    if auto_refresh:
-        st.sidebar.caption(f"🟢 Auto-refreshing every {refresh_label}")
-    else:
-        st.sidebar.caption("⚫ Auto-refresh off — use button above")
-
-    st.sidebar.markdown("---")
-    st.sidebar.caption(
-        "ℹ️ yfinance OI data updates once per day (after market close). "
-        "Live IV from Schwab updates on every refresh."
-    )
-
-    # Fire the JS auto-refresh
-    autorefresh_js(refresh_sec, auto_refresh)
-
     col_s, col_m = st.columns([1, 3])
     with col_s:
         symbol    = st.text_input("Options Symbol", "SPY", key="gex_symbol_input")
@@ -450,10 +578,21 @@ def render_gex_engine():
 
     with tab_gex:
         st.markdown(f"{sec_hdr('GAMMA EXPOSURE — Reaction to Price')}", unsafe_allow_html=True)
-        st.caption("Green = positive gamma (dealers stabilize). Red = negative gamma (dealers amplify). Yellow line = gamma flip.")
-        fig_gex = _greek_bar_chart(dg.gex_by_strike, spot,
-                                   "Net GEX by Strike ($M)", _C_POS, _C_NEG, gs.gamma_flip)
-        st.plotly_chart(fig_gex, use_container_width=True)
+
+        view_mode = st.radio("View", ["Heatmap", "Bar Chart"], horizontal=True, key="gex_view_mode")
+
+        if view_mode == "Heatmap":
+            st.caption("Strike × Expiry matrix · Green = positive GEX (dealers stabilize) · Red = negative GEX (dealers amplify) · → = spot price · TOTAL = net across all expiries")
+            n_strikes = st.slider("Strike range (% from spot)", 5, 15, 10, key="gex_hm_range") / 100
+            hm_height = st.slider("Height", 400, 1000, 700, step=50, key="gex_hm_height")
+            fig_gex = _make_heatmap(chain_df, spot, "net_gex",
+                                    f"{symbol} GEX", hm_height)
+            st.plotly_chart(fig_gex, use_container_width=True)
+        else:
+            st.caption("Green = positive gamma (dealers stabilize). Red = negative gamma (dealers amplify). Yellow line = gamma flip.")
+            fig_gex = _greek_bar_chart(dg.gex_by_strike, spot,
+                                       "Net GEX by Strike ($M)", _C_POS, _C_NEG, gs.gamma_flip)
+            st.plotly_chart(fig_gex, use_container_width=True)
 
         c1, c2 = st.columns(2)
         with c1:
@@ -487,12 +626,18 @@ def render_gex_engine():
     with tab_vex:
         st.markdown(f"{sec_hdr('VANNA EXPOSURE — Reaction to IV Changes')}", unsafe_allow_html=True)
         st.caption("Positive vanna: falling IV → dealers buy underlying (bullish). Negative vanna: falling IV → dealers sell (bearish).")
-        if "source" not in source.lower() or True:
-            if "yfinance" in source.lower():
-                st.info("📋 VEX computed from EOD IV. With Schwab/TOS connected, this uses live per-strike IV for real-time vanna.")
-        fig_vex = _greek_bar_chart(dg.vex_by_strike, spot,
-                                   "Net VEX by Strike ($M)", _C_VEX, _C_NEG, gs.gamma_flip)
-        st.plotly_chart(fig_vex, use_container_width=True)
+        if "yfinance" in source.lower():
+            st.info("📋 VEX computed from EOD IV. With Schwab/TOS connected, this uses live per-strike IV for real-time vanna.")
+
+        view_mode_vex = st.radio("View", ["Heatmap", "Bar Chart"], horizontal=True, key="vex_view_mode")
+        if view_mode_vex == "Heatmap":
+            st.caption("Strike × Expiry matrix · Purple/green = positive vanna · Red = negative vanna · TOTAL = net across all expiries")
+            fig_vex = _make_heatmap(chain_df, spot, "net_vex", f"{symbol} VEX", 700)
+            st.plotly_chart(fig_vex, use_container_width=True)
+        else:
+            fig_vex = _greek_bar_chart(dg.vex_by_strike, spot,
+                                       "Net VEX by Strike ($M)", _C_VEX, _C_NEG, gs.gamma_flip)
+            st.plotly_chart(fig_vex, use_container_width=True)
 
         v1, v2 = st.columns(2)
         ntm_vex_val = sum(v for k,v in dg.vex_by_strike.items() if abs(k-spot)/spot < 0.02)
@@ -531,9 +676,16 @@ def render_gex_engine():
         st.caption("Positive charm: time passing → dealers buy underlying (upward drift). Negative charm: dealers sell (downward drift).")
         if "yfinance" in source.lower():
             st.info("📋 CEX computed from EOD IV/OI. With Schwab/TOS, charm reflects live 0DTE positioning for intraday drift signals.")
-        fig_cex = _greek_bar_chart(dg.cex_by_strike, spot,
-                                   "Net CEX by Strike ($M)", _C_CEX, _C_NEG, gs.gamma_flip)
-        st.plotly_chart(fig_cex, use_container_width=True)
+
+        view_mode_cex = st.radio("View", ["Heatmap", "Bar Chart"], horizontal=True, key="cex_view_mode")
+        if view_mode_cex == "Heatmap":
+            st.caption("Strike × Expiry matrix · Teal/green = positive charm (dealers buy as time passes) · Red = negative · TOTAL = net")
+            fig_cex = _make_heatmap(chain_df, spot, "net_cex", f"{symbol} CEX", 700)
+            st.plotly_chart(fig_cex, use_container_width=True)
+        else:
+            fig_cex = _greek_bar_chart(dg.cex_by_strike, spot,
+                                       "Net CEX by Strike ($M)", _C_CEX, _C_NEG, gs.gamma_flip)
+            st.plotly_chart(fig_cex, use_container_width=True)
 
         c1, c2 = st.columns(2)
         with c1:

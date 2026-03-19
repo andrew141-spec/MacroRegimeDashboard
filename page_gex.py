@@ -128,13 +128,9 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
     flat = [abs(v) for row in z_vals for v in row if abs(v) >= thresh]
     zmax = float(np.percentile(flat, 97)) if flat else 100.0
     colorscale = [
-        [0.00, "#4c0519"],  # deep dark red
-        [0.25, "#dc2626"],  # red
-        [0.45, "#1a0a0a"],  # very dark red tint (not black) near zero
-        [0.50, "#0d1117"],  # near-zero: dark slate (matches reference dark bg)
-        [0.55, "#0a1a0a"],  # very dark green tint near zero
-        [0.75, "#16a34a"],  # green
-        [1.00, "#052e16"],  # deep dark green
+        [0.00, "#7f1d1d"], [0.30, "#ef4444"],
+        [0.47, "#1c1c1c"], [0.50, "#111111"], [0.53, "#1c1c1c"],
+        [0.70, "#10b981"], [1.00, "#064e3b"],
     ]
 
     # ── Figure ────────────────────────────────────────────────────────────
@@ -206,8 +202,9 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
             ticktext=ticktext,
             tickfont=dict(size=9, color="rgba(255,255,255,0.75)"),
             showgrid=False, fixedrange=False,
-            # Use exact strike bounds set by user
-            range=[strike_lo - 1, strike_hi + 1],
+            # Tight range: from lowest to highest ACTUAL strike in pivot
+            # This eliminates empty rows at top/bottom
+            range=[min(strikes) - 0.5, max(strikes) + 0.5],
             autorange=False,
         ),
     )

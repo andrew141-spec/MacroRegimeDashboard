@@ -600,7 +600,8 @@ def render_gex_engine():
                         # Fall back to midpoint of chain strikes
                         spot = float(chain_df["strike"].median())
                 else:
-                    st.warning("Schwab chain empty — falling back to yfinance")
+                    err = st.session_state.get("_schwab_chain_error", "unknown error")
+                    st.warning(f"Schwab chain empty — {err} — falling back to yfinance")
                     chain_df, spot, source = get_gex_from_yfinance(symbol)
             else:
                 st.warning("Schwab not connected — using yfinance. Go to **Schwab/TOS** tab to authorise.")

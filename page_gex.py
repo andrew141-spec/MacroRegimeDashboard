@@ -173,19 +173,18 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
         hovertemplate="Strike: %{y}<br>Expiry: %{x}<br>%{z:.1f}M<extra></extra>",
     ))
 
-    # ── Spot row: cyan horizontal highlight line (top and bottom border) ──
-    # Use paper-fraction y so it never distorts the axis range
-    if n_rows > 0:
-        row_h   = 1.0 / n_rows          # height of one row in paper coords
-        row_top = 1.0 - spot_idx * row_h
-        row_bot = row_top - row_h
-        for y_pos in [row_top, row_bot]:
-            fig.add_shape(
-                type="line",
-                x0=0, x1=1, y0=y_pos, y1=y_pos,
-                xref="paper", yref="paper",
-                line=dict(color="#06b6d4", width=1.5),
-            )
+    # ── Spot row: highlight via annotation on the y-axis label ─────────────
+    # Shapes on categorical axes are unreliable; annotating the tick is cleaner.
+    # The "→ $660" label already visually marks the spot row.
+    # Add a subtle background highlight using an hrect-style annotation:
+    fig.add_annotation(
+        x=0, y=y_labels[spot_idx],
+        text="▶",
+        showarrow=False,
+        font=dict(color="#06b6d4", size=11),
+        xref="paper", yref="y",
+        xanchor="right",
+    )
 
     # ── TOTAL column: right-side separator ───────────────────────────────
     fig.add_shape(
@@ -220,11 +219,12 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
             tickfont=dict(size=9, color="rgba(255,255,255,0.75)"),
             showgrid=False,
             fixedrange=False,
-            # Lock to exactly the strike rows — no extra space above/below
-            range=[n_rows - 0.5, -0.5],   # reversed: index 0 = top = highest strike
+            # Categorical axis — control order via categoryarray (NOT numeric range)
+            # y_labels is already in descending strike order (highest first = top of chart)
+            categoryorder="array",
+            categoryarray=y_labels,   # exact order: highest strike at top
             autorange=False,
-            # Autoscale centered on spot: show equal rows above and below
-            # (handled by the pct filter which is symmetric around spot)
+            automargin=True,
         ),
     )
 

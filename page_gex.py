@@ -592,6 +592,35 @@ def render_gex_engine():
         if k not in st.session_state:
             st.session_state[k] = v
 
+    # ── Sidebar refresh controls ──────────────────────────────────────────
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### ⚡ GEX Refresh")
+    auto_refresh = st.sidebar.toggle("Auto refresh", key="gex_auto_refresh")
+
+    _INTERVALS = {"30s": 30, "1m": 60, "2m": 120, "5m": 300, "10m": 600, "15m": 900, "30m": 1800}
+    refresh_label = st.sidebar.selectbox(
+        "Refresh interval", options=list(_INTERVALS.keys()),
+        key="gex_refresh_interval", disabled=not auto_refresh,
+    )
+    refresh_sec = _INTERVALS[refresh_label]
+
+    if st.sidebar.button("🔄 Refresh now", use_container_width=True, key="gex_manual_refresh"):
+        st.cache_data.clear()
+        st.rerun()
+
+    if auto_refresh:
+        st.sidebar.caption(f"🟢 Auto-refreshing every {refresh_label}")
+        st.sidebar.caption(
+            "ℹ️ OI updates once/day (OCC). "
+            "Spot + IV refresh on every cycle. "
+            "Schwab: live IV each refresh."
+        )
+    else:
+        st.sidebar.caption("⚫ Auto-refresh off")
+
+    autorefresh_js(refresh_sec, auto_refresh)
+    st.sidebar.markdown("---")
+
     col_s, col_m = st.columns([1, 3])
     with col_s:
         # No 'value=' arg — Streamlit reads from session_state[key] automatically

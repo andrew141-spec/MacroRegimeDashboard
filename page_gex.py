@@ -148,7 +148,7 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
         colorbar=dict(tickfont=dict(size=9, color="rgba(255,255,255,0.6)"),
                       thickness=14, len=0.88, tickformat="$.0s",
                       bgcolor="rgba(0,0,0,0)", bordercolor="rgba(255,255,255,0.08)"),
-        xgap=2, ygap=1,
+        xgap=0, ygap=0,
         hovertemplate="Strike: $%{y:.0f}<br>Expiry: %{x}<br>%{z:.1f}M<extra></extra>",
     ))
 
@@ -194,7 +194,7 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
         paper_bgcolor="#0d0d0d", plot_bgcolor="#0d0d0d",
         font=dict(color="rgba(255,255,255,0.80)", family="monospace"),
         height=height,
-        margin=dict(l=70, r=80, t=45, b=55),
+        margin=dict(l=60, r=70, t=40, b=50),
         xaxis=dict(side="bottom", tickfont=dict(size=9, color="rgba(255,255,255,0.65)"),
                    tickangle=-25, showgrid=False, fixedrange=False),
         yaxis=dict(
@@ -576,7 +576,7 @@ def render_gex_engine():
 
     col_s, col_m = st.columns([1, 3])
     with col_s:
-        symbol    = st.text_input("Options Symbol", "SPY", key="gex_symbol_input")
+        symbol    = st.text_input("Options Symbol", "QQQ", key="gex_symbol_input").strip().upper()
         use_schwab = st.toggle("Use Schwab/TOS (live IV)", False, key="gex_use_schwab")
 
     # ── Data fetch ────────────────────────────────────────────────────────
@@ -961,7 +961,7 @@ def render_setups_page():
     # ── Symbol + data ─────────────────────────────────────────────────────
     col_sym, col_sch, col_info = st.columns([1, 1, 3])
     with col_sym:
-        symbol = st.text_input("Symbol", "QQQ", key="setups_symbol")
+        symbol = st.text_input("Symbol", "QQQ", key="setups_symbol").strip().upper()
     with col_sch:
         use_schwab = st.toggle("Schwab (live IV)", False, key="setups_schwab")
 

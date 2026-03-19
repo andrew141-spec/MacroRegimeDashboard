@@ -348,7 +348,17 @@ def schwab_get_options_chain(client, symbol: str = "SPY",
                         continue
 
         if not rows:
-            st.session_state["_schwab_chain_error"] = "No chain data in response"
+            # Debug: log what the response actually contained
+            call_keys = list(data.get("callExpDateMap", {}).keys())[:3]
+            put_keys  = list(data.get("putExpDateMap",  {}).keys())[:3]
+            all_strikes = []
+            for exp_map in [data.get("callExpDateMap", {}), data.get("putExpDateMap", {})]:
+                for strikes_dict in exp_map.values():
+                    all_strikes.extend([float(k) for k in strikes_dict.keys()])
+            strike_range = f"{min(all_strikes):.0f}–{max(all_strikes):.0f}" if all_strikes else "none"
+            st.session_state["_schwab_chain_error"] = (
+                f"No rows after filtering. spot_est={spot_est:.2f}, "                f"raw strikes in response: {strike_range}, "                f"filter: {spot_est*0.85:.0f}–{spot_est*1.15:.0f}, "                f"expirations (calls): {call_keys}"
+            )
             return None
 
         df = (pd.DataFrame(rows)

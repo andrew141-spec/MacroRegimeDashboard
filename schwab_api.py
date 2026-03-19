@@ -282,14 +282,8 @@ def schwab_get_options_chain(client, symbol: str = "SPY",
                 pass
         spot_est = spot or 500.0
 
-        # Minimum viable call — strip all optional params that could cause 400.
-        # Schwab is strict: strategy=SINGLE and include_underlying_quote
-        # both trigger 400 for some symbols. Let the API return its defaults.
-        resp = client.get_option_chain(
-            symbol,
-            contract_type=schwab.client.Client.Options.ContractType.ALL,
-            strike_count=60,
-        )
+        # Try with absolutely no optional params first to isolate the 400
+        resp = client.get_option_chain(symbol)
 
         if resp.status_code != 200:
             st.session_state["_schwab_chain_error"] = (

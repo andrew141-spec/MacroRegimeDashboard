@@ -72,10 +72,18 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
     pivot.columns = pivot.columns.get_level_values(0) if pivot.columns.nlevels > 1 else pivot.columns
 
     # ── Filters ───────────────────────────────────────────────────────────
-    pct     = getattr(_make_heatmap, "_strike_pct", 0.06)
-    max_dte = getattr(_make_heatmap, "_max_dte",    30)
+    # Use absolute strike bounds set by the UI controls (saved in session_state)
+    # Fall back to ±6% of spot if not set
+    default_lo = round(spot * 0.94 / 5) * 5   # round to nearest $5
+    default_hi = round(spot * 1.06 / 5) * 5
+    strike_lo = getattr(_make_heatmap, "_strike_lo", default_lo)
+    strike_hi = getattr(_make_heatmap, "_strike_hi", default_hi)
+    max_dte   = getattr(_make_heatmap, "_max_dte",    30)
 
-    pivot = pivot[(pivot.index >= spot * (1 - pct)) & (pivot.index <= spot * (1 + pct))]
+    # Also store pct for the spot-centering range in yaxis
+    pct = max(abs(strike_hi - spot), abs(spot - strike_lo)) / spot
+
+    pivot = pivot[(pivot.index >= strike_lo) & (pivot.index <= strike_hi)]
 
     def _dte(col):
         try:    return (dt.date.fromisoformat(col) - dt.date.today()).days
@@ -194,8 +202,8 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
             ticktext=ticktext,
             tickfont=dict(size=9, color="rgba(255,255,255,0.75)"),
             showgrid=False, fixedrange=False,
-            # Centre on spot: symmetric range so spot is in the middle
-            range=[spot * (1 - pct) - 1, spot * (1 + pct) + 1],
+            # Use exact strike bounds set by user
+            range=[strike_lo - 1, strike_hi + 1],
             autorange=False,
         ),
     )
@@ -651,18 +659,47 @@ def render_gex_engine():
 
         if view_mode == "Heatmap":
             st.caption("Strike × Expiry matrix · Green = positive GEX (dealers stabilize) · Red = negative GEX (dealers amplify) · → = spot price · TOTAL = net across all expiries")
-            sc1, sc2, sc3 = st.columns(3)
+
+            # ── Persistent controls — use session_state so values survive tab switches ──
+            # Initialise defaults once (only when key is absent)
+            def _default_lo(): return float(round(spot * 0.94 / 5) * 5)
+            def _default_hi(): return float(round(spot * 1.06 / 5) * 5)
+            if "gex_strike_lo" not in st.session_state: st.session_state["gex_strike_lo"] = _default_lo()
+            if "gex_strike_hi" not in st.session_state: st.session_state["gex_strike_hi"] = _default_hi()
+            if "gex_hm_dte"    not in st.session_state: st.session_state["gex_hm_dte"]    = 30
+            if "gex_hm_height" not in st.session_state: st.session_state["gex_hm_height"] = 1000
+
+            sc1, sc2, sc3, sc4 = st.columns(4)
             with sc1:
-                strike_pct = sc1.slider("Strike range ± %", 3, 12, 6, key="gex_hm_range")
+                strike_lo = st.number_input(
+                    "Strike low ($)", min_value=1.0, max_value=float(spot * 1.5),
+                    step=1.0, format="%.0f",
+                    key="gex_strike_lo",
+                )
             with sc2:
-                max_dte    = sc2.slider("Max DTE (days)", 7, 90, 30, step=7, key="gex_hm_dte")
+                strike_hi = st.number_input(
+                    "Strike high ($)", min_value=1.0, max_value=float(spot * 2.0),
+                    step=1.0, format="%.0f",
+                    key="gex_strike_hi",
+                )
             with sc3:
-                hm_height  = sc3.slider("Height (px)", 350, 800, 500, step=50, key="gex_hm_height")
-            # Pass config via function attributes (avoids changing signature)
-            _make_heatmap._strike_pct = strike_pct / 100
-            _make_heatmap._max_dte    = max_dte
+                max_dte = st.number_input(
+                    "Max DTE (days)", min_value=0, max_value=365,
+                    step=7, format="%d",
+                    key="gex_hm_dte",
+                )
+            with sc4:
+                hm_height = st.number_input(
+                    "Height (px)", min_value=300, max_value=2000,
+                    step=50, format="%d",
+                    key="gex_hm_height",
+                )
+
+            _make_heatmap._strike_lo = float(strike_lo)
+            _make_heatmap._strike_hi = float(strike_hi)
+            _make_heatmap._max_dte   = int(max_dte)
             fig_gex = _make_heatmap(chain_df, spot, "net_gex",
-                                    f"{symbol} GEX", hm_height)
+                                    f"{symbol} GEX", int(hm_height))
             st.plotly_chart(fig_gex, use_container_width=True)
         else:
             st.caption("Green = positive gamma (dealers stabilize). Red = negative gamma (dealers amplify). Yellow line = gamma flip.")

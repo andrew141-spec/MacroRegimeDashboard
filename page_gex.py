@@ -43,12 +43,9 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
                   title: str = "GEX Heatmap",
                   height: int = 580) -> go.Figure:
     """
-    Strike × Expiry heatmap matching the reference image exactly:
-      - Strikes on Y axis, descending (high at top), centred on spot
-      - Expiry dates on X axis (bottom), chronological, TOTAL on far right
-      - Cells: dollar value in $M, coloured green (pos) / red (neg)
-      - Spot row: cyan left-arrow label + highlighted row
-      - No empty rows, no zero-value label noise
+    Strike × Expiry heatmap.
+    Uses NUMERIC y-axis (actual strike prices) so shapes/lines work correctly.
+    Spot is always centred by filtering ±pct% symmetrically.
     """
     from gex_engine import compute_gex_from_chain
 
@@ -59,174 +56,150 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
         return fig
 
     gex_chain = compute_gex_from_chain(chain_df, spot)
-    greek_col  = {"net_gex":"net_gex","net_vex":"net_vex","net_cex":"net_cex"}.get(greek,"net_gex")
+    greek_col = {"net_gex":"net_gex","net_vex":"net_vex","net_cex":"net_cex"}.get(greek,"net_gex")
 
-    # ── Expiry labels (YYYY-MM-DD format for reliable sorting) ────────────
-    gex_chain["exp_date"] = (gex_chain["expiry_T"] * 365).round(0).astype(int).apply(
-        lambda d: dt.date.today() + dt.timedelta(days=int(d))
+    # ── Expiry labels ─────────────────────────────────────────────────────
+    gex_chain["exp_label"] = (gex_chain["expiry_T"] * 365).round(0).astype(int).apply(
+        lambda d: (dt.date.today() + dt.timedelta(days=int(d))).strftime("%Y-%m-%d")
     )
-    gex_chain["exp_label"] = gex_chain["exp_date"].apply(lambda d: d.strftime("%Y-%m-%d"))
 
-    # ── Pivot ─────────────────────────────────────────────────────────────
+    # ── Pivot: numeric strike index ───────────────────────────────────────
     pivot = (gex_chain
              .groupby(["strike", "exp_label"])[greek_col]
              .sum()
-             .reset_index()
-             .pivot(index="strike", columns="exp_label", values=greek_col)
-             .fillna(0) / 1e6)
+             .unstack(fill_value=0)
+             / 1e6)
+    pivot.columns = pivot.columns.get_level_values(0) if pivot.columns.nlevels > 1 else pivot.columns
 
-    # ── Strike filter: centre on spot, ±pct% ─────────────────────────────
+    # ── Filters ───────────────────────────────────────────────────────────
     pct     = getattr(_make_heatmap, "_strike_pct", 0.06)
     max_dte = getattr(_make_heatmap, "_max_dte",    30)
 
-    lo, hi = spot * (1 - pct), spot * (1 + pct)
-    pivot  = pivot[(pivot.index >= lo) & (pivot.index <= hi)]
+    pivot = pivot[(pivot.index >= spot * (1 - pct)) & (pivot.index <= spot * (1 + pct))]
 
-    # ── Expiry filter: near-term only ────────────────────────────────────
-    def _dte(col): 
-        try: return (dt.date.fromisoformat(col) - dt.date.today()).days
+    def _dte(col):
+        try:    return (dt.date.fromisoformat(col) - dt.date.today()).days
         except: return 999
-    keep_cols = [c for c in pivot.columns if _dte(c) <= max_dte]
-    if keep_cols:
-        pivot = pivot[sorted(keep_cols)]   # already ISO → sorts correctly
 
-    # Drop all-zero rows (strikes with no meaningful exposure)
+    keep = [c for c in pivot.columns if _dte(c) <= max_dte]
+    if keep:
+        pivot = pivot[sorted(keep)]
+
     pivot = pivot.loc[(pivot.abs() >= 0.5).any(axis=1)]
-
-    # Descending strike order (highest at top)
-    pivot = pivot.sort_index(ascending=False)
+    if pivot.empty:
+        fig = go.Figure()
+        fig.add_annotation(text="No near-term data in range", x=0.5, y=0.5,
+                           showarrow=False, xref="paper", yref="paper",
+                           font=dict(color="white", size=13))
+        return fig
 
     # ── TOTAL column ──────────────────────────────────────────────────────
-    pivot["TOTAL"] = pivot.drop(columns=["TOTAL"], errors="ignore").sum(axis=1)
+    pivot["TOTAL"] = pivot.sum(axis=1)
 
-    # ── Display labels: shorten expiry to "Mar 18" style ─────────────────
-    def _fmt_col(c):
-        if c == "TOTAL": return "TOTAL"
-        try: return dt.date.fromisoformat(c).strftime("%Y-%m-%d")
-        except: return c
+    # Strikes ascending for the matrix (Heatmap y goes bottom→top by default)
+    # We will flip with yaxis.autorange="reversed" so highest strike is at top
+    pivot = pivot.sort_index(ascending=True)
 
-    display_cols = [_fmt_col(c) for c in pivot.columns]
+    strikes     = list(pivot.index)          # numeric: [580, 585, 590 ...]
+    display_x   = [c if c == "TOTAL" else
+                   dt.date.fromisoformat(c).strftime("%b %-d")
+                   if _dte(c) < 999 else c
+                   for c in pivot.columns]
+    z_vals      = pivot.values.tolist()
+    n_rows, n_cols = len(strikes), len(pivot.columns)
 
-    strikes = list(pivot.index)
-    z_vals  = pivot.values.tolist()
-    n_rows  = len(strikes)
-    n_cols  = len(pivot.columns)
-
-    # ── Nearest strike to spot → highlight row ────────────────────────────
-    nearest = min(strikes, key=lambda s: abs(s - spot))
-    spot_idx = strikes.index(nearest)
-
-    # ── Y-axis labels: arrow marker on spot row ───────────────────────────
-    y_labels = []
-    for s in strikes:
-        if s == nearest:
-            y_labels.append(f"→ ${s:.0f}")
-        else:
-            y_labels.append(f"${s:.0f}")
-
-    # ── Cell text: value in $M, skip small cells ──────────────────────────
-    # Threshold scales with cell count so text never overlaps
+    # ── Cell text ─────────────────────────────────────────────────────────
     thresh = 0.5
     def _cell(v):
         if abs(v) < thresh: return ""
-        if abs(v) >= 1000: return f"${v/1000:.1f}B"
+        if abs(v) >= 1000:  return f"${v/1000:.1f}B"
         return f"${v:.1f}M"
     text_vals = [[_cell(v) for v in row] for row in z_vals]
 
-    # ── Colour scale ──────────────────────────────────────────────────────
+    # ── Colour ────────────────────────────────────────────────────────────
     flat = [abs(v) for row in z_vals for v in row if abs(v) >= thresh]
     zmax = float(np.percentile(flat, 97)) if flat else 100.0
-
     colorscale = [
-        [0.00, "#7f1d1d"],  # deep red
-        [0.30, "#ef4444"],  # red
-        [0.45, "#1c1c1c"],  # near-zero dark
-        [0.50, "#111111"],  # zero = black
-        [0.55, "#1c1c1c"],
-        [0.70, "#10b981"],  # green
-        [1.00, "#064e3b"],  # deep green
+        [0.00, "#7f1d1d"], [0.30, "#ef4444"],
+        [0.47, "#1c1c1c"], [0.50, "#111111"], [0.53, "#1c1c1c"],
+        [0.70, "#10b981"], [1.00, "#064e3b"],
     ]
 
-    # ── Build figure ──────────────────────────────────────────────────────
+    # ── Figure ────────────────────────────────────────────────────────────
     fig = go.Figure(go.Heatmap(
         z=z_vals,
-        x=display_cols,
-        y=y_labels,
+        x=display_x,
+        y=strikes,          # NUMERIC — enables correct shapes and range
         text=text_vals,
         texttemplate="%{text}",
-        textfont=dict(
-            size=max(7, min(11, int(450 / max(n_cols, 1)))),
-            color="rgba(255,255,255,0.90)",
-            family="monospace",
-        ),
+        textfont=dict(size=max(7, min(10, int(380/max(n_cols,1)))),
+                      color="rgba(255,255,255,0.90)", family="monospace"),
         colorscale=colorscale,
         zmid=0, zmin=-zmax, zmax=zmax,
         showscale=True,
-        colorbar=dict(
-            tickfont=dict(size=9, color="rgba(255,255,255,0.6)"),
-            thickness=14, len=0.9,
-            bgcolor="rgba(0,0,0,0)",
-            bordercolor="rgba(255,255,255,0.08)",
-            tickformat="$.0s",
-        ),
+        colorbar=dict(tickfont=dict(size=9, color="rgba(255,255,255,0.6)"),
+                      thickness=14, len=0.88, tickformat="$.0s",
+                      bgcolor="rgba(0,0,0,0)", bordercolor="rgba(255,255,255,0.08)"),
         xgap=2, ygap=1,
-        hovertemplate="Strike: %{y}<br>Expiry: %{x}<br>%{z:.1f}M<extra></extra>",
+        hovertemplate="Strike: $%{y:.0f}<br>Expiry: %{x}<br>%{z:.1f}M<extra></extra>",
     ))
 
-    # ── Spot row: highlight via annotation on the y-axis label ─────────────
-    # Shapes on categorical axes are unreliable; annotating the tick is cleaner.
-    # The "→ $660" label already visually marks the spot row.
-    # Add a subtle background highlight using an hrect-style annotation:
+    # ── Spot line — horizontal, numeric y ────────────────────────────────
+    # Nearest strike to spot
+    nearest = min(strikes, key=lambda s: abs(s - spot))
+    # Draw a cyan line at the spot strike value on the numeric y axis
+    fig.add_shape(
+        type="line",
+        x0=-0.5, x1=n_cols - 0.5,
+        y0=nearest, y1=nearest,
+        xref="x", yref="y",
+        line=dict(color="#06b6d4", width=2),
+    )
+    # Spot label on the left
     fig.add_annotation(
-        x=0, y=y_labels[spot_idx],
-        text="▶",
+        x=-0.5, y=nearest,
+        text=f"▶ ${spot:.2f}",
         showarrow=False,
-        font=dict(color="#06b6d4", size=11),
-        xref="paper", yref="y",
+        xref="x", yref="y",
         xanchor="right",
+        font=dict(color="#06b6d4", size=10, family="monospace"),
     )
 
-    # ── TOTAL column: right-side separator ───────────────────────────────
+    # ── TOTAL separator ───────────────────────────────────────────────────
     fig.add_shape(
         type="line",
         x0=n_cols - 1.5, x1=n_cols - 1.5,
         y0=0, y1=1,
         xref="x", yref="paper",
-        line=dict(color="rgba(255,255,255,0.25)", width=1, dash="dot"),
+        line=dict(color="rgba(255,255,255,0.20)", width=1, dash="dot"),
     )
 
-    # ── Layout ────────────────────────────────────────────────────────────
+    # ── Y-axis tick labels: "$630" format, custom per strike ─────────────
+    tickvals = strikes
+    ticktext = [f"${s:.0f}" for s in strikes]
+
     fig.update_layout(
         title=dict(
-            text=(f"{title} — {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                  f" — Current Price: ${spot:.2f}"),
-            font=dict(size=11, color="rgba(255,255,255,0.65)"),
-            x=0.5,
+            text=f"{title} — {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} — Current Price: ${spot:.2f}",
+            font=dict(size=11, color="rgba(255,255,255,0.65)"), x=0.5,
         ),
-        paper_bgcolor="#0d0d0d",
-        plot_bgcolor="#0d0d0d",
+        paper_bgcolor="#0d0d0d", plot_bgcolor="#0d0d0d",
         font=dict(color="rgba(255,255,255,0.80)", family="monospace"),
         height=height,
         margin=dict(l=70, r=80, t=45, b=55),
-        xaxis=dict(
-            side="bottom",           # dates at bottom like reference
-            tickfont=dict(size=9, color="rgba(255,255,255,0.65)"),
-            tickangle=-25,
-            showgrid=False,
-            fixedrange=False,
-        ),
+        xaxis=dict(side="bottom", tickfont=dict(size=9, color="rgba(255,255,255,0.65)"),
+                   tickangle=-25, showgrid=False, fixedrange=False),
         yaxis=dict(
+            tickvals=tickvals,
+            ticktext=ticktext,
             tickfont=dict(size=9, color="rgba(255,255,255,0.75)"),
-            showgrid=False,
-            fixedrange=False,
-            # Categorical axis — control order via categoryarray (NOT numeric range)
-            # y_labels is already in descending strike order (highest first = top of chart)
-            categoryorder="array",
-            categoryarray=y_labels,   # exact order: highest strike at top
+            showgrid=False, fixedrange=False,
+            # Centre on spot: symmetric range so spot is in the middle
+            range=[spot * (1 - pct) - 1, spot * (1 + pct) + 1],
             autorange=False,
-            automargin=True,
         ),
     )
+    return fig
 
     return fig
 

@@ -648,6 +648,18 @@ def render_gex_engine():
     st.markdown("---")
 
     # ── Tabs: GEX / VEX / CEX / Key Nodes / OTM Anchors ─────────────────
+    # ── Sync heatmap config from session_state (works regardless of which tab is active) ──
+    if "gex_strikes_each_side" not in st.session_state:
+        st.session_state["gex_strikes_each_side"] = 20
+    if "gex_hm_dte"            not in st.session_state:
+        st.session_state["gex_hm_dte"]            = 30
+    if "gex_hm_height"         not in st.session_state:
+        st.session_state["gex_hm_height"]         = 1000
+    _n = int(st.session_state["gex_strikes_each_side"])
+    _make_heatmap._strike_lo = float(spot - _n)
+    _make_heatmap._strike_hi = float(spot + _n)
+    _make_heatmap._max_dte   = int(st.session_state["gex_hm_dte"])
+
     tab_gex, tab_vex, tab_cex, tab_nodes, tab_otm = st.tabs(
         ["📊 GEX (Gamma)", "🌀 VEX (Vanna)", "⏱ CEX (Charm)", "🎯 Key Nodes", "🔭 OTM Anchors"]
     )
@@ -660,51 +672,69 @@ def render_gex_engine():
         if view_mode == "Heatmap":
             st.caption("Strike × Expiry matrix · Green = positive GEX (dealers stabilize) · Red = negative GEX (dealers amplify) · → = spot price · TOTAL = net across all expiries")
 
-            # ── Persistent controls — use session_state so values survive tab switches ──
-            # Initialise defaults once (only when key is absent)
-            def _default_lo(): return float(round(spot * 0.94 / 5) * 5)
-            def _default_hi(): return float(round(spot * 1.06 / 5) * 5)
-            if "gex_strike_lo" not in st.session_state: st.session_state["gex_strike_lo"] = _default_lo()
-            if "gex_strike_hi" not in st.session_state: st.session_state["gex_strike_hi"] = _default_hi()
-            if "gex_hm_dte"    not in st.session_state: st.session_state["gex_hm_dte"]    = 30
-            if "gex_hm_height" not in st.session_state: st.session_state["gex_hm_height"] = 1000
+            # ── Persistent controls (survive tab switches via session_state keys) ──
+            if "gex_strikes_each_side" not in st.session_state:
+                st.session_state["gex_strikes_each_side"] = 20
+            if "gex_hm_dte"            not in st.session_state:
+                st.session_state["gex_hm_dte"]            = 30
+            if "gex_hm_height"         not in st.session_state:
+                st.session_state["gex_hm_height"]         = 1000
 
-            sc1, sc2, sc3, sc4 = st.columns(4)
+            sc1, sc2, sc3 = st.columns(3)
             with sc1:
-                strike_lo = st.number_input(
-                    "Strike low ($)", min_value=1.0, max_value=float(spot * 1.5),
-                    step=1.0, format="%.0f",
-                    key="gex_strike_lo",
+                strikes_each_side = st.number_input(
+                    "Strikes each side of spot",
+                    min_value=5, max_value=100, step=5, format="%d",
+                    key="gex_strikes_each_side",
+                    help=f"Shows this many $1 strikes above AND below ${spot:.0f}. "
+                         f"e.g. 20 → ${spot-20:.0f} to ${spot+20:.0f}",
                 )
             with sc2:
-                strike_hi = st.number_input(
-                    "Strike high ($)", min_value=1.0, max_value=float(spot * 2.0),
-                    step=1.0, format="%.0f",
-                    key="gex_strike_hi",
-                )
-            with sc3:
                 max_dte = st.number_input(
                     "Max DTE (days)", min_value=0, max_value=365,
                     step=7, format="%d",
                     key="gex_hm_dte",
                 )
-            with sc4:
+            with sc3:
                 hm_height = st.number_input(
                     "Height (px)", min_value=300, max_value=2000,
                     step=50, format="%d",
                     key="gex_hm_height",
                 )
 
-            _make_heatmap._strike_lo = float(strike_lo)
-            _make_heatmap._strike_hi = float(strike_hi)
+            # Compute symmetric bounds centred on spot
+            # Round to nearest $1 so they align with actual option strikes
+            strike_lo = float(spot - int(strikes_each_side))
+            strike_hi = float(spot + int(strikes_each_side))
+
+            _make_heatmap._strike_lo = strike_lo
+            _make_heatmap._strike_hi = strike_hi
             _make_heatmap._max_dte   = int(max_dte)
+
+            # Show the computed range as info text
+            st.caption(
+                f"Showing strikes ${strike_lo:.0f} – ${strike_hi:.0f} "
+                f"({int(strikes_each_side)} each side of spot ${spot:.2f}) · "
+                f"Max DTE: {int(max_dte)}d · Height: {int(hm_height)}px"
+            )
+
             fig_gex = _make_heatmap(chain_df, spot, "net_gex",
                                     f"{symbol} GEX", int(hm_height))
             st.plotly_chart(fig_gex, use_container_width=True)
         else:
             st.caption("Green = positive gamma (dealers stabilize). Red = negative gamma (dealers amplify). Yellow line = gamma flip.")
-            fig_gex = _greek_bar_chart(dg.gex_by_strike, spot,
-                                       "Net GEX by Strike ($M)", _C_POS, _C_NEG, gs.gamma_flip)
+            # Use same strike range setting as heatmap
+            if "gex_strikes_each_side" not in st.session_state:
+                st.session_state["gex_strikes_each_side"] = 20
+            if "gex_hm_height" not in st.session_state:
+                st.session_state["gex_hm_height"] = 1000
+            n_side   = int(st.session_state["gex_strikes_each_side"])
+            bar_lo   = spot - n_side
+            bar_hi   = spot + n_side
+            filtered = {k: v for k, v in dg.gex_by_strike.items() if bar_lo <= k <= bar_hi}
+            fig_gex = _greek_bar_chart(filtered, spot,
+                                       "Net GEX by Strike ($M)", _C_POS, _C_NEG, gs.gamma_flip,
+                                       height=int(st.session_state["gex_hm_height"]))
             st.plotly_chart(fig_gex, use_container_width=True)
 
         c1, c2 = st.columns(2)
@@ -745,7 +775,7 @@ def render_gex_engine():
         view_mode_vex = st.radio("View", ["Heatmap", "Bar Chart"], horizontal=True, key="vex_view_mode")
         if view_mode_vex == "Heatmap":
             st.caption("Strike × Expiry matrix · Purple/green = positive vanna · Red = negative vanna · TOTAL = net across all expiries")
-            fig_vex = _make_heatmap(chain_df, spot, "net_vex", f"{symbol} VEX", 700)
+            fig_vex = _make_heatmap(chain_df, spot, "net_vex", f"{symbol} VEX", int(st.session_state.get("gex_hm_height", 1000)))
             st.plotly_chart(fig_vex, use_container_width=True)
         else:
             fig_vex = _greek_bar_chart(dg.vex_by_strike, spot,
@@ -793,7 +823,7 @@ def render_gex_engine():
         view_mode_cex = st.radio("View", ["Heatmap", "Bar Chart"], horizontal=True, key="cex_view_mode")
         if view_mode_cex == "Heatmap":
             st.caption("Strike × Expiry matrix · Teal/green = positive charm (dealers buy as time passes) · Red = negative · TOTAL = net")
-            fig_cex = _make_heatmap(chain_df, spot, "net_cex", f"{symbol} CEX", 700)
+            fig_cex = _make_heatmap(chain_df, spot, "net_cex", f"{symbol} CEX", int(st.session_state.get("gex_hm_height", 1000)))
             st.plotly_chart(fig_cex, use_container_width=True)
         else:
             fig_cex = _greek_bar_chart(dg.cex_by_strike, spot,

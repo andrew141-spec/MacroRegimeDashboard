@@ -229,6 +229,7 @@ def schwab_complete_auth(client_id: str, client_secret: str,
 
 
 def schwab_get_spot(client, symbol: str = "SPY") -> Optional[float]:
+    symbol = symbol.strip().upper()
     """Get current quote from Schwab API."""
     if client is None:
         return None
@@ -250,6 +251,9 @@ def schwab_get_spot(client, symbol: str = "SPY") -> Optional[float]:
 
 def schwab_get_options_chain(client, symbol: str = "SPY",
                               spot: Optional[float] = None) -> Optional[pd.DataFrame]:
+    # Normalise symbol — strip whitespace and uppercase
+    # A trailing space or wrong case causes Schwab 400 "Invalid Parameter/Value"
+    symbol = symbol.strip().upper()
     """
     Fetch options chain from Schwab API for GEX computation.
 
@@ -282,8 +286,13 @@ def schwab_get_options_chain(client, symbol: str = "SPY",
                 pass
         spot_est = spot or 500.0
 
-        # Try with absolutely no optional params first to isolate the 400
-        resp = client.get_option_chain(symbol)
+        # Restore proper params now that symbol is normalised
+        st.session_state["_schwab_chain_debug"] = f"Requesting chain for symbol='{symbol}' spot_est={spot_est:.2f}"
+        resp = client.get_option_chain(
+            symbol,
+            contract_type=schwab.client.Client.Options.ContractType.ALL,
+            strike_count=20,
+        )
 
         if resp.status_code != 200:
             st.session_state["_schwab_chain_error"] = (

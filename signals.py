@@ -24,8 +24,6 @@ def compute_leading_stack(
     # NEW signals
     tips_10y=None, bank_reserves=None, bank_credit=None,
     ism_no=None, gdp_quarterly=None, mmmf=None,
-    # Structural risk indicators
-    unrate=None, hy_spread=None,
 ) -> Dict:
     """
     Signal stack reorganised by forecast horizon per the architecture critique.
@@ -244,72 +242,6 @@ def compute_leading_stack(
     R["liq_impulse_13w_pct"]   = current_pct_rank(liq_13w, 252)
     R["liq_impulse_13w_level"] = float(liq_13w.dropna().iloc[-1]) if liq_13w.dropna().size else 0.0
 
-    # ════════════════════════════════════════════════════════════════
-    # STRUCTURAL RISK INDICATORS
-    # Not bucketed into tactical/short/medium — these are regime
-    # context signals that gate the probability model.
-    # ════════════════════════════════════════════════════════════════
-
-    # SR1. Sahm Rule (Claudia Sahm, 2019)
-    # Triggered when 3M avg unemployment rises ≥0.5pp above its 12M low.
-    # Perfect post-WWII recession onset record. Already have UNRATE loaded.
-    # Recession risk does NOT feed as a directional probability — it is a
-    # regime gate that compresses all bullish signals toward 50.
-    if "unrate" in dir() or True:   # unrate passed as argument
-        unrate_s = _to_1d(unrate).reindex(idx).ffill()
-        unrate_3m_avg  = unrate_s.rolling(91, min_periods=60).mean()
-        unrate_12m_low = unrate_s.rolling(365, min_periods=200).min()
-        sahm_series    = unrate_3m_avg - unrate_12m_low
-        sahm_now       = float(sahm_series.dropna().iloc[-1]) if sahm_series.dropna().size else 0.0
-        R["sahm_indicator"]  = sahm_now
-        R["sahm_triggered"]  = sahm_now >= 0.50
-        R["sahm_approaching"] = 0.30 <= sahm_now < 0.50   # watch zone
-        # Regime label
-        if sahm_now >= 0.50:
-            R["sahm_regime"] = "RECESSION ONSET"
-        elif sahm_now >= 0.30:
-            R["sahm_regime"] = "Watch Zone"
-        elif sahm_now >= 0.10:
-            R["sahm_regime"] = "Elevated"
-        else:
-            R["sahm_regime"] = "Normal"
-    else:
-        R["sahm_indicator"] = np.nan
-        R["sahm_triggered"] = False
-        R["sahm_approaching"] = False
-        R["sahm_regime"] = "Unavailable"
-
-    # SR2. HY Spread Level (ICE BofA BAMLH0A0HYM2)
-    # The LEVEL of HY spreads is a distinct signal from the HYG/LQD momentum ratio.
-    # Momentum tells you direction; level tells you whether you're in a stress regime.
-    if hy_spread is not None and len(_to_1d(hy_spread).dropna()) > 20:
-        hy_r = resample_ffill(hy_spread, idx)
-        hy_now = float(hy_r.dropna().iloc[-1]) if hy_r.dropna().size else np.nan
-        if np.isfinite(hy_now):
-            # Regime classification
-            if hy_now < 300:
-                hy_regime = "Complacency"
-            elif hy_now < 450:
-                hy_regime = "Normal"
-            elif hy_now < 600:
-                hy_regime = "Elevated"
-            elif hy_now < 1000:
-                hy_regime = "Recession Pricing"
-            else:
-                hy_regime = "Systemic Stress"
-            R["hy_spread_level"] = hy_now
-            R["hy_spread_regime"] = hy_regime
-            # Percentile rank for use in composite if desired
-            R["hy_spread_pct"]   = current_pct_rank(-hy_r, 252)  # inverted: lower = better
-            # Gate signal: in Recession Pricing or above, compress bull signals
-            R["hy_stress_gate"] = hy_now >= 600
-        else:
-            R["hy_spread_level"] = np.nan; R["hy_spread_regime"] = "Unavailable"
-            R["hy_spread_pct"] = 50.0;     R["hy_stress_gate"] = False
-    else:
-        R["hy_spread_level"] = np.nan; R["hy_spread_regime"] = "Unavailable"
-        R["hy_spread_pct"] = 50.0;     R["hy_stress_gate"] = False
-
     return R
 
 # ============================================================
@@ -520,21 +452,20 @@ def compute_1d_prob(
     # confidence scalar on the other signals, not as a direction vote
     scaled = 50.0 + (raw_1d - 50.0) * gex_signal_confidence * flip_proximity_penalty
 
-    # ── Session context compression ───────────────────────────────────
-    # 1-day probability is only reliable during prime-time liquidity
+    # ── Session context ─────────────────────────────────────────────────────────
+    # session_mult controls TRADING SIZE not the probability model.
+    # When session_mult=0 (Globex 6pm-9:30am), the old code did:
+    #   scaled = 50 + (scaled-50) * 0 = exactly 50 for 15+ hours every day.
+    # Fix: leave the probability unaffected by session. 
+    # The session_valid flag in the output tells the UI whether to act on it.
     session_mult = session.get("size_mult", 0.5)
-    if session_mult < 0.5:
-        # Outside prime time: compress toward 50 (signals are noisier)
-        scaled = 50.0 + (scaled - 50.0) * (session_mult * 1.5)
 
     # ── Fear overlay (coincident risk-off condition) ──────────────────
-    # High fear compresses upside potential: fear>70 → cap bull signal at 60
-    # This reflects the empirical observation that in high-fear regimes,
-    # upside surprises are muted (dealers are not supporting rallies)
+    # High fear compresses upside potential modestly — not a hard cap
     if fear_score > 70:
-        scaled = min(scaled, 60.0 + (scaled - 60.0) * 0.4)
+        scaled = 50.0 + (scaled - 50.0) * 0.75   # compress deviation by 25% in high fear
     elif fear_score > 55:
-        scaled = min(scaled, 65.0 + (scaled - 65.0) * 0.7)
+        scaled = 50.0 + (scaled - 50.0) * 0.90   # compress deviation by 10% in elevated fear
 
     prob_1d = float(np.clip(scaled, 10, 90))
 

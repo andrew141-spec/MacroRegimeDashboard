@@ -73,7 +73,9 @@ def _fetch_with_retry(fn, retries=3, delay=2):
     return None, "max retries exceeded"
 
 
-@st.cache_data(ttl=25)   # 25s — shorter than min refresh interval (30s) so every cycle fetches fresh data
+@st.cache_data(ttl=300)  # 5 min — yfinance rate-limits aggressively on shared IPs (Streamlit Cloud).
+                          # OI only updates once/day anyway, so sub-5min refresh has no real benefit.
+                          # Use Schwab for live IV if you need more frequent updates.
 def get_gex_from_yfinance(symbol="SPY") -> Tuple[Optional[pd.DataFrame], float, str]:
     """Pull option chain from yfinance. Retries on rate limits, falls back to disk cache."""
     today = dt.date.today()

@@ -72,17 +72,22 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
     pivot.columns = pivot.columns.get_level_values(0) if pivot.columns.nlevels > 1 else pivot.columns
 
     # ── Filters ───────────────────────────────────────────────────────────
-    # Use absolute strike bounds set by the UI controls (saved in session_state)
-    # Fall back to ±6% of spot if not set
-    default_lo = round(spot * 0.94 / 5) * 5   # round to nearest $5
-    default_hi = round(spot * 1.06 / 5) * 5
-    strike_lo = getattr(_make_heatmap, "_strike_lo", default_lo)
-    strike_hi = getattr(_make_heatmap, "_strike_hi", default_hi)
+    strike_lo = getattr(_make_heatmap, "_strike_lo", None)
+    strike_hi = getattr(_make_heatmap, "_strike_hi", None)
     max_dte   = getattr(_make_heatmap, "_max_dte",    30)
 
-    # Also store pct for the spot-centering range in yaxis
-    pct = max(abs(strike_hi - spot), abs(spot - strike_lo)) / spot
+    # If controls haven't set bounds yet, or spot is 0, derive from actual data
+    if not strike_lo or not strike_hi or spot <= 0:
+        all_strikes = pivot.index
+        if len(all_strikes) > 0:
+            mid = float(all_strikes[len(all_strikes)//2])  # median strike
+            spot_ref = spot if spot > 0 else mid
+            strike_lo = spot_ref - 20
+            strike_hi = spot_ref + 20
+        else:
+            strike_lo, strike_hi = 0, 99999  # show everything if no data
 
+    pct = max(abs(strike_hi - spot), abs(spot - strike_lo)) / max(spot, 1)
     pivot = pivot[(pivot.index >= strike_lo) & (pivot.index <= strike_hi)]
 
     def _dte(col):
@@ -94,6 +99,21 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
         pivot = pivot[sorted(keep)]
 
     pivot = pivot.loc[(pivot.abs() >= 0.5).any(axis=1)]
+    if pivot.empty:
+        # Lower threshold and try again before giving up
+        pivot_retry = (gex_chain
+                       .groupby(["strike", "exp_label"])[greek_col]
+                       .sum()
+                       .unstack(fill_value=0)
+                       / 1e6)
+        pivot_retry.columns = pivot_retry.columns.get_level_values(0) if pivot_retry.columns.nlevels > 1 else pivot_retry.columns
+        pivot_retry = pivot_retry[(pivot_retry.index >= strike_lo) & (pivot_retry.index <= strike_hi)]
+        keep2 = [c for c in pivot_retry.columns if _dte(c) <= max_dte]
+        if keep2:
+            pivot_retry = pivot_retry[sorted(keep2)]
+        pivot_retry = pivot_retry.loc[(pivot_retry.abs() > 0).any(axis=1)]
+        if not pivot_retry.empty:
+            pivot = pivot_retry  # use lower-threshold data
     if pivot.empty:
         fig = go.Figure()
         fig.add_annotation(text="No near-term data in range", x=0.5, y=0.5,
@@ -629,7 +649,7 @@ def render_gex_engine():
         use_schwab = st.toggle("Use Schwab/TOS (live IV)", key="gex_use_schwab")
 
     # ── Data fetch ────────────────────────────────────────────────────────
-    chain_df, spot, source = None, 0.0, "unknown"
+    chain_df, spot, source = None, float(st.session_state.get("_last_known_spot", 500.0)), "unknown"
     with col_m:
         if use_schwab:
             client = get_schwab_client()
@@ -657,6 +677,10 @@ def render_gex_engine():
                 chain_df, spot, source = get_gex_from_yfinance(symbol)
         else:
             chain_df, spot, source = get_gex_from_yfinance(symbol)
+
+    # Save last known good spot so next load has a better fallback than 0
+    if spot and spot > 0:
+        st.session_state["_last_known_spot"] = spot
 
     if chain_df is None or len(chain_df) == 0:
         st.error(f"No options data available. Source returned: `{source}`")

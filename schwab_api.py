@@ -161,22 +161,23 @@ def get_schwab_client():
 def schwab_run_auth_flow(client_id: str, client_secret: str,
                           redirect_uri: str) -> Optional[str]:
     """
-    Start the OAuth2 flow using schwab.auth.get_auth_context().
-    Stores the AuthContext in session state for use in schwab_complete_auth().
+    Start the OAuth2 flow using the current schwab-py manual flow API.
     Returns the Schwab authorization URL for the user to open in their browser.
     """
     if not SCHWAB_AVAILABLE:
         return None
     try:
-        auth_context = schwab.auth.get_auth_context(client_id, redirect_uri)
-        # Persist as plain strings — AuthContext is a namedtuple and session_state
-        # can lose complex objects across reruns (especially when the user opens
-        # the auth URL in a new tab). Strings survive reliably.
-        st.session_state["_schwab_auth_callback_url"]      = auth_context.callback_url
-        st.session_state["_schwab_auth_authorization_url"]  = auth_context.authorization_url
-        st.session_state["_schwab_auth_state"]              = auth_context.state
-        st.session_state["_schwab_oauth_redir"]             = redirect_uri
-        return auth_context.authorization_url
+        # Build the auth URL directly via the Schwab OAuth endpoint —
+        # schwab-py no longer exposes OAuth2Client; use the documented URL format.
+        import urllib.parse
+        params = urllib.parse.urlencode({
+            "client_id":     client_id,
+            "redirect_uri":  redirect_uri,
+            "response_type": "code",
+        })
+        auth_url = f"https://api.schwabapi.com/v1/oauth/authorize?{params}"
+        st.session_state["_schwab_oauth_redir"] = redirect_uri
+        return auth_url
     except Exception as e:
         return f"error: {e}"
 
@@ -184,9 +185,7 @@ def schwab_run_auth_flow(client_id: str, client_secret: str,
 def schwab_complete_auth(client_id: str, client_secret: str,
                           redirect_uri: str, callback_url: str) -> Tuple[bool, str]:
     """
-    Complete the OAuth2 flow using schwab.auth.client_from_received_url().
-    This is the correct cloud/server API — it accepts the full redirected URL
-    (including auth code) without needing stdin interaction.
+    Complete the OAuth2 flow using schwab.auth.client_from_manual_flow.
     Saves the resulting token to Supabase.
     Returns (success: bool, message: str).
     """
@@ -195,37 +194,15 @@ def schwab_complete_auth(client_id: str, client_secret: str,
     try:
         tmp_path = tempfile.mktemp(suffix=".json", prefix="schwab_token_")
 
-        # Reconstruct AuthContext from the three strings saved during run_auth_flow.
-        # We store as plain strings because Streamlit session_state can lose complex
-        # objects across reruns (the user opens auth URL in a new tab → state is gone).
-        # Reconstructing from saved strings guarantees the state value matches.
-        saved_callback_url = st.session_state.get("_schwab_auth_callback_url", redirect_uri)
-        saved_auth_url     = st.session_state.get("_schwab_auth_authorization_url", "")
-        saved_state        = st.session_state.get("_schwab_auth_state", "")
-
-        if not saved_state:
-            return False, ("Auth state missing — session was reset. "                           "Please click 'Generate Auth URL' again and complete "                           "the flow without refreshing the page.")
-
-        auth_context = schwab.auth.AuthContext(
-            callback_url=saved_callback_url,
-            authorization_url=saved_auth_url,
-            state=saved_state,
-        )
-
-        def _write_token(token):
-            with open(tmp_path, "w") as f:
-                import json
-                json.dump(token, f)
-
-        # client_from_received_url is the correct API for server/cloud flows.
-        # It takes the full redirected URL the user pastes (containing the auth code),
-        # exchanges it for a token, and calls token_write_func to save it.
-        client = schwab.auth.client_from_received_url(
+        # client_from_manual_flow is the current schwab-py API for server/cloud use.
+        # It takes the full redirected callback URL, exchanges the code, and writes
+        # the token to tmp_path.
+        client = schwab.auth.client_from_manual_flow(
             api_key=client_id,
             app_secret=client_secret,
-            auth_context=auth_context,
-            received_url=callback_url,
-            token_write_func=_write_token,
+            callback_url=redirect_uri,
+            token_path=tmp_path,
+            redirected_url=callback_url,
         )
 
         token_dict = _token_from_tempfile(tmp_path)
@@ -294,13 +271,23 @@ def schwab_get_options_chain(client, symbol: str = "SPY",
         return None
     try:
         today    = dt.date.today()
+
+        # Try to get a live quote first so strike_count is centred correctly
+        if not spot:
+            try:
+                q = client.get_quote(symbol).json()
+                q_data = q.get(symbol, {})
+                spot = float(q_data.get("quote", q_data).get("lastPrice", 0) or 0) or None
+            except Exception:
+                pass
         spot_est = spot or 500.0
 
-        # Request near-the-money chain, 2 nearest expirations
+        # Request near-the-money chain — use larger strike_count so we don't
+        # miss strikes when Schwab's ATM centre differs slightly from spot
         resp = client.get_option_chain(
             symbol,
             contract_type=schwab.client.Client.Options.ContractType.ALL,
-            strike_count=30,
+            strike_count=60,      # was 30 — wider net so nothing gets missed
             include_underlying_quote=True,
             strategy=schwab.client.Client.Options.Strategy.SINGLE,
             option_type=schwab.client.Client.Options.Type.ALL,
@@ -313,6 +300,14 @@ def schwab_get_options_chain(client, symbol: str = "SPY",
             return None
 
         data = resp.json()
+
+        # Use the underlying price from the response if available — most accurate
+        underlying = data.get("underlying", {})
+        if underlying:
+            api_spot = float(underlying.get("last", 0) or underlying.get("mark", 0) or 0)
+            if api_spot > 0:
+                spot_est = api_spot
+
         rows = []
 
         for right_key, right_char in [("callExpDateMap", "C"), ("putExpDateMap", "P")]:
@@ -329,8 +324,9 @@ def schwab_get_options_chain(client, symbol: str = "SPY",
                 for strike_str, contracts in strikes_dict.items():
                     try:
                         strike = float(strike_str)
-                        # Skip far out-of-money
-                        if not (spot_est * 0.88 <= strike <= spot_est * 1.12):
+                        # Filter to ±15% — wide enough to never miss valid strikes
+                        # (the user's heatmap range controls what's displayed)
+                        if not (spot_est * 0.85 <= strike <= spot_est * 1.15):
                             continue
                         for contract in contracts:
                             iv  = float(contract.get("volatility", 0) or 0) / 100.0

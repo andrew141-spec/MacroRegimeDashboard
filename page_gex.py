@@ -41,183 +41,194 @@ def _days_to_exp(label: str) -> int:
 def _make_heatmap(chain_df: pd.DataFrame, spot: float,
                   greek: str = "net_gex",
                   title: str = "GEX Heatmap",
-                  height: int = 620) -> go.Figure:
+                  height: int = 580) -> go.Figure:
     """
-    Build a GEX/VEX/CEX heatmap matching the reference layout:
-      - Rows    = strike prices (high at top, low at bottom)
-      - Columns = expiration dates
-      - Values  = greek exposure in $M for that strike × expiry
-      - Colour  = green (positive) → red (negative), intensity ∝ magnitude
-      - Rightmost column = total across all expirations
-      - Left annotation = spot price arrow row
+    Strike × Expiry heatmap matching the reference image exactly:
+      - Strikes on Y axis, descending (high at top), centred on spot
+      - Expiry dates on X axis (bottom), chronological, TOTAL on far right
+      - Cells: dollar value in $M, coloured green (pos) / red (neg)
+      - Spot row: cyan left-arrow label + highlighted row
+      - No empty rows, no zero-value label noise
     """
     from gex_engine import compute_gex_from_chain
 
     if chain_df is None or len(chain_df) == 0:
         fig = go.Figure()
         fig.add_annotation(text="No data", x=0.5, y=0.5, showarrow=False,
-                           xref="paper", yref="paper", font=dict(color="white"))
+                           xref="paper", yref="paper", font=dict(color="white", size=14))
         return fig
 
-    # Compute all Greeks on the full chain
     gex_chain = compute_gex_from_chain(chain_df, spot)
+    greek_col  = {"net_gex":"net_gex","net_vex":"net_vex","net_cex":"net_cex"}.get(greek,"net_gex")
 
-    # Map greek arg to column
-    col_map = {"net_gex": "net_gex", "net_vex": "net_vex", "net_cex": "net_cex"}
-    greek_col = col_map.get(greek, "net_gex")
-
-    # Build expiry date labels
-    gex_chain["exp_label"] = (gex_chain["expiry_T"] * 365).round(0).astype(int).apply(
-        lambda d: (dt.date.today() + dt.timedelta(days=int(d))).strftime("%b %-d")
+    # ── Expiry labels (YYYY-MM-DD format for reliable sorting) ────────────
+    gex_chain["exp_date"] = (gex_chain["expiry_T"] * 365).round(0).astype(int).apply(
+        lambda d: dt.date.today() + dt.timedelta(days=int(d))
     )
+    gex_chain["exp_label"] = gex_chain["exp_date"].apply(lambda d: d.strftime("%Y-%m-%d"))
 
-    # Pivot: rows=strike, cols=exp_label, values=greek_col (in $M)
+    # ── Pivot ─────────────────────────────────────────────────────────────
     pivot = (gex_chain
              .groupby(["strike", "exp_label"])[greek_col]
              .sum()
              .reset_index()
              .pivot(index="strike", columns="exp_label", values=greek_col)
-             .fillna(0)
-             / 1e6)
+             .fillna(0) / 1e6)
 
-    # Sort strikes descending (high at top like reference image)
+    # ── Strike filter: centre on spot, ±pct% ─────────────────────────────
+    pct     = getattr(_make_heatmap, "_strike_pct", 0.06)
+    max_dte = getattr(_make_heatmap, "_max_dte",    30)
+
+    lo, hi = spot * (1 - pct), spot * (1 + pct)
+    pivot  = pivot[(pivot.index >= lo) & (pivot.index <= hi)]
+
+    # ── Expiry filter: near-term only ────────────────────────────────────
+    def _dte(col): 
+        try: return (dt.date.fromisoformat(col) - dt.date.today()).days
+        except: return 999
+    keep_cols = [c for c in pivot.columns if _dte(c) <= max_dte]
+    if keep_cols:
+        pivot = pivot[sorted(keep_cols)]   # already ISO → sorts correctly
+
+    # Drop all-zero rows (strikes with no meaningful exposure)
+    pivot = pivot.loc[(pivot.abs() >= 0.5).any(axis=1)]
+
+    # Descending strike order (highest at top)
     pivot = pivot.sort_index(ascending=False)
 
-    # Filter strikes to ±strike_pct of spot (passed via function arg, default ±7%)
-    # Tighter range = fewer rows = readable cells
-    pct = getattr(_make_heatmap, "_strike_pct", 0.07)
-    pivot = pivot[(pivot.index >= spot * (1 - pct)) & (pivot.index <= spot * (1 + pct))]
+    # ── TOTAL column ──────────────────────────────────────────────────────
+    pivot["TOTAL"] = pivot.drop(columns=["TOTAL"], errors="ignore").sum(axis=1)
 
-    # Filter to near-term expirations only — max 45 DTE keeps columns manageable
-    # Far-dated expirations have negligible gamma and just waste horizontal space
-    max_dte = getattr(_make_heatmap, "_max_dte", 45)
-    near_term_cols = [c for c in pivot.columns
-                      if c != "TOTAL" and _days_to_exp(c) <= max_dte]
-    if near_term_cols:
-        pivot = pivot[near_term_cols]
+    # ── Display labels: shorten expiry to "Mar 18" style ─────────────────
+    def _fmt_col(c):
+        if c == "TOTAL": return "TOTAL"
+        try: return dt.date.fromisoformat(c).strftime("%Y-%m-%d")
+        except: return c
 
-    # Drop strikes with all-zero exposure (reduces noise rows)
-    pivot = pivot.loc[(pivot.abs() > 0.1).any(axis=1)]
+    display_cols = [_fmt_col(c) for c in pivot.columns]
 
-    # Sort columns chronologically
-    try:
-        pivot = pivot[sorted(pivot.columns,
-                             key=lambda x: dt.datetime.strptime(
-                                 x + f" {dt.date.today().year}", "%b %d %Y"))]
-    except Exception:
-        pass
+    strikes = list(pivot.index)
+    z_vals  = pivot.values.tolist()
+    n_rows  = len(strikes)
+    n_cols  = len(pivot.columns)
 
-    # Add total column
-    pivot["TOTAL"] = pivot.sum(axis=1)
+    # ── Nearest strike to spot → highlight row ────────────────────────────
+    nearest = min(strikes, key=lambda s: abs(s - spot))
+    spot_idx = strikes.index(nearest)
 
-    strikes  = list(pivot.index)
-    cols     = list(pivot.columns)
-    z_vals   = pivot.values.tolist()
-
-    # Text annotations: show value if |val| > 0.5M, else blank
-    # Only annotate cells with |value| >= 1M — avoids clutter in small cells
-    n_cols = len(cols)
-    n_rows = len(strikes)
-    # Fewer cells = more space per cell = can show smaller values
-    thresh = 2.0 if n_cols > 12 else (1.0 if n_cols > 6 else 0.5)
-    text_vals = [
-        [f"${v:.0f}M" if abs(v) >= thresh else "" for v in row]
-        for row in z_vals
-    ]
-
-    # Color scale: red → black → green, centred at 0
-    colorscale = [
-        [0.0,  "#b91c1c"],   # deep red
-        [0.35, "#ef4444"],   # red
-        [0.48, "#1a1a1a"],   # near-black at zero
-        [0.52, "#1a1a1a"],
-        [0.65, "#10b981"],   # green
-        [1.0,  "#065f46"],   # deep green
-    ]
-
-    # Cap colour range at 95th percentile to avoid outliers swamping scale
-    flat = [abs(v) for row in z_vals for v in row if v != 0]
-    zmax = float(np.percentile(flat, 95)) if flat else 10.0
-
-    # Spot row highlight: find nearest strike to spot
-    nearest_strike = min(strikes, key=lambda s: abs(s - spot)) if strikes else spot
-    spot_row_idx   = strikes.index(nearest_strike) if nearest_strike in strikes else None
-
-    # Y-axis labels with spot marker
+    # ── Y-axis labels: arrow marker on spot row ───────────────────────────
     y_labels = []
     for s in strikes:
-        if abs(s - spot) / spot < 0.0015:
-            y_labels.append(f"→ ${s:.2f}")
+        if s == nearest:
+            y_labels.append(f"→ ${s:.0f}")
         else:
             y_labels.append(f"${s:.0f}")
 
+    # ── Cell text: value in $M, skip small cells ──────────────────────────
+    # Threshold scales with cell count so text never overlaps
+    thresh = 0.5
+    def _cell(v):
+        if abs(v) < thresh: return ""
+        if abs(v) >= 1000: return f"${v/1000:.1f}B"
+        return f"${v:.1f}M"
+    text_vals = [[_cell(v) for v in row] for row in z_vals]
+
+    # ── Colour scale ──────────────────────────────────────────────────────
+    flat = [abs(v) for row in z_vals for v in row if abs(v) >= thresh]
+    zmax = float(np.percentile(flat, 97)) if flat else 100.0
+
+    colorscale = [
+        [0.00, "#7f1d1d"],  # deep red
+        [0.30, "#ef4444"],  # red
+        [0.45, "#1c1c1c"],  # near-zero dark
+        [0.50, "#111111"],  # zero = black
+        [0.55, "#1c1c1c"],
+        [0.70, "#10b981"],  # green
+        [1.00, "#064e3b"],  # deep green
+    ]
+
+    # ── Build figure ──────────────────────────────────────────────────────
     fig = go.Figure(go.Heatmap(
         z=z_vals,
-        x=cols,
+        x=display_cols,
         y=y_labels,
         text=text_vals,
         texttemplate="%{text}",
-        textfont=dict(size=9, color="rgba(255,255,255,0.85)"),
+        textfont=dict(
+            size=max(7, min(11, int(450 / max(n_cols, 1)))),
+            color="rgba(255,255,255,0.90)",
+            family="monospace",
+        ),
         colorscale=colorscale,
-        zmid=0,
-        zmin=-zmax,
-        zmax=zmax,
+        zmid=0, zmin=-zmax, zmax=zmax,
         showscale=True,
         colorbar=dict(
-            title=dict(text="$M", font=dict(size=10, color="rgba(255,255,255,0.6)")),
             tickfont=dict(size=9, color="rgba(255,255,255,0.6)"),
-            thickness=12,
-            len=0.85,
+            thickness=14, len=0.9,
             bgcolor="rgba(0,0,0,0)",
-            bordercolor="rgba(255,255,255,0.1)",
+            bordercolor="rgba(255,255,255,0.08)",
+            tickformat="$.0s",
         ),
-        hoverongaps=False,
-        hovertemplate="Strike: %{y}<br>Expiry: %{x}<br>Value: %{z:.2f}M<extra></extra>",
-        xgap=1,
-        ygap=0.5,
+        xgap=2, ygap=1,
+        hovertemplate="Strike: %{y}<br>Expiry: %{x}<br>%{z:.1f}M<extra></extra>",
     ))
 
-    # Spot row highlight — use paper y-reference so it doesn't distort the axis
-    # We just annotate the y-axis label instead of drawing a shape
-    spot_label = y_labels[spot_row_idx] if spot_row_idx is not None else None
+    # ── Spot row: cyan horizontal highlight line (top and bottom border) ──
+    # Use paper-fraction y so it never distorts the axis range
+    if n_rows > 0:
+        row_h   = 1.0 / n_rows          # height of one row in paper coords
+        row_top = 1.0 - spot_idx * row_h
+        row_bot = row_top - row_h
+        for y_pos in [row_top, row_bot]:
+            fig.add_shape(
+                type="line",
+                x0=0, x1=1, y0=y_pos, y1=y_pos,
+                xref="paper", yref="paper",
+                line=dict(color="#06b6d4", width=1.5),
+            )
 
-    # TOTAL column border — use paper coords so no axis distortion
+    # ── TOTAL column: right-side separator ───────────────────────────────
     fig.add_shape(
-        type="rect",
-        x0=len(cols) - 1.5, x1=len(cols) - 0.5,
+        type="line",
+        x0=n_cols - 1.5, x1=n_cols - 1.5,
         y0=0, y1=1,
         xref="x", yref="paper",
-        line=dict(color="rgba(255,255,255,0.20)", width=1, dash="dot"),
-        fillcolor="rgba(0,0,0,0)",
+        line=dict(color="rgba(255,255,255,0.25)", width=1, dash="dot"),
     )
 
+    # ── Layout ────────────────────────────────────────────────────────────
     fig.update_layout(
         title=dict(
-            text=f"{title} — {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} — Current Price: ${spot:.2f}",
-            font=dict(size=12, color="rgba(255,255,255,0.7)"),
+            text=(f"{title} — {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                  f" — Current Price: ${spot:.2f}"),
+            font=dict(size=11, color="rgba(255,255,255,0.65)"),
             x=0.5,
         ),
-        paper_bgcolor="rgba(15,15,15,1)",
-        plot_bgcolor="rgba(15,15,15,1)",
-        font=dict(color="rgba(255,255,255,0.75)", family="monospace"),
+        paper_bgcolor="#0d0d0d",
+        plot_bgcolor="#0d0d0d",
+        font=dict(color="rgba(255,255,255,0.80)", family="monospace"),
         height=height,
-        margin=dict(l=80, r=80, t=50, b=50),
+        margin=dict(l=70, r=80, t=45, b=55),
         xaxis=dict(
-            side="top",   # dates at top like reference image
-            tickfont=dict(size=9 if n_cols > 10 else 10),
-            tickangle=-30 if n_cols > 10 else 0,
-            gridcolor="rgba(255,255,255,0.04)",
+            side="bottom",           # dates at bottom like reference
+            tickfont=dict(size=9, color="rgba(255,255,255,0.65)"),
+            tickangle=-25,
+            showgrid=False,
             fixedrange=False,
         ),
         yaxis=dict(
-            tickfont=dict(size=8 if n_rows > 30 else 10),
-            gridcolor="rgba(255,255,255,0.04)",
+            tickfont=dict(size=9, color="rgba(255,255,255,0.75)"),
+            showgrid=False,
             fixedrange=False,
-            # Lock range to exactly the strikes — prevents axis expanding to 0
-            range=[-0.5, n_rows - 0.5],
+            # Lock to exactly the strike rows — no extra space above/below
+            range=[n_rows - 0.5, -0.5],   # reversed: index 0 = top = highest strike
             autorange=False,
+            # Autoscale centered on spot: show equal rows above and below
+            # (handled by the pct filter which is symmetric around spot)
         ),
     )
+
+    return fig
 
     return fig
 

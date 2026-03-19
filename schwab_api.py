@@ -1,9 +1,15 @@
 # schwab_api.py — Schwab OAuth2 client, Supabase token storage, options chain
-import os, time, math, datetime as dt, json, tempfile
+import os, re, time, math, datetime as dt, json, tempfile
+from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
+from enum import Enum
 import numpy as np
 import pandas as pd
 import streamlit as st
+import plotly.graph_objects as go
+import plotly.express as px
+import yfinance as yf
+from fredapi import Fred
 from scipy import stats as scipy_stats
 from scipy.stats import norm as scipy_norm
 from urllib.request import Request, urlopen
@@ -155,23 +161,18 @@ def get_schwab_client():
 def schwab_run_auth_flow(client_id: str, client_secret: str,
                           redirect_uri: str) -> Optional[str]:
     """
-    Start the OAuth2 flow using the current schwab-py manual flow API.
+    Start the OAuth2 flow using schwab.auth.get_auth_context().
+    Stores the AuthContext in session state for use in schwab_complete_auth().
     Returns the Schwab authorization URL for the user to open in their browser.
     """
     if not SCHWAB_AVAILABLE:
         return None
     try:
-        # Build the auth URL directly via the Schwab OAuth endpoint —
-        # schwab-py no longer exposes OAuth2Client; use the documented URL format.
-        import urllib.parse
-        params = urllib.parse.urlencode({
-            "client_id":     client_id,
-            "redirect_uri":  redirect_uri,
-            "response_type": "code",
-        })
-        auth_url = f"https://api.schwabapi.com/v1/oauth/authorize?{params}"
-        st.session_state["_schwab_oauth_redir"] = redirect_uri
-        return auth_url
+        auth_context = schwab.auth.get_auth_context(client_id, redirect_uri)
+        # Store the full auth_context — needed by client_from_received_url later
+        st.session_state["_schwab_auth_context"] = auth_context
+        st.session_state["_schwab_oauth_redir"]  = redirect_uri
+        return auth_context.authorization_url
     except Exception as e:
         return f"error: {e}"
 
@@ -179,7 +180,9 @@ def schwab_run_auth_flow(client_id: str, client_secret: str,
 def schwab_complete_auth(client_id: str, client_secret: str,
                           redirect_uri: str, callback_url: str) -> Tuple[bool, str]:
     """
-    Complete the OAuth2 flow using schwab.auth.client_from_manual_flow.
+    Complete the OAuth2 flow using schwab.auth.client_from_received_url().
+    This is the correct cloud/server API — it accepts the full redirected URL
+    (including auth code) without needing stdin interaction.
     Saves the resulting token to Supabase.
     Returns (success: bool, message: str).
     """
@@ -188,15 +191,26 @@ def schwab_complete_auth(client_id: str, client_secret: str,
     try:
         tmp_path = tempfile.mktemp(suffix=".json", prefix="schwab_token_")
 
-        # client_from_manual_flow is the current schwab-py API for server/cloud use.
-        # It takes the full redirected callback URL, exchanges the code, and writes
-        # the token to tmp_path.
-        client = schwab.auth.client_from_manual_flow(
+        # Retrieve the AuthContext stored when schwab_run_auth_flow was called.
+        # If missing (e.g. session was reset), rebuild it from the redirect_uri.
+        auth_context = st.session_state.get("_schwab_auth_context")
+        if auth_context is None:
+            auth_context = schwab.auth.get_auth_context(client_id, redirect_uri)
+
+        def _write_token(token):
+            with open(tmp_path, "w") as f:
+                import json
+                json.dump(token, f)
+
+        # client_from_received_url is the correct API for server/cloud flows.
+        # It takes the full redirected URL the user pastes (containing the auth code),
+        # exchanges it for a token, and calls token_write_func to save it.
+        client = schwab.auth.client_from_received_url(
             api_key=client_id,
             app_secret=client_secret,
-            callback_url=redirect_uri,
-            token_path=tmp_path,
-            redirected_url=callback_url,
+            auth_context=auth_context,
+            received_url=callback_url,
+            token_write_func=_write_token,
         )
 
         token_dict = _token_from_tempfile(tmp_path)
@@ -332,10 +346,6 @@ def schwab_get_options_chain(client, symbol: str = "SPY",
                     iv=("iv", "mean"),
                     call_oi=("call_oi", "sum"),
                     put_oi=("put_oi", "sum"),
-                    # Preserve Schwab's model gamma — averaged across contracts
-                    # at the same strike/expiry. gex_engine prefers this over
-                    # recomputing from BS when it's available and non-zero.
-                    schwab_gamma=("schwab_gamma", "mean"),
                 )
                 .reset_index())
         return df

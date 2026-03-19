@@ -243,261 +243,322 @@ def _key_nodes_table(nodes: List[Tuple[float, float]], spot: float, label: str):
     st.dataframe(df, hide_index=True, use_container_width=True)
 
 
-def _module3_setups(dg: DealerGreeks, gs: GammaState, spot: float,
-                    vix_level: float, session: dict) -> List[dict]:
+
+def _levels(dg, gs, spot, side="long"):
     """
-    Evaluate Module 3 setups from the heatmap framework.
-    Returns list of dicts with: name, active, conditions_met, conditions_missing, action, note
+    Compute concrete entry, stop, and target levels from GEX data.
+    side: "long" or "short"
+    Returns dict with entry, stop, t1, t2, rr1, rr2
+    """
+    gex  = dg.gex_by_strike
+    flip = gs.gamma_flip if gs.gamma_flip else spot
+
+    # Key positive nodes (call walls / support) — sorted by proximity to spot
+    pos_above = sorted([(k,v) for k,v in gex.items() if v > 0 and k > spot], key=lambda x: x[0])
+    pos_below = sorted([(k,v) for k,v in gex.items() if v > 0 and k < spot], key=lambda x: -x[0])
+    neg_above = sorted([(k,v) for k,v in gex.items() if v < 0 and k > spot], key=lambda x: x[0])
+    neg_below = sorted([(k,v) for k,v in gex.items() if v < 0 and k < spot], key=lambda x: -x[0])
+
+    # Biggest nodes (by abs value) above and below
+    biggest_above = max([(k,v) for k,v in gex.items() if k > spot], key=lambda x:abs(x[1]), default=(spot*1.01, 0))
+    biggest_below = min([(k,v) for k,v in gex.items() if k < spot], key=lambda x:abs(x[1]), default=(spot*0.99, 0))
+
+    # Nearest positive node below (support) and nearest positive node above (resistance)
+    nearest_support    = pos_below[0][0]  if pos_below    else spot * 0.995
+    nearest_resistance = pos_above[0][0]  if pos_above    else spot * 1.005
+    nearest_neg_below  = neg_below[0][0]  if neg_below    else spot * 0.99
+    nearest_neg_above  = neg_above[0][0]  if neg_above    else spot * 1.01
+
+    # Second targets (next significant node beyond first)
+    sec_support    = pos_below[1][0] if len(pos_below) > 1 else nearest_support    * 0.995
+    sec_resistance = pos_above[1][0] if len(pos_above) > 1 else nearest_resistance * 1.005
+
+    if side == "long":
+        entry = nearest_support          # buy at/near support node
+        stop  = round(entry * 0.997, 2)  # 0.3% below entry (just below the node)
+        t1    = nearest_resistance       # first positive node above
+        t2    = sec_resistance           # second positive node above
+        rr1   = round((t1 - entry) / (entry - stop), 1) if entry > stop else 0
+        rr2   = round((t2 - entry) / (entry - stop), 1) if entry > stop else 0
+    else:
+        entry = nearest_resistance       # sell at/near resistance node
+        stop  = round(entry * 1.003, 2)  # 0.3% above entry
+        t1    = nearest_support          # first positive node below
+        t2    = sec_support              # second positive node below
+        rr1   = round((entry - t1) / (stop - entry), 1) if stop > entry else 0
+        rr2   = round((entry - t2) / (stop - entry), 1) if stop > entry else 0
+
+    return {
+        "entry": round(entry, 2),
+        "stop":  round(stop,  2),
+        "t1":    round(t1,    2),
+        "t2":    round(t2,    2),
+        "rr1":   rr1,
+        "rr2":   rr2,
+        "flip":  round(flip,  2),
+    }
+
+
+def _module3_setups(dg: "DealerGreeks", gs: "GammaState", spot: float,
+                    vix_level: float, session: dict) -> list:
+    """
+    Evaluate Module 3 setups with precise entry/stop/target levels.
+    Each setup checks real conditions, then computes exact price levels.
     """
     setups = []
     regime = gs.regime
     dist   = gs.distance_to_flip_pct
-    flip   = gs.gamma_flip
+    flip   = gs.gamma_flip or spot
 
-    # Helpers
-    ntm_gex = sum(v for k, v in dg.gex_by_strike.items() if abs(k - spot) / spot < 0.02)
-    ntm_vex = sum(v for k, v in dg.vex_by_strike.items() if abs(k - spot) / spot < 0.02)
-    ntm_cex = sum(v for k, v in dg.cex_by_strike.items() if abs(k - spot) / spot < 0.02)
+    # Near-the-money aggregates (within 2% of spot)
+    ntm_gex = sum(v for k, v in dg.gex_by_strike.items() if abs(k-spot)/spot < 0.02)
+    ntm_vex = sum(v for k, v in dg.vex_by_strike.items() if abs(k-spot)/spot < 0.02)
+    ntm_cex = sum(v for k, v in dg.cex_by_strike.items() if abs(k-spot)/spot < 0.02)
 
-    # Largest nodes above and below
-    above_nodes = [(k, v) for k, v in dg.gex_by_strike.items() if k > spot]
-    below_nodes = [(k, v) for k, v in dg.gex_by_strike.items() if k < spot]
-    largest_above = max(above_nodes, key=lambda x: abs(x[1])) if above_nodes else (spot, 0)
-    largest_below = min(below_nodes, key=lambda x: abs(x[1])) if below_nodes else (spot, 0)
+    # Consecutive same-sign strikes in 5% band
+    near = sorted([k for k in dg.gex_by_strike if abs(k-spot)/spot < 0.05])
+    pos_run = sum(1 for k in near if dg.gex_by_strike.get(k, 0) > 0)
+    neg_run = sum(1 for k in near if dg.gex_by_strike.get(k, 0) < 0)
 
-    # Consecutive same-sign strikes near spot
-    near_strikes = sorted([k for k in dg.gex_by_strike if abs(k - spot) / spot < 0.05])
-    pos_run = sum(1 for k in near_strikes if dg.gex_by_strike.get(k, 0) > 0)
-    neg_run = sum(1 for k in near_strikes if dg.gex_by_strike.get(k, 0) < 0)
+    # Largest node above/below
+    gex = dg.gex_by_strike
+    above = [(k,v) for k,v in gex.items() if k > spot]
+    below = [(k,v) for k,v in gex.items() if k < spot]
+    largest_above = max(above, key=lambda x:abs(x[1])) if above else (spot*1.01, 0)
+    largest_below = min(below, key=lambda x:abs(x[1])) if below else (spot*0.99, 0)
 
-    is_late = session["window"] in ("Afternoon", "Close/MOC")
+    pos_nodes_above = sorted([(k,v) for k,v in gex.items() if v > 0 and k > spot], key=lambda x:x[0])
+    pos_nodes_below = sorted([(k,v) for k,v in gex.items() if v > 0 and k < spot], key=lambda x:-x[0])
+    neg_nodes_above = sorted([(k,v) for k,v in gex.items() if v < 0 and k > spot], key=lambda x:x[0])
+    neg_nodes_below = sorted([(k,v) for k,v in gex.items() if v < 0 and k < spot], key=lambda x:-x[0])
+
+    is_late  = session["window"] in ("Afternoon", "Close/MOC")
     is_prime = session["window"] == "Morning"
-
-    # ── 1. Gamma Pin and Magnet Drift ─────────────────────────────────────
-    cond1_met = []
-    cond1_mis = []
-    if regime in (GammaRegime.STRONG_POSITIVE, GammaRegime.POSITIVE):
-        cond1_met.append("Positive gamma regime ✓")
-    else:
-        cond1_mis.append("Need positive gamma regime")
-    if pos_run >= 3:
-        cond1_met.append(f"{pos_run} consecutive positive strikes near spot ✓")
-    else:
-        cond1_mis.append(f"Need 3+ consecutive positive strikes (have {pos_run})")
-    if abs(largest_above[1]) > 50e6 or abs(largest_below[1]) > 50e6:
-        cond1_met.append("Large key nodes define range ✓")
-    else:
-        cond1_mis.append("Need large key nodes above/below ($50M+)")
-
-    setups.append({
-        "name": "Gamma Pin & Magnet Drift",
-        "icon": "📌",
-        "active": len(cond1_met) >= 2,
-        "conditions_met": cond1_met,
-        "conditions_missing": cond1_mis,
-        "action": f"Fade moves away from key node ${dg.key_nodes_gex[0][0]:.0f} if present. Use outer positive nodes as range edges." if dg.key_nodes_gex else "Identify key node first — no significant nodes detected.",
-        "note": "Avoid chasing breakouts unless outer node rapidly shrinks (magnet weakening).",
-        "module": "Module 3 §1",
-    })
-
-    # ── 2. Node Break — Regime Shift ──────────────────────────────────────
     near_flip = abs(dist) < 1.5
-    large_node_nearby = any(abs(k - spot) / spot < 0.015 and abs(v) > 100e6
-                            for k, v in dg.gex_by_strike.items())
-    cond2_met = []
-    cond2_mis = []
-    if near_flip:
-        cond2_met.append(f"Near gamma flip ({dist:+.2f}%) ✓")
-    else:
-        cond2_mis.append(f"Need price closer to flip (currently {dist:+.2f}%)")
-    if large_node_nearby:
-        cond2_met.append("Large node within 1.5% of spot ✓")
-    else:
-        cond2_mis.append("Need large node ($100M+) within 1.5% of spot")
-    if regime in (GammaRegime.POSITIVE, GammaRegime.NEUTRAL):
-        cond2_met.append("Regime can transition ✓")
-    else:
-        cond2_mis.append("Best when transitioning from positive → neutral/negative")
 
-    setups.append({
-        "name": "Node Break — Regime Shift",
-        "icon": "💥",
-        "active": len(cond2_met) >= 2,
-        "conditions_met": cond2_met,
-        "conditions_missing": cond2_mis,
-        "action": "Watch for failed rejection + fast decrease in node value. Enter direction of break, target next largest node.",
-        "note": "Vol expands the moment the former wall is gone. Expect vacuum to next node.",
-        "module": "Module 3 §2",
-    })
+    def _setup(name, icon, met, mis, action, entry_text, stop_text,
+               t1_text, t2_text, rr, note, module, active=None):
+        a = (len(met) >= 2) if active is None else active
+        setups.append({
+            "name": name, "icon": icon, "active": a,
+            "conditions_met": met, "conditions_missing": mis,
+            "action": action,
+            "entry": entry_text, "stop": stop_text,
+            "t1": t1_text, "t2": t2_text, "rr": rr,
+            "note": note, "module": module,
+        })
 
-    # ── 3. Negative Gamma Amplification ───────────────────────────────────
-    cond3_met = []
-    cond3_mis = []
-    if regime in (GammaRegime.NEGATIVE, GammaRegime.STRONG_NEGATIVE):
-        cond3_met.append("Negative gamma regime ✓")
-    else:
-        cond3_mis.append("Need negative gamma regime")
-    if neg_run >= 3:
-        cond3_met.append(f"{neg_run} consecutive negative strikes near spot ✓")
-    else:
-        cond3_mis.append(f"Need 3+ consecutive negative strikes (have {neg_run})")
-    if ntm_gex < -100e6:
-        cond3_met.append("Strong negative GEX cluster near spot ✓")
-    else:
-        cond3_mis.append("Need strong negative GEX cluster ($-100M+)")
+    # ── 1. Gamma Pin & Magnet Drift ───────────────────────────────────────
+    # Conditions: positive regime + consecutive positive strikes + large nodes defining range
+    m, x = [], []
+    (m if regime in (GammaRegime.STRONG_POSITIVE, GammaRegime.POSITIVE) else x).append("✓ Positive gamma regime")
+    (m if pos_run >= 3 else x).append(f"{'✓' if pos_run>=3 else '○'} {pos_run}/3 consecutive positive strikes near spot")
+    (m if (abs(largest_above[1]) > 50e6 or abs(largest_below[1]) > 50e6) else x).append(
+        f"{'✓' if abs(largest_above[1])>50e6 or abs(largest_below[1])>50e6 else '○'} Large nodes defining range ($50M+)")
 
-    setups.append({
-        "name": "Negative Gamma Amplification",
-        "icon": "🌊",
-        "active": len(cond3_met) >= 2,
-        "conditions_met": cond3_met,
-        "conditions_missing": cond3_mis,
-        "action": "Trade breakouts away from flip zone. Down moves → delta selling. Up moves → delta buying. Follow the direction.",
-        "note": "Gap-and-go and sharp moves expected. Do NOT fade — dealers are chasing.",
-        "module": "Module 3 §3",
-    })
+    sup  = pos_nodes_below[0][0] if pos_nodes_below else spot * 0.997
+    res  = pos_nodes_above[0][0] if pos_nodes_above else spot * 1.003
+    sup2 = pos_nodes_below[1][0] if len(pos_nodes_below) > 1 else sup * 0.997
+    res2 = pos_nodes_above[1][0] if len(pos_nodes_above) > 1 else res * 1.003
+    stop_l = round(sup * 0.9975, 2)
+    stop_s = round(res * 1.0025, 2)
+    rr_l = round((res - sup) / (sup - stop_l), 1) if sup > stop_l else 0
+    rr_s = round((res - sup) / (stop_s - res), 1) if stop_s > res else 0
 
-    # ── 4. Vanna Squeeze ──────────────────────────────────────────────────
-    pos_vanna_ntm = ntm_vex > 50e6
-    iv_elevated   = vix_level > 22
-    cond4_met = []
-    cond4_mis = []
-    if pos_vanna_ntm:
-        cond4_met.append(f"Positive vanna near spot (${ntm_vex/1e6:.0f}M) ✓")
-    else:
-        cond4_mis.append("Need positive vanna band near spot ($50M+)")
-    if iv_elevated:
-        cond4_met.append(f"IV elevated (VIX {vix_level:.1f}) — compression potential ✓")
-    else:
-        cond4_mis.append(f"IV not elevated enough (VIX {vix_level:.1f}, need >22)")
-    if regime in (GammaRegime.POSITIVE, GammaRegime.NEUTRAL):
-        cond4_met.append("Positive gamma supportive ✓")
-    else:
-        cond4_mis.append("Positive/neutral gamma regime preferred")
+    _setup("Gamma Pin & Magnet Drift", "📌", m, x,
+           f"Range trade between ${sup:.2f} support and ${res:.2f} resistance. "
+           f"Dealers mechanically buy dips to ${sup:.2f} and sell rips to ${res:.2f}.",
+           f"LONG: ${sup:.2f} (support node) | SHORT: ${res:.2f} (resistance node)",
+           f"LONG stop: ${stop_l:.2f} (below node) | SHORT stop: ${stop_s:.2f} (above node)",
+           f"T1 (long): ${res:.2f} | T1 (short): ${sup:.2f}",
+           f"T2 (long): ${res2:.2f} | T2 (short): ${sup2:.2f}",
+           f"~{rr_l:.1f}:1 long / ~{rr_s:.1f}:1 short",
+           "Fade moves away from the node. Wait for price to reach the level — do not anticipate.",
+           "§1")
 
-    setups.append({
-        "name": "Vanna Squeeze",
-        "icon": "🚀",
-        "active": len(cond4_met) >= 2,
-        "conditions_met": cond4_met,
-        "conditions_missing": cond4_mis,
-        "action": "Positive vanna + elevated IV = self-reinforcing squeeze. IV drops → call deltas rise → dealers BUY → price rallies → IV drops further. Look for accumulation below positive GEX node. Target: next largest positive GEX level.",
-        "note": "Most powerful post-event (FOMC/earnings): uncertainty resolves → IV crushes → dealers buy. Feedback loop: falling IV forces dealer buying which further reduces IV.",
-        "module": "Module 3 §4",
-    })
+    # ── 2. Node Break — Regime Shift ─────────────────────────────────────
+    # Conditions: near gamma flip + large node within 1.5% of spot
+    m, x = [], []
+    (m if near_flip else x).append(f"{'✓' if near_flip else '○'} Near gamma flip (dist: {dist:+.2f}%, need <1.5%)")
+    large_nearby = [(k,v) for k,v in gex.items() if abs(k-spot)/spot < 0.015 and abs(v) > 100e6]
+    (m if large_nearby else x).append(f"{'✓' if large_nearby else '○'} Large node ($100M+) within 1.5% of spot")
+    (m if regime in (GammaRegime.POSITIVE, GammaRegime.NEUTRAL) else x).append(
+        f"{'✓' if regime in (GammaRegime.POSITIVE,GammaRegime.NEUTRAL) else '○'} Transitional regime")
 
-    # ── 5. Vanna Rug / Vol Shock ──────────────────────────────────────────
-    # Per notes: negative vanna NEAR spot (ITM/ATM) + IV compressed + catalyst
-    neg_vanna_ntm = sum(v for k, v in dg.vex_by_strike.items()
-                        if abs(k - spot) / spot < 0.03 and v < 0)
-    iv_compressed = vix_level < 18
-    cond5_met = []
-    cond5_mis = []
-    if neg_vanna_ntm < -30e6:
-        cond5_met.append(f"Negative vanna near spot (${neg_vanna_ntm/1e6:.0f}M) ✓")
-    else:
-        cond5_mis.append("Need negative vanna near/ITM spot ($-30M+)")
-    if iv_compressed:
-        cond5_met.append(f"IV compressed (VIX {vix_level:.1f}) — shock potential ✓")
-    else:
-        cond5_mis.append(f"IV not compressed enough (VIX {vix_level:.1f}, need <18)")
-    if session.get("is_data_day") or session.get("is_opex_friday"):
-        cond5_met.append("Catalyst present (data day / OpEx) ✓")
-    else:
-        cond5_mis.append("Watch for upcoming catalyst: FOMC/CPI/NFP/earnings (when IV typically spikes)")
+    # Entry is a break of the flip level
+    break_long_entry  = round(flip * 1.001, 2)   # just above flip
+    break_short_entry = round(flip * 0.999, 2)   # just below flip
+    break_stop_l      = round(flip * 0.998, 2)   # invalidation: flip reclaimed
+    break_stop_s      = round(flip * 1.002, 2)
+    next_pos_above    = pos_nodes_above[0][0] if pos_nodes_above else flip * 1.01
+    next_neg_below    = neg_nodes_below[0][0] if neg_nodes_below else flip * 0.99
+    rr_break_l        = round((next_pos_above - break_long_entry)  / (break_long_entry  - break_stop_l), 1) if break_long_entry > break_stop_l else 0
+    rr_break_s        = round((break_short_entry - next_neg_below) / (break_stop_s - break_short_entry), 1) if break_stop_s > break_short_entry else 0
 
-    setups.append({
-        "name": "Vanna Rug / Vol Shock",
-        "icon": "🧨",
-        "active": len(cond5_met) >= 2,
-        "conditions_met": cond5_met,
-        "conditions_missing": cond5_mis,
-        "action": "Negative vanna + compressed IV = cascade risk on any catalyst. IV spikes → dealers short options SELL underlying → price drops → IV spikes further. Self-reinforcing selloff. Short bias or hedge BEFORE catalyst hits.",
-        "note": "Opposite of Vanna Squeeze. IV rise forces dealer selling cascade. Most dangerous: low VIX + negative vanna + known catalyst. Selloffs, fear events, macro misses all cause IV to spike.",
-        "module": "Module 3 §5",
-    })
+    _setup("Node Break — Regime Shift", "💥", m, x,
+           f"Enter on confirmed break through flip at ${flip:.2f}. "
+           f"Failed rejection + fast node decrease = signal. Target next node on breakout side.",
+           f"LONG break: ${break_long_entry:.2f} (flip + buffer) | SHORT break: ${break_short_entry:.2f}",
+           f"LONG stop: ${break_stop_l:.2f} (flip reclaimed = invalid) | SHORT stop: ${break_stop_s:.2f}",
+           f"T1 (long): ${next_pos_above:.2f} | T1 (short): ${next_neg_below:.2f}",
+           f"T2: next major node beyond T1",
+           f"~{rr_break_l:.1f}:1 long / ~{rr_break_s:.1f}:1 short",
+           "Enter ONLY on a confirmed close through flip — not a wick. Flip reclaimed = exit immediately.",
+           "§2")
 
-    # ── 6. Charm Drift (EOD) ──────────────────────────────────────────────
+    # ── 3. Negative Gamma Amplification ──────────────────────────────────
+    m, x = [], []
+    (m if regime in (GammaRegime.NEGATIVE, GammaRegime.STRONG_NEGATIVE) else x).append(
+        f"{'✓' if regime in (GammaRegime.NEGATIVE,GammaRegime.STRONG_NEGATIVE) else '○'} Negative gamma regime")
+    (m if neg_run >= 3 else x).append(f"{'✓' if neg_run>=3 else '○'} {neg_run}/3 consecutive negative strikes near spot")
+    (m if ntm_gex < -100e6 else x).append(
+        f"{'✓' if ntm_gex < -100e6 else '○'} Strong negative GEX cluster (${ntm_gex/1e6:.0f}M, need -$100M)")
+
+    # In neg gamma: follow breakouts. Entry = current direction continuation.
+    # Next neg node in direction of move = target (dealers amplify through them)
+    mom_dir = "long" if spot > flip else "short"
+    if mom_dir == "long":
+        ng_entry = spot      # enter now (momentum)
+        ng_stop  = round(flip * 0.999, 2)   # flip is invalidation
+        ng_t1    = neg_nodes_above[0][0] if neg_nodes_above else spot * 1.01
+        ng_t2    = neg_nodes_above[1][0] if len(neg_nodes_above) > 1 else ng_t1 * 1.01
+        ng_rr    = round((ng_t1 - ng_entry) / (ng_entry - ng_stop), 1) if ng_entry > ng_stop else 0
+    else:
+        ng_entry = spot
+        ng_stop  = round(flip * 1.001, 2)
+        ng_t1    = neg_nodes_below[0][0] if neg_nodes_below else spot * 0.99
+        ng_t2    = neg_nodes_below[1][0] if len(neg_nodes_below) > 1 else ng_t1 * 0.99
+        ng_rr    = round((ng_entry - ng_t1) / (ng_stop - ng_entry), 1) if ng_stop > ng_entry else 0
+
+    _setup("Negative Gamma Amplification", "🌊", m, x,
+           f"Follow breakouts — dealers amplify moves. Momentum: {'LONG' if mom_dir=='long' else 'SHORT'} bias "
+           f"(spot {'above' if mom_dir=='long' else 'below'} flip ${flip:.2f}). Do NOT fade.",
+           f"{'LONG' if mom_dir=='long' else 'SHORT'} @ ${ng_entry:.2f} (market / pullback entry)",
+           f"Stop: ${ng_stop:.2f} (flip ${flip:.2f} = regime change, exit immediately)",
+           f"T1: ${ng_t1:.2f} (next negative node — dealers amplify through it)",
+           f"T2: ${ng_t2:.2f}",
+           f"~{ng_rr:.1f}:1",
+           "Gap-and-go expected. Do NOT fade. Trail stop to entry once T1 hit.",
+           "§3")
+
+    # ── 4. Vanna Squeeze ─────────────────────────────────────────────────
+    m, x = [], []
+    (m if ntm_vex > 50e6 else x).append(f"{'✓' if ntm_vex>50e6 else '○'} Positive vanna near spot (${ntm_vex/1e6:.0f}M, need $50M+)")
+    (m if vix_level > 22 else x).append(f"{'✓' if vix_level>22 else '○'} IV elevated (VIX {vix_level:.1f}, need >22)")
+    (m if regime in (GammaRegime.POSITIVE, GammaRegime.NEUTRAL) else x).append(
+        f"{'✓' if regime in (GammaRegime.POSITIVE,GammaRegime.NEUTRAL) else '○'} Positive/neutral gamma")
+
+    # Vanna squeeze: buy near largest positive GEX below, target positive nodes above
+    vs_entry = pos_nodes_below[0][0] if pos_nodes_below else spot * 0.998
+    vs_stop  = round(vs_entry * 0.997, 2)
+    vs_t1    = pos_nodes_above[0][0] if pos_nodes_above else spot * 1.01
+    vs_t2    = pos_nodes_above[1][0] if len(pos_nodes_above) > 1 else vs_t1 * 1.01
+    vs_rr    = round((vs_t1 - vs_entry) / (vs_entry - vs_stop), 1) if vs_entry > vs_stop else 0
+
+    _setup("Vanna Squeeze", "🚀", m, x,
+           f"IV drop → call deltas rise → dealers BUY → self-reinforcing rally. "
+           f"Accumulate near ${vs_entry:.2f} (positive GEX node). "
+           f"Feedback loop accelerates as IV compresses further.",
+           f"LONG @ ${vs_entry:.2f} (largest positive GEX node below spot)",
+           f"Stop: ${vs_stop:.2f} (node broken = squeeze thesis invalid)",
+           f"T1: ${vs_t1:.2f} (next positive node above — take 50% here)",
+           f"T2: ${vs_t2:.2f} (trail remainder)",
+           f"~{vs_rr:.1f}:1",
+           "Most powerful post-FOMC/earnings when IV crushes. Patience at entry — wait for node hold.",
+           "§4")
+
+    # ── 5. Vanna Rug / Vol Shock ─────────────────────────────────────────
+    neg_vex_ntm = sum(v for k,v in dg.vex_by_strike.items() if abs(k-spot)/spot < 0.03 and v < 0)
+    m, x = [], []
+    (m if neg_vex_ntm < -30e6 else x).append(f"{'✓' if neg_vex_ntm < -30e6 else '○'} Negative vanna near spot (${neg_vex_ntm/1e6:.0f}M, need -$30M+)")
+    (m if vix_level < 18 else x).append(f"{'✓' if vix_level<18 else '○'} IV compressed (VIX {vix_level:.1f}, need <18)")
+    (m if (session.get('is_data_day') or session.get('is_opex_friday')) else x).append(
+        f"{'✓' if session.get('is_data_day') or session.get('is_opex_friday') else '○'} Catalyst present (data day/OpEx)")
+
+    # Vanna rug: short bias before catalyst, stop above nearest resistance
+    vr_entry = neg_nodes_above[0][0] if neg_nodes_above else spot * 1.002
+    vr_stop  = round(vr_entry * 1.003, 2)
+    vr_t1    = neg_nodes_below[0][0] if neg_nodes_below else spot * 0.99
+    vr_t2    = neg_nodes_below[1][0] if len(neg_nodes_below) > 1 else vr_t1 * 0.99
+    vr_rr    = round((vr_entry - vr_t1) / (vr_stop - vr_entry), 1) if vr_stop > vr_entry else 0
+
+    _setup("Vanna Rug / Vol Shock", "🧨", m, x,
+           f"IV spike → dealers SELL → cascade. Short bias BEFORE catalyst. "
+           f"Negative vanna + compressed IV = most dangerous combo. "
+           f"Do not hold through event — position BEFORE.",
+           f"SHORT @ ${vr_entry:.2f} (negative node, pre-catalyst)",
+           f"Stop: ${vr_stop:.2f} (above node = thesis wrong, exit fast)",
+           f"T1: ${vr_t1:.2f} (first negative node below — cascades through it)",
+           f"T2: ${vr_t2:.2f} (next node — trail stop to entry after T1)",
+           f"~{vr_rr:.1f}:1",
+           "Must be positioned BEFORE the catalyst. IV spike + negative vanna = self-reinforcing. Cover into panic, not after.",
+           "§5")
+
+    # ── 6. Charm Drift (EOD) ─────────────────────────────────────────────
+    m, x = [], []
     strong_charm = abs(ntm_cex) > 20e6
-    cond6_met = []
-    cond6_mis = []
-    if strong_charm:
-        direction_str = "bullish (dealers buy)" if ntm_cex > 0 else "bearish (dealers sell)"
-        cond6_met.append(f"Strong charm near spot (${ntm_cex/1e6:.0f}M — {direction_str}) ✓")
+    charm_long = ntm_cex > 0
+    (m if strong_charm else x).append(f"{'✓' if strong_charm else '○'} Strong charm near spot (${ntm_cex/1e6:.0f}M, need ±$20M+)")
+    (m if is_late else x).append(f"{'✓' if is_late else '○'} Late session — charm strongest after 2pm (currently: {session['window']})")
+
+    cd_entry = spot
+    if charm_long:
+        cd_stop = pos_nodes_below[0][0] * 0.998 if pos_nodes_below else spot * 0.997
+        cd_t1   = pos_nodes_above[0][0] if pos_nodes_above else spot * 1.005
+        cd_t2   = pos_nodes_above[1][0] if len(pos_nodes_above) > 1 else cd_t1 * 1.003
     else:
-        cond6_mis.append("Need strong charm near spot ($20M+ abs)")
-    if is_late:
-        cond6_met.append("Late session — charm effect strongest ✓")
+        cd_stop = pos_nodes_above[0][0] * 1.002 if pos_nodes_above else spot * 1.003
+        cd_t1   = pos_nodes_below[0][0] if pos_nodes_below else spot * 0.995
+        cd_t2   = pos_nodes_below[1][0] if len(pos_nodes_below) > 1 else cd_t1 * 0.997
+    cd_rr = round(abs(cd_t1 - cd_entry) / abs(cd_entry - cd_stop), 1) if cd_entry != cd_stop else 0
+
+    _setup("Charm Drift (EOD)", "⏰", m, x,
+           f"As 0DTE options decay, dealers {'buy' if charm_long else 'sell'} to rebalance delta. "
+           f"EOD {'upward' if charm_long else 'downward'} drift expected. "
+           f"Strongest 14:00–16:00 ET. Exit by 15:50.",
+           f"{'LONG' if charm_long else 'SHORT'} @ ${cd_entry:.2f} (current spot, enter after 2pm)",
+           f"Stop: ${cd_stop:.2f} ({'below support' if charm_long else 'above resistance'})",
+           f"T1: ${cd_t1:.2f} (nearest GEX {'resistance' if charm_long else 'support'} node)",
+           f"T2: ${cd_t2:.2f} | Hard exit: 15:50 ET regardless",
+           f"~{cd_rr:.1f}:1",
+           "Exit before 15:50 ET — MOC flow overrides charm after that. Reduce size 50% if VIX > 25.",
+           "§6")
+
+    # ── 7. Charm-Vanna Alignment ─────────────────────────────────────────
+    m, x = [], []
+    (m if dg.vanna_charm_aligned else x).append(
+        f"{'✓' if dg.vanna_charm_aligned else '○'} Vanna ({dg.vanna_direction}) + Charm ({dg.charm_direction}) aligned")
+    both_size = abs(ntm_vex) > 30e6 and abs(ntm_cex) > 15e6
+    (m if both_size else x).append(f"{'✓' if both_size else '○'} VEX (${ntm_vex/1e6:.0f}M need $30M+) and CEX (${ntm_cex/1e6:.0f}M need $15M+)")
+
+    align_long = dg.vanna_direction == "bullish"
+    if align_long:
+        al_entry = pos_nodes_below[0][0] if pos_nodes_below else spot * 0.998
+        al_stop  = round(al_entry * 0.997, 2)
+        al_t1    = pos_nodes_above[0][0] if pos_nodes_above else spot * 1.005
+        al_t2    = pos_nodes_above[1][0] if len(pos_nodes_above) > 1 else al_t1 * 1.005
     else:
-        cond6_mis.append("Charm drift strongest afternoon/EOD (currently earlier session)")
+        al_entry = pos_nodes_above[0][0] if pos_nodes_above else spot * 1.002
+        al_stop  = round(al_entry * 1.003, 2)
+        al_t1    = pos_nodes_below[0][0] if pos_nodes_below else spot * 0.995
+        al_t2    = pos_nodes_below[1][0] if len(pos_nodes_below) > 1 else al_t1 * 0.995
+    al_rr = round(abs(al_t1 - al_entry) / abs(al_entry - al_stop), 1) if al_entry != al_stop else 0
 
-    setups.append({
-        "name": "Charm Drift (EOD)",
-        "icon": "⏰",
-        "active": len(cond6_met) >= 2,
-        "conditions_met": cond6_met,
-        "conditions_missing": cond6_mis,
-        "action": f"Favor {'long' if ntm_cex > 0 else 'short'} bias into EOD. Charm forces dealers to {'buy' if ntm_cex > 0 else 'sell'} as time passes — strongest 14:00–16:00 ET.",
-        "note": "Even if price/IV unchanged, time decay shifts dealer deltas. Use GEX magnets as targets.",
-        "module": "Module 3 §6",
-    })
-
-    # ── 7. Charm-Vanna Alignment ──────────────────────────────────────────
-    cond7_met = []
-    cond7_mis = []
-    if dg.vanna_charm_aligned:
-        cond7_met.append(f"Vanna and Charm both {dg.vanna_direction} ✓")
-        cond7_met.append("High-odds drift window ✓")
-    else:
-        cond7_mis.append(f"Vanna ({dg.vanna_direction}) and Charm ({dg.charm_direction}) not aligned")
-    if abs(ntm_vex) > 30e6 and abs(ntm_cex) > 15e6:
-        cond7_met.append("Both exposures have meaningful magnitude ✓")
-    else:
-        cond7_mis.append("Need both VEX ($30M+) and CEX ($15M+) near spot")
-
-    setups.append({
-        "name": "Charm-Vanna Alignment",
-        "icon": "⚡",
-        "active": dg.vanna_charm_aligned and len(cond7_met) >= 2,
-        "conditions_met": cond7_met,
-        "conditions_missing": cond7_mis,
-        "action": f"Both second-order flows lean {dg.vanna_direction}. Favor directional swing with the flow. Use GEX magnets as take-profit levels.",
-        "note": "Treat as high-odds drift window. Time decay + IV compression both push the same direction.",
-        "module": "Module 3 §7",
-    })
-
-    # ── 8. Cross-Expiry Overlap (Macro Magnet) ────────────────────────────
-    # Find strikes with large exposure in multiple expirations
-    multi_exp = {}
-    for _, row in (compute_gex_from_chain(
-                        pd.DataFrame({"strike": [], "expiry_T": [], "iv": [], "call_oi": [], "put_oi": []}),
-                        spot) if False else pd.DataFrame()).iterrows():
-        pass  # placeholder — detect from chain
-    # Use key node overlap as proxy
-    gex_nodes  = {k for k, v in dg.key_nodes_gex}
-    vex_nodes  = {k for k, v in dg.key_nodes_vex}
-    cex_nodes  = {k for k, v in dg.key_nodes_cex}
-    stacked    = gex_nodes & (vex_nodes | cex_nodes)
-
-    cond8_met = []
-    cond8_mis = []
-    if stacked:
-        cond8_met.append(f"Stacked nodes at: {', '.join(f'${k:.0f}' for k in sorted(stacked))} ✓")
-    else:
-        cond8_mis.append("No strike appears as key node in multiple Greeks")
-
-    setups.append({
-        "name": "Cross-Expiry / Stacked Node (Macro Magnet)",
-        "icon": "🧲",
-        "active": bool(stacked),
-        "conditions_met": cond8_met,
-        "conditions_missing": cond8_mis,
-        "action": f"Treat stacked strikes as macro magnets: {', '.join(f'${k:.0f}' for k in sorted(stacked)) or 'none detected'}. Expect strong reactions on first touch.",
-        "note": "Real regime change if they decisively break. Multiple dealer books adjusting simultaneously.",
-        "module": "Module 3 §9",
-    })
+    _setup("Charm-Vanna Alignment", "⚡", m, x,
+           f"Both second-order flows lean {dg.vanna_direction}. "
+           f"High-conviction directional window — two mechanical flows compounding.",
+           f"{'LONG' if align_long else 'SHORT'} @ ${al_entry:.2f}",
+           f"Stop: ${al_stop:.2f}",
+           f"T1: ${al_t1:.2f}",
+           f"T2: ${al_t2:.2f}",
+           f"~{al_rr:.1f}:1",
+           "Highest-conviction window. Scale in — 50% at entry, add 50% on first pullback to entry zone.",
+           "§7",
+           active=dg.vanna_charm_aligned and len(m) >= 2)
 
     return setups
+
+
 
 
 def render_gex_engine():
@@ -816,13 +877,36 @@ def render_gex_engine():
 
 
 def render_setups_page():
-    """Trade setups — original 5 setups + Module 3 dealer flow setups."""
+    """Trade Setups — full live context with symbol picker, all setups, entry/stop/target levels."""
     st.markdown(CSS, unsafe_allow_html=True)
     st.markdown("## 🎯 Trade Setups — Live Context")
 
-    chain_df, spot, source = get_gex_from_yfinance("SPY")
-    gs = build_gamma_state(chain_df, spot, source) if chain_df is not None else GammaState()
-    dg = compute_dealer_greeks(chain_df, spot, source) if chain_df is not None else DealerGreeks()
+    # ── Symbol + data ─────────────────────────────────────────────────────
+    col_sym, col_sch, col_info = st.columns([1, 1, 3])
+    with col_sym:
+        symbol = st.text_input("Symbol", "QQQ", key="setups_symbol")
+    with col_sch:
+        use_schwab = st.toggle("Schwab (live IV)", False, key="setups_schwab")
+
+    chain_df, spot, source = None, 580.0, "unknown"
+    if use_schwab:
+        client = get_schwab_client()
+        if client:
+            spot_live = schwab_get_spot(client, symbol)
+            spot      = spot_live or spot
+            chain_df  = schwab_get_options_chain(client, symbol, spot)
+            source    = "Schwab API (live IV)"
+        if chain_df is None:
+            chain_df, spot, source = get_gex_from_yfinance(symbol)
+    else:
+        chain_df, spot, source = get_gex_from_yfinance(symbol)
+
+    if chain_df is None or len(chain_df) == 0:
+        st.error(f"No options data for {symbol}. Try refreshing or switching symbol.")
+        return
+
+    gs        = build_gamma_state(chain_df, spot, source)
+    dg        = compute_dealer_greeks(chain_df, spot, source)
     session   = get_session_context()
     vix_df    = yf.Ticker("^VIX").history(period="1d")
     vix_level = float(vix_df["Close"].iloc[-1]) if len(vix_df) > 0 else 20.0
@@ -831,122 +915,182 @@ def render_setups_page():
     setups_orig = evaluate_setups(gs, session, spot, fear_est, vix_level)
     setups_m3   = _module3_setups(dg, gs, spot, vix_level, session)
 
-    # Session header
-    sm = session["size_mult"]
-    st.markdown(f"""<div class='warn-card'>
-      <b>Session:</b> {session['window']} · <b>Liquidity:</b> {session['liquidity']} ·
-      <b>Size Mult:</b> {sm:.2f}x · <b>Regime:</b> {gs.regime.value} ·
-      <b>Flip:</b> {f'{gs.gamma_flip:.1f}' if gs.gamma_flip else 'N/A'} ·
-      <b>Vanna:</b> {dg.vanna_direction.upper()} · <b>Charm:</b> {dg.charm_direction.upper()}
-    </div>""", unsafe_allow_html=True)
-    st.markdown("")
+    active_orig = sum(1 for s in setups_orig if s["active"] and s["score"].tradeable)
+    active_m3   = sum(1 for s in setups_m3   if s["active"])
+    total_active = active_orig + active_m3
 
-    tab_orig, tab_m3, tab_sizing = st.tabs(
-        ["📐 Core GEX Setups (5)", "🌊 Dealer Flow Setups (Module 3)", "📏 Sizing Reference"]
-    )
+    # ── Session / regime header bar ───────────────────────────────────────
+    sm    = session["size_mult"]
+    sm_c  = "#10b981" if sm >= 0.9 else ("#f59e0b" if sm >= 0.5 else ("#f97316" if sm > 0 else "#ef4444"))
+    ev    = session.get("event_label", "")
+    ev_html = f"<span style='color:#f59e0b;font-weight:700;'>⚠ {ev}</span> · " if ev else ""
+    flip_str = f"${gs.gamma_flip:.2f}" if gs.gamma_flip else "N/A"
 
-    # ── Tab 1: Original 5 setups ──────────────────────────────────────────
+    st.markdown(f"""
+<div style='display:flex;gap:12px;flex-wrap:wrap;align-items:center;
+            padding:10px 14px;background:rgba(255,255,255,0.03);
+            border:1px solid rgba(255,255,255,0.08);border-radius:10px;
+            margin-bottom:10px;font-family:monospace;font-size:11px;'>
+  {ev_html}
+  <span>Session: <b style='color:{sm_c};'>{session['window']}</b></span>
+  <span style='color:rgba(255,255,255,0.4);'>·</span>
+  <span>Size: <b style='color:{sm_c};'>{sm:.2f}×</b></span>
+  <span style='color:rgba(255,255,255,0.4);'>·</span>
+  <span>Spot: <b>${spot:.2f}</b></span>
+  <span style='color:rgba(255,255,255,0.4);'>·</span>
+  <span>Flip: <b style='color:#f59e0b;'>{flip_str}</b></span>
+  <span style='color:rgba(255,255,255,0.4);'>·</span>
+  <span>Regime: <b>{gs.regime.value}</b></span>
+  <span style='color:rgba(255,255,255,0.4);'>·</span>
+  <span>Vanna: <b style='color:{"#10b981" if dg.vanna_direction=="bullish" else "#ef4444"};'>{dg.vanna_direction.upper()}</b></span>
+  <span style='color:rgba(255,255,255,0.4);'>·</span>
+  <span>Charm: <b style='color:{"#10b981" if dg.charm_direction=="bullish" else "#ef4444"};'>{dg.charm_direction.upper()}</b></span>
+  <span style='color:rgba(255,255,255,0.4);'>·</span>
+  <span>VIX: <b>{vix_level:.1f}</b></span>
+</div>""", unsafe_allow_html=True)
+
+    if total_active > 0:
+        st.markdown(f"""<div style='padding:8px 14px;background:rgba(16,185,129,0.08);
+            border:1px solid rgba(16,185,129,0.30);border-radius:8px;margin-bottom:10px;
+            font-family:monospace;font-size:11px;'>
+            ✅ <b>{total_active} setup{"s" if total_active>1 else ""} currently active</b>
+            — {active_orig} core GEX · {active_m3} dealer flow
+        </div>""", unsafe_allow_html=True)
+
+    # ── Tabs ──────────────────────────────────────────────────────────────
+    tab_m3, tab_orig, tab_sizing = st.tabs([
+        "🌊 Dealer Flow Setups", "📐 Core GEX Setups", "📏 Sizing Reference"
+    ])
+
+    # ── Tab 1: Module 3 Dealer Flow Setups (PRIMARY) ─────────────────────
+    with tab_m3:
+        st.markdown(f"{sec_hdr('DEALER FLOW SETUPS — ENTRY / STOP / TARGET')}", unsafe_allow_html=True)
+        st.caption(
+            "Levels derived from live GEX nodes. Entry = nearest relevant node. "
+            "Stop = node break = thesis invalid. Targets = next significant nodes."
+        )
+
+        def _lcard(label, val, color):
+            return (f"<div style='display:flex;justify-content:space-between;align-items:center;"
+                    f"padding:5px 10px;margin:2px 0;background:rgba(255,255,255,0.04);"
+                    f"border-radius:6px;border-left:3px solid {color};'>"
+                    f"<span style='font-size:10px;color:rgba(255,255,255,0.50);"
+                    f"font-family:monospace;letter-spacing:0.5px;'>{label}</span>"
+                    f"<span style='font-family:monospace;font-size:12px;"
+                    f"font-weight:700;color:{color};'>{val}</span></div>")
+
+        for s in setups_m3:
+            active = s["active"]
+            border_color = "rgba(16,185,129,0.35)" if active else "rgba(255,255,255,0.08)"
+            bg_color     = "rgba(16,185,129,0.05)"  if active else "rgba(0,0,0,0)"
+            with st.expander(
+                f"{s['icon']} {'✅ ACTIVE' if active else '⚪'} — {s['name']} ({s['module']})",
+                expanded=active
+            ):
+                cond_col, lvl_col = st.columns([1, 1.1])
+
+                with cond_col:
+                    st.markdown("**Conditions**")
+                    for c in s.get("conditions_met", []):
+                        st.markdown(
+                            f"<div style='font-size:11px;color:#10b981;padding:2px 0;'>{c}</div>",
+                            unsafe_allow_html=True)
+                    for c in s.get("conditions_missing", []):
+                        st.markdown(
+                            f"<div style='font-size:11px;color:rgba(255,255,255,0.35);padding:2px 0;'>{c}</div>",
+                            unsafe_allow_html=True)
+                    if s.get("action"):
+                        st.markdown(
+                            f"<div style='margin-top:8px;font-size:11px;"
+                            f"color:rgba(255,255,255,0.70);line-height:1.4;'>"
+                            f"{s['action']}</div>",
+                            unsafe_allow_html=True)
+
+                with lvl_col:
+                    st.markdown("**Price Levels**")
+                    html = ""
+                    if s.get("entry"): html += _lcard("ENTRY",  s["entry"], "#06b6d4")
+                    if s.get("stop"):  html += _lcard("STOP",   s["stop"],  "#ef4444")
+                    if s.get("t1"):    html += _lcard("T1",     s["t1"],    "#10b981")
+                    if s.get("t2"):    html += _lcard("T2",     s["t2"],    "#34d399")
+                    if s.get("rr"):    html += _lcard("R:R",    s["rr"],    "#f59e0b")
+                    st.markdown(html, unsafe_allow_html=True)
+
+                if s.get("note"):
+                    st.markdown(
+                        f"<div style='margin-top:8px;padding:7px 10px;"
+                        f"background:rgba(245,158,11,0.07);"
+                        f"border-left:2px solid rgba(245,158,11,0.40);"
+                        f"border-radius:4px;font-size:10px;"
+                        f"color:rgba(255,255,255,0.60);'>⚠ {s['note']}</div>",
+                        unsafe_allow_html=True)
+
+    # ── Tab 2: Core GEX Setups (original 5) ──────────────────────────────
     with tab_orig:
         st.markdown(f"{sec_hdr('CORE GEX × ORDERFLOW SETUPS')}", unsafe_allow_html=True)
         st.caption("WHERE (GEX) + WHY (AMT) + WHEN (Orderflow). All three required.")
 
         for s in setups_orig:
-            score    = s["score"]
-            active   = s["active"]
+            score     = s["score"]
+            active    = s["active"]
             tradeable = score.tradeable
+            icon = "✅" if (active and tradeable) else ("🟡" if active else "⚫")
             with st.expander(
-                f"{'✅' if (active and tradeable) else ('🟡' if active else '⚫')} "
-                f"Setup {s['setup']}: {s['name']}",
-                expanded=active and tradeable
+                f"{icon} Setup {s['setup']}: {s['name']}",
+                expanded=(active and tradeable)
             ):
-                col1, col2, col3 = st.columns(3)
-                with col1:
+                c1, c2, c3 = st.columns(3)
+                with c1:
                     st.metric("Composite Score", f"{score.composite:.2f}")
                     st.metric("Est. Hit Rate",   f"{s['est_hit_rate']*100:.0f}%")
                     st.metric("Effective Size",  f"{s['effective_size']*100:.0f}%")
-                with col2:
+                with c2:
                     st.markdown("**Score Components**")
                     for label, val in [
-                        ("Gamma Alignment",    score.gamma_alignment),
-                        ("Orderflow Confirm",  score.orderflow_confirmation),
-                        ("TPO Context",        score.tpo_context),
-                        ("Level Freshness",    score.level_freshness),
-                        ("Event Risk",         score.event_risk),
+                        ("Gamma Alignment",   score.gamma_alignment),
+                        ("Orderflow Confirm", score.orderflow_confirmation),
+                        ("TPO Context",       score.tpo_context),
+                        ("Level Freshness",   score.level_freshness),
+                        ("Event Risk",        score.event_risk),
                     ]:
-                        c = _C_POS if val >= 0.7 else (_C_FLIP if val >= 0.5 else _C_NEG)
+                        c = "#10b981" if val >= 0.7 else ("#f59e0b" if val >= 0.5 else "#ef4444")
                         st.markdown(
                             f"<div style='display:flex;justify-content:space-between;'>"
                             f"<span class='small'>{label}</span>"
-                            f"<span style='font-family:var(--mono);font-size:11px;color:{c};'>{val:.2f}</span>"
+                            f"<span style='font-family:monospace;font-size:11px;color:{c};'>{val:.2f}</span>"
                             f"</div>", unsafe_allow_html=True)
-                with col3:
+                with c3:
                     status = "🟢 ACTIVE" if (active and tradeable) else ("🟡 Watching" if active else "⚫ Not Active")
                     st.markdown(f"**{status}**")
                     st.markdown(f"<div class='small'>{s['desc']}</div>", unsafe_allow_html=True)
-                    if s["note"]:
-                        st.markdown(f"<div class='warn-card' style='margin-top:6px;font-size:10px;'>{s['note']}</div>",
-                                    unsafe_allow_html=True)
-
-    # ── Tab 2: Module 3 Dealer Flow Setups ───────────────────────────────
-    with tab_m3:
-        st.markdown(f"{sec_hdr('DEALER FLOW SETUPS — MODULE 3')}", unsafe_allow_html=True)
-        st.caption("Based on GEX + VEX + CEX heatmap framework. Active alert = conditions met. Missing = what to watch for.")
-
-        active_count = sum(1 for s in setups_m3 if s["active"])
-        if active_count > 0:
-            st.markdown(f"""<div class='warn-card' style='background:rgba(16,185,129,0.07);border-color:rgba(16,185,129,0.30);margin-bottom:10px;'>
-              ✅ <b>{active_count} dealer flow setup{'s' if active_count > 1 else ''} currently active</b>
-            </div>""", unsafe_allow_html=True)
-
-        for s in setups_m3:
-            active = s["active"]
-            with st.expander(
-                f"{s['icon']} {'✅ ACTIVE' if active else '⚪'} — {s['name']} ({s['module']})",
-                expanded=active
-            ):
-                col1, col2 = st.columns([1, 1])
-                with col1:
-                    if s["conditions_met"]:
-                        st.markdown("**✅ Conditions Met:**")
-                        for c in s["conditions_met"]:
-                            st.markdown(f"<div style='font-size:11px;color:{_C_POS};'>✓ {c}</div>",
-                                        unsafe_allow_html=True)
-                    if s["conditions_missing"]:
-                        st.markdown("**⏳ Still Watching For:**")
-                        for c in s["conditions_missing"]:
-                            st.markdown(f"<div style='font-size:11px;color:{_C_MUTED};'>○ {c}</div>",
-                                        unsafe_allow_html=True)
-                with col2:
-                    st.markdown("**📋 Action:**")
-                    st.markdown(f"<div class='small' style='color:var(--text);'>{s['action']}</div>",
-                                unsafe_allow_html=True)
-                    if s["note"]:
-                        st.markdown(f"<div class='warn-card' style='margin-top:8px;font-size:10px;'>{s['note']}</div>",
-                                    unsafe_allow_html=True)
+                    if s.get("note"):
+                        st.markdown(
+                            f"<div class='warn-card' style='margin-top:6px;font-size:10px;'>{s['note']}</div>",
+                            unsafe_allow_html=True)
 
     # ── Tab 3: Sizing reference ───────────────────────────────────────────
     with tab_sizing:
         st.markdown("### Position Sizing — Core Setups")
-        sizing_data = {
-            "Setup":         ["1: Gamma Bounce", "2: Gamma Fade", "3: Flip Breakout",
-                               "4: Exhaustion Rev.", "5: 0DTE Pin"],
-            "Base Size":     ["100%","100%","75%","50%","100%"],
-            "Session Mult":  [f"{sm:.2f}x"] * 5,
-            "Vol Adj":       ["×0.5 if VIX>35, ×0.75 if VIX>25"] * 5,
-            "Min R:R":       ["2:1","2:1","2:1","3:1","1.3:1"],
-            "Est. Hit Rate": ["~55%","~52%","~45%","~40%","~65%"],
-        }
-        st.dataframe(pd.DataFrame(sizing_data), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame({
+            "Setup":        ["1: Gamma Bounce","2: Gamma Fade","3: Flip Breakout","4: Exhaustion Rev.","5: 0DTE Pin"],
+            "Base Size":    ["100%","100%","75%","50%","100%"],
+            "Session Mult": [f"{sm:.2f}×"] * 5,
+            "Vol Adj":      ["×0.5 if VIX>35, ×0.75 if VIX>25"] * 5,
+            "Min R:R":      ["2:1","2:1","2:1","3:1","1.3:1"],
+            "Est. Hit Rate":["~55%","~52%","~45%","~40%","~65%"],
+        }), hide_index=True, use_container_width=True)
 
         st.markdown("### Kelly Fractions")
         kelly_data = []
-        for name, p, r_r in [("Setup 1 Bounce", 0.55, 2.5), ("Setup 2 Fade", 0.52, 2.2),
-                               ("Setup 3 Breakout", 0.45, 3.0), ("Setup 4 Reversal", 0.40, 4.0),
-                               ("Setup 5 Pin", 0.65, 1.5)]:
+        for name, p, r_r in [
+            ("Setup 1 Bounce", 0.55, 2.5), ("Setup 2 Fade", 0.52, 2.2),
+            ("Setup 3 Breakout", 0.45, 3.0), ("Setup 4 Reversal", 0.40, 4.0),
+            ("Setup 5 Pin", 0.65, 1.5)
+        ]:
             f_star = (p * r_r - (1 - p)) / r_r
             kelly_data.append({
                 "Setup": name, "p(win)": f"{p:.0%}", "R:R": f"{r_r:.1f}",
                 "Full Kelly": f"{f_star:.0%}", "Half Kelly": f"{f_star/2:.0%}",
-                "Rec. Risk%": f"{min(f_star/2*100, 15):.0f}%",
+                "Rec. Risk%": f"{min(f_star/2*100,15):.0f}%",
             })
         st.dataframe(pd.DataFrame(kelly_data), hide_index=True, use_container_width=True)

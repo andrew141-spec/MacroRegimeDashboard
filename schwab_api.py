@@ -282,15 +282,15 @@ def schwab_get_options_chain(client, symbol: str = "SPY",
                 pass
         spot_est = spot or 500.0
 
-        # Request near-the-money chain — use larger strike_count so we don't
-        # miss strikes when Schwab's ATM centre differs slightly from spot
+        # Request full chain — contract_type=ALL gets both calls and puts
+        # option_type refers to standard vs non-standard contracts (not calls/puts)
+        # — omit it so only standard equity options are returned (no mini/weekly weirdness)
         resp = client.get_option_chain(
             symbol,
             contract_type=schwab.client.Client.Options.ContractType.ALL,
-            strike_count=60,      # was 30 — wider net so nothing gets missed
+            strike_count=60,
             include_underlying_quote=True,
             strategy=schwab.client.Client.Options.Strategy.SINGLE,
-            option_type=schwab.client.Client.Options.Type.ALL,
         )
 
         if resp.status_code != 200:

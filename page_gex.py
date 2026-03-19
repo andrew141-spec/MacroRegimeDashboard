@@ -580,17 +580,26 @@ def render_gex_engine():
         use_schwab = st.toggle("Use Schwab/TOS (live IV)", False, key="gex_use_schwab")
 
     # ── Data fetch ────────────────────────────────────────────────────────
-    chain_df, spot, source = None, 580.0, "unknown"
+    chain_df, spot, source = None, 0.0, "unknown"
     with col_m:
         if use_schwab:
             client = get_schwab_client()
             if client:
                 st.info("Schwab connected — fetching live chain")
-                spot_live = schwab_get_spot(client, symbol)
-                spot      = spot_live or spot
-                chain_df  = schwab_get_options_chain(client, symbol, spot)
-                source    = "Schwab API (live IV)"
-                if chain_df is None:
+                # Always pass spot=None so schwab_get_options_chain fetches
+                # the price from the API response itself — avoids using a
+                # stale spot from a previously loaded symbol (e.g. SPY→QQQ)
+                chain_df = schwab_get_options_chain(client, symbol, spot=None)
+                source   = "Schwab API (live IV)"
+                if chain_df is not None and len(chain_df) > 0:
+                    # Get spot from a live quote (after chain is confirmed working)
+                    spot_live = schwab_get_spot(client, symbol)
+                    if spot_live and spot_live > 0:
+                        spot = spot_live
+                    else:
+                        # Fall back to midpoint of chain strikes
+                        spot = float(chain_df["strike"].median())
+                else:
                     st.warning("Schwab chain empty — falling back to yfinance")
                     chain_df, spot, source = get_gex_from_yfinance(symbol)
             else:
@@ -959,11 +968,14 @@ def render_setups_page():
     if use_schwab:
         client = get_schwab_client()
         if client:
-            spot_live = schwab_get_spot(client, symbol)
-            spot      = spot_live or spot
-            chain_df  = schwab_get_options_chain(client, symbol, spot)
-            source    = "Schwab API (live IV)"
-        if chain_df is None:
+            chain_df = schwab_get_options_chain(client, symbol, spot=None)
+            source   = "Schwab API (live IV)"
+            if chain_df is not None and len(chain_df) > 0:
+                spot_live = schwab_get_spot(client, symbol)
+                spot = spot_live if (spot_live and spot_live > 0) else float(chain_df["strike"].median())
+            else:
+                chain_df, spot, source = get_gex_from_yfinance(symbol)
+        else:
             chain_df, spot, source = get_gex_from_yfinance(symbol)
     else:
         chain_df, spot, source = get_gex_from_yfinance(symbol)

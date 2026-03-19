@@ -29,6 +29,15 @@ _C_VEX   = "#8b5cf6"   # purple — vanna
 _C_CEX   = "#06b6d4"   # teal   — charm
 _C_MUTED = "rgba(255,255,255,0.52)"
 
+def _days_to_exp(label: str) -> int:
+    """Convert 'Mar 18' style label back to days from today.""",
+    try:
+        exp = dt.datetime.strptime(label + f" {dt.date.today().year}", "%b %d %Y").date()
+        return (exp - dt.date.today()).days
+    except Exception:
+        return 999  # unknown = treat as far-dated
+
+
 def _make_heatmap(chain_df: pd.DataFrame, spot: float,
                   greek: str = "net_gex",
                   title: str = "GEX Heatmap",
@@ -74,14 +83,27 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
     # Sort strikes descending (high at top like reference image)
     pivot = pivot.sort_index(ascending=False)
 
-    # Filter to ±12% of spot for readability
-    pivot = pivot[(pivot.index >= spot * 0.88) & (pivot.index <= spot * 1.12)]
+    # Filter strikes to ±strike_pct of spot (passed via function arg, default ±7%)
+    # Tighter range = fewer rows = readable cells
+    pct = getattr(_make_heatmap, "_strike_pct", 0.07)
+    pivot = pivot[(pivot.index >= spot * (1 - pct)) & (pivot.index <= spot * (1 + pct))]
 
-    # Sort columns by date
+    # Filter to near-term expirations only — max 45 DTE keeps columns manageable
+    # Far-dated expirations have negligible gamma and just waste horizontal space
+    max_dte = getattr(_make_heatmap, "_max_dte", 45)
+    near_term_cols = [c for c in pivot.columns
+                      if c != "TOTAL" and _days_to_exp(c) <= max_dte]
+    if near_term_cols:
+        pivot = pivot[near_term_cols]
+
+    # Drop strikes with all-zero exposure (reduces noise rows)
+    pivot = pivot.loc[(pivot.abs() > 0.1).any(axis=1)]
+
+    # Sort columns chronologically
     try:
-        col_order = sorted(pivot.columns,
-                           key=lambda x: dt.datetime.strptime(x, "%b %d"))
-        pivot = pivot[col_order]
+        pivot = pivot[sorted(pivot.columns,
+                             key=lambda x: dt.datetime.strptime(
+                                 x + f" {dt.date.today().year}", "%b %d %Y"))]
     except Exception:
         pass
 
@@ -93,8 +115,13 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
     z_vals   = pivot.values.tolist()
 
     # Text annotations: show value if |val| > 0.5M, else blank
+    # Only annotate cells with |value| >= 1M — avoids clutter in small cells
+    n_cols = len(cols)
+    n_rows = len(strikes)
+    # Fewer cells = more space per cell = can show smaller values
+    thresh = 2.0 if n_cols > 12 else (1.0 if n_cols > 6 else 0.5)
     text_vals = [
-        [f"${v:.1f}M" if abs(v) >= 0.5 else "" for v in row]
+        [f"${v:.0f}M" if abs(v) >= thresh else "" for v in row]
         for row in z_vals
     ]
 
@@ -183,13 +210,14 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
         height=height,
         margin=dict(l=80, r=80, t=50, b=50),
         xaxis=dict(
-            side="bottom",
-            tickfont=dict(size=10),
+            side="top",   # dates at top like reference image
+            tickfont=dict(size=9 if n_cols > 10 else 10),
+            tickangle=-30 if n_cols > 10 else 0,
             gridcolor="rgba(255,255,255,0.04)",
             fixedrange=False,
         ),
         yaxis=dict(
-            tickfont=dict(size=9),
+            tickfont=dict(size=8 if n_rows > 30 else 10),
             gridcolor="rgba(255,255,255,0.04)",
             fixedrange=False,
             autorange=True,
@@ -583,8 +611,16 @@ def render_gex_engine():
 
         if view_mode == "Heatmap":
             st.caption("Strike × Expiry matrix · Green = positive GEX (dealers stabilize) · Red = negative GEX (dealers amplify) · → = spot price · TOTAL = net across all expiries")
-            n_strikes = st.slider("Strike range (% from spot)", 5, 15, 10, key="gex_hm_range") / 100
-            hm_height = st.slider("Height", 400, 1000, 700, step=50, key="gex_hm_height")
+            sc1, sc2, sc3 = st.columns(3)
+            with sc1:
+                strike_pct = sc1.slider("Strike range ± %", 3, 12, 6, key="gex_hm_range")
+            with sc2:
+                max_dte    = sc2.slider("Max DTE (days)", 7, 90, 30, step=7, key="gex_hm_dte")
+            with sc3:
+                hm_height  = sc3.slider("Height (px)", 350, 800, 500, step=50, key="gex_hm_height")
+            # Pass config via function attributes (avoids changing signature)
+            _make_heatmap._strike_pct = strike_pct / 100
+            _make_heatmap._max_dte    = max_dte
             fig_gex = _make_heatmap(chain_df, spot, "net_gex",
                                     f"{symbol} GEX", hm_height)
             st.plotly_chart(fig_gex, use_container_width=True)

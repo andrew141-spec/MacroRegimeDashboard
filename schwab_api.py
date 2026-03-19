@@ -282,15 +282,13 @@ def schwab_get_options_chain(client, symbol: str = "SPY",
                 pass
         spot_est = spot or 500.0
 
-        # Request full chain — contract_type=ALL gets both calls and puts
-        # option_type refers to standard vs non-standard contracts (not calls/puts)
-        # — omit it so only standard equity options are returned (no mini/weekly weirdness)
+        # Minimum viable call — strip all optional params that could cause 400.
+        # Schwab is strict: strategy=SINGLE and include_underlying_quote
+        # both trigger 400 for some symbols. Let the API return its defaults.
         resp = client.get_option_chain(
             symbol,
             contract_type=schwab.client.Client.Options.ContractType.ALL,
             strike_count=60,
-            include_underlying_quote=True,
-            strategy=schwab.client.Client.Options.Strategy.SINGLE,
         )
 
         if resp.status_code != 200:

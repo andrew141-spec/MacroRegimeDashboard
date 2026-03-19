@@ -575,10 +575,30 @@ def render_gex_engine():
     st.markdown(CSS, unsafe_allow_html=True)
     st.markdown("## ⚡ GEX Engine — Dealer Greeks")
 
+    # ── Initialise ALL persistent settings once — never overwrite existing values ──
+    # These survive navigation between pages because session_state persists for the
+    # entire browser session. We only set defaults when the key is absent.
+    _DEFAULTS = {
+        "gex_symbol_input":     "QQQ",
+        "gex_use_schwab":       False,
+        "gex_view_mode":        "Heatmap",
+        "gex_auto_refresh":     True,
+        "gex_refresh_interval": "2m",
+        "gex_strikes_each_side": 20,
+        "gex_hm_dte":           30,
+        "gex_hm_height":        1000,
+    }
+    for k, v in _DEFAULTS.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
     col_s, col_m = st.columns([1, 3])
     with col_s:
-        symbol    = st.text_input("Options Symbol", "QQQ", key="gex_symbol_input").strip().upper()
-        use_schwab = st.toggle("Use Schwab/TOS (live IV)", False, key="gex_use_schwab")
+        # No 'value=' arg — Streamlit reads from session_state[key] automatically
+        symbol    = st.text_input("Options Symbol", key="gex_symbol_input").strip().upper()
+        # Write back the uppercased value so it persists correctly
+        st.session_state["gex_symbol_input"] = symbol
+        use_schwab = st.toggle("Use Schwab/TOS (live IV)", key="gex_use_schwab")
 
     # ── Data fetch ────────────────────────────────────────────────────────
     chain_df, spot, source = None, 0.0, "unknown"
@@ -683,13 +703,7 @@ def render_gex_engine():
         if view_mode == "Heatmap":
             st.caption("Strike × Expiry matrix · Green = positive GEX (dealers stabilize) · Red = negative GEX (dealers amplify) · → = spot price · TOTAL = net across all expiries")
 
-            # ── Persistent controls (survive tab switches via session_state keys) ──
-            if "gex_strikes_each_side" not in st.session_state:
-                st.session_state["gex_strikes_each_side"] = 20
-            if "gex_hm_dte"            not in st.session_state:
-                st.session_state["gex_hm_dte"]            = 30
-            if "gex_hm_height"         not in st.session_state:
-                st.session_state["gex_hm_height"]         = 1000
+            # Settings already initialised at top of render_gex_engine
 
             sc1, sc2, sc3 = st.columns(3)
             with sc1:
@@ -735,10 +749,7 @@ def render_gex_engine():
         else:
             st.caption("Green = positive gamma (dealers stabilize). Red = negative gamma (dealers amplify). Yellow line = gamma flip.")
             # Use same strike range setting as heatmap
-            if "gex_strikes_each_side" not in st.session_state:
-                st.session_state["gex_strikes_each_side"] = 20
-            if "gex_hm_height" not in st.session_state:
-                st.session_state["gex_hm_height"] = 1000
+
             n_side   = int(st.session_state["gex_strikes_each_side"])
             bar_lo   = spot - n_side
             bar_hi   = spot + n_side
@@ -960,11 +971,18 @@ def render_setups_page():
     st.markdown("## 🎯 Trade Setups — Live Context")
 
     # ── Symbol + data ─────────────────────────────────────────────────────
+    # Persist settings across page navigation
+    if "setups_symbol" not in st.session_state:
+        st.session_state["setups_symbol"] = "QQQ"
+    if "setups_schwab" not in st.session_state:
+        st.session_state["setups_schwab"] = False
+
     col_sym, col_sch, col_info = st.columns([1, 1, 3])
     with col_sym:
-        symbol = st.text_input("Symbol", "QQQ", key="setups_symbol").strip().upper()
+        symbol = st.text_input("Symbol", key="setups_symbol").strip().upper()
+        st.session_state["setups_symbol"] = symbol
     with col_sch:
-        use_schwab = st.toggle("Schwab (live IV)", False, key="setups_schwab")
+        use_schwab = st.toggle("Schwab (live IV)", key="setups_schwab")
 
     chain_df, spot, source = None, 580.0, "unknown"
     if use_schwab:

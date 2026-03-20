@@ -637,8 +637,12 @@ def render_dashboard():
         st.markdown(f"{sec_hdr('MARKET STRUCTURE')}", unsafe_allow_html=True)
         ml1, ml2 = st.columns([1.35,1.0]); mr1, mr2 = st.columns([1.35,1.0])
 
+        def _safe_last(s):
+            d = s.dropna()
+            return float(d.iloc[-1]) if len(d) > 0 else float("nan")
+
         yc = pd.DataFrame({"Tenor":["3M","2Y","10Y","30Y"],
-                           "Yield":[float(y3m.iloc[-1]),float(y2.iloc[-1]),float(y10.iloc[-1]),float(y30.iloc[-1])]})
+                           "Yield":[_safe_last(y3m),_safe_last(y2),_safe_last(y10),_safe_last(y30)]})
         fig_yc = go.Figure(go.Scatter(x=yc.Tenor, y=yc.Yield, mode="lines+markers+text",
                                       text=[f"{v:.2f}" for v in yc.Yield], textposition="top center",
                                       line=dict(color="#3b82f6",width=2), marker=dict(size=6)))
@@ -671,7 +675,8 @@ def render_dashboard():
         t1,t2,t3,t4 = st.columns(4)
         t1.metric("Symbol",ticker_tile); t2.metric("5D Return",f"{r5*100:.2f}%" if np.isfinite(r5) else "N/A")
         t3.metric("21D Return",f"{r21*100:.2f}%" if np.isfinite(r21) else "N/A")
-        t4.metric("2s10s (bp)",f"{float(s_2s10s.iloc[-1]):.0f}")
+        _s2s10_val = float(s_2s10s.dropna().iloc[-1]) if s_2s10s.dropna().size else float("nan")
+        t4.metric("2s10s (bp)", f"{_s2s10_val:.0f}" if not __import__("math").isnan(_s2s10_val) else "N/A")
         tc = "#10b981" if (np.isfinite(r21) and r21>0) else "#ef4444"
         # Convert hex colour to rgba for fill — Plotly rejects 8-digit hex
         def _hex_to_rgba(hex_col: str, alpha: float) -> str:
@@ -684,6 +689,94 @@ def render_dashboard():
                                       fillcolor=_hex_to_rgba(tc, 0.10)))
         st.plotly_chart(plotly_dark(fig_px,f"{ticker_tile} Price",240), use_container_width=True)
         st.caption("Educational use only. Not investment advice.")
+
+        st.markdown("<hr/>", unsafe_allow_html=True)
+
+        # ── MACRO RISK INDICATORS ─────────────────────────────────────────
+        st.markdown(f"{sec_hdr('MACRO RISK INDICATORS')}", unsafe_allow_html=True)
+
+        ri1, ri2 = st.columns(2)
+
+        # Sahm Rule card
+        with ri1:
+            sahm_last = _safe_last(sahm_rule) if sahm_rule is not None else float("nan")
+            sahm_ok   = not __import__("math").isnan(sahm_last)
+            sahm_trig = sahm_last >= 0.50 if sahm_ok else False
+            sahm_warn = sahm_last >= 0.30 if sahm_ok else False
+            sahm_col  = "#ef4444" if sahm_trig else ("#f59e0b" if sahm_warn else "#10b981")
+            sahm_label = "🔴 TRIGGERED — Recession Onset" if sahm_trig else ("🟡 WARNING — Deteriorating" if sahm_warn else "🟢 Clear")
+            sahm_val_str = f"{sahm_last:.3f}" if sahm_ok else "N/A"
+            st.markdown(f"""<div style='background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.09);
+                border-left:3px solid {sahm_col};border-radius:10px;padding:14px 16px;'>
+              <div style='font-family:monospace;font-size:9px;letter-spacing:1px;color:rgba(255,255,255,0.4);
+                          text-transform:uppercase;margin-bottom:4px;'>Sahm Rule Indicator</div>
+              <div style='font-size:26px;font-weight:700;color:{sahm_col};font-family:monospace;'>{sahm_val_str}</div>
+              <div style='font-size:11px;color:rgba(255,255,255,0.55);margin-top:4px;'>{sahm_label}</div>
+              <div style='font-size:10px;color:rgba(255,255,255,0.30);margin-top:4px;'>
+                Triggers at ≥0.50 · 3M avg UNRATE minus 12M low · Most reliable recession onset signal
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+        # HY Spread card
+        with ri2:
+            hy_last = _safe_last(hy_spread) if hy_spread is not None else float("nan")
+            hy_ok   = not __import__("math").isnan(hy_last)
+            hy_stress  = hy_last > 600 if hy_ok else False
+            hy_warning = hy_last > 400 if hy_ok else False
+            hy_col     = "#ef4444" if hy_stress else ("#f59e0b" if hy_warning else "#10b981")
+            if hy_ok:
+                if hy_last < 300:   hy_label = "🟢 Complacency (<300bp)"; 
+                elif hy_last < 400: hy_label = "🟢 Normal (300–400bp)"
+                elif hy_last < 600: hy_label = "🟡 Elevated — watch credit"; 
+                elif hy_last < 1000: hy_label = "🔴 Stress — recession pricing"
+                else:               hy_label = "🔴 SYSTEMIC — crisis level"
+            else:
+                hy_label = "N/A"
+            hy_val_str = f"{hy_last:.0f} bp" if hy_ok else "N/A"
+            st.markdown(f"""<div style='background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.09);
+                border-left:3px solid {hy_col};border-radius:10px;padding:14px 16px;'>
+              <div style='font-family:monospace;font-size:9px;letter-spacing:1px;color:rgba(255,255,255,0.4);
+                          text-transform:uppercase;margin-bottom:4px;'>HY Credit Spread (ICE BofA OAS)</div>
+              <div style='font-size:26px;font-weight:700;color:{hy_col};font-family:monospace;'>{hy_val_str}</div>
+              <div style='font-size:11px;color:rgba(255,255,255,0.55);margin-top:4px;'>{hy_label}</div>
+              <div style='font-size:10px;color:rgba(255,255,255,0.30);margin-top:4px;'>
+                &lt;300bp complacency · &gt;600bp recession · &gt;1000bp systemic · FRED: BAMLH0A0HYM2
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown("<hr/>", unsafe_allow_html=True)
+
+        # ── UPCOMING ECONOMIC CALENDAR ────────────────────────────────────
+        st.markdown(f"{sec_hdr('UPCOMING EVENTS')}", unsafe_allow_html=True)
+        from probability import get_calendar_context
+        import datetime as _dt
+        today_et = _dt.date.today()
+        upcoming = []
+        for days_ahead in range(0, 21):
+            d = today_et + _dt.timedelta(days=days_ahead)
+            cal = get_calendar_context(d)
+            if cal["is_data_day"]:
+                upcoming.append((d, cal["event_label"], cal.get("size_penalty", 1.0)))
+
+        if upcoming:
+            for ev_date, ev_label, ev_size in upcoming[:8]:
+                days_to = (ev_date - today_et).days
+                if days_to == 0:    dt_str = "TODAY";          dt_col = "#ef4444"
+                elif days_to == 1:  dt_str = "TOMORROW";       dt_col = "#f59e0b"
+                elif days_to <= 5:  dt_str = f"in {days_to}d"; dt_col = "#f59e0b"
+                else:               dt_str = f"in {days_to}d"; dt_col = "rgba(255,255,255,0.45)"
+                size_tag = f"<span style='color:#ef4444;font-size:9px;margin-left:6px;'>0.5× size</span>" if ev_size <= 0.5 else (
+                           f"<span style='color:#f59e0b;font-size:9px;margin-left:6px;'>0.75× size</span>" if ev_size < 1.0 else "")
+                st.markdown(
+                    f"<div style='display:flex;align-items:center;padding:7px 0;"
+                    f"border-bottom:1px solid rgba(255,255,255,0.06);'>"
+                    f"<span style='font-family:monospace;font-size:10px;color:{dt_col};min-width:80px;'>{dt_str}</span>"
+                    f"<span style='font-size:11px;color:rgba(255,255,255,0.75);'>{ev_date.strftime('%b %d')} — {ev_label}</span>"
+                    f"{size_tag}</div>",
+                    unsafe_allow_html=True
+                )
+        else:
+            st.caption("No major events in the next 21 days.")
 
     # ── RIGHT PANEL ──
     with right_col:

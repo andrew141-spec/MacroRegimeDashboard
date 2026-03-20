@@ -129,9 +129,12 @@ def compute_gex_from_chain(chain: pd.DataFrame, spot: float,
 
 
 def compute_dealer_greeks(chain: pd.DataFrame, spot: float,
-                           source: str = "yfinance") -> DealerGreeks:
+                           source: str = "yfinance", max_dte: int = 45) -> DealerGreeks:
     """Compute full GEX/VEX/CEX profile, key nodes, OTM anchors, and alignment signals."""
-    gex_chain = compute_gex_from_chain(chain, spot)
+    near_chain = chain[chain["expiry_T"] <= max_dte / 365.0].copy()
+    if near_chain.empty:
+        near_chain = chain.copy()
+    gex_chain = compute_gex_from_chain(near_chain, spot)
 
     # Aggregate by strike (sum across expirations)
     agg = gex_chain.groupby("strike").agg(
@@ -249,8 +252,21 @@ def classify_gex_regime(spot: float, flip: float) -> Tuple[GammaRegime, float, f
     stability = float(np.clip(min(abs(dist_pct - 0.5), abs(dist_pct + 0.5)) / 2.0, 0, 1))
     return regime, dist_pct, stability
 
-def build_gamma_state(chain: pd.DataFrame, spot: float, source: str = "yfinance") -> GammaState:
-    gex_chain = compute_gex_from_chain(chain, spot)
+def build_gamma_state(chain: pd.DataFrame, spot: float, source: str = "yfinance",
+                      max_dte: int = 45) -> GammaState:
+    """
+    Build gamma state from options chain.
+    max_dte: only include expirations within this many days (default 45).
+    Far-dated options have negligible gamma and distort the flip level.
+    SpotGamma/GEXBot use near-term OI only for spot GEX calculations.
+    """
+    import datetime as _dt
+    # Filter to near-term expirations before GEX computation
+    # expiry_T is in years; 45 DTE = 45/365 ≈ 0.123
+    near_chain = chain[chain["expiry_T"] <= max_dte / 365.0].copy()
+    if near_chain.empty:
+        near_chain = chain.copy()  # fallback: use all if filter removes everything
+    gex_chain = compute_gex_from_chain(near_chain, spot)
     flip = find_gamma_flip(gex_chain)
     regime, dist, stability = classify_gex_regime(spot, flip)
 

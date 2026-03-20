@@ -242,14 +242,53 @@ def _greek_bar_chart(by_strike: dict, spot: float, title: str,
                      flip_level: float = None, height=340) -> go.Figure:
     strikes = sorted(by_strike.keys())
     near    = [s for s in strikes if spot * 0.90 < s < spot * 1.10]
-    vals    = [by_strike[s] / 1e6 for s in near]
-    colors  = [pos_color if v > 0 else neg_color for v in vals]
-    fig = go.Figure(go.Bar(x=near, y=vals, marker_color=colors, opacity=0.85, name=title))
-    fig.add_vline(x=spot, line_dash="dot", line_color="rgba(255,255,255,0.6)",
-                  annotation_text="SPOT", annotation_font_size=10)
-    if flip_level:
-        fig.add_vline(x=flip_level, line_dash="dash", line_color=_C_FLIP,
-                      annotation_text=f"FLIP {flip_level:.0f}", annotation_font_size=10)
+    if not near:
+        near = strikes  # fallback: show all if range filter removes everything
+
+    # Auto-scale: $B if any value exceeds $5B, else $M
+    raw_vals = [by_strike[s] / 1e6 for s in near]
+    max_abs  = max((abs(v) for v in raw_vals), default=1)
+    if max_abs >= 5000:
+        scale, unit = 1000.0, "$B"
+    else:
+        scale, unit = 1.0, "$M"
+    vals   = [v / scale for v in raw_vals]
+    colors = [pos_color if v > 0 else neg_color for v in vals]
+
+    fig = go.Figure(go.Bar(
+        x=near, y=vals,
+        marker_color=colors,
+        marker_line_width=0,
+        opacity=0.85,
+        name=title,
+    ))
+
+    # Zero line — prominent horizontal reference
+    fig.add_hline(y=0, line_color="rgba(255,255,255,0.35)", line_width=1)
+
+    # Spot line
+    fig.add_vline(x=spot, line_dash="dot", line_color="rgba(255,255,255,0.70)", line_width=1.5,
+                  annotation_text=f"SPOT ${spot:.0f}",
+                  annotation_font_size=10, annotation_font_color="rgba(255,255,255,0.8)",
+                  annotation_position="top right")
+
+    # Flip line
+    if flip_level and abs(flip_level - spot) / max(spot, 1) < 0.20:
+        fig.add_vline(x=flip_level, line_dash="dash", line_color=_C_FLIP, line_width=1.5,
+                      annotation_text=f"FLIP ${flip_level:.0f}",
+                      annotation_font_size=10, annotation_font_color=_C_FLIP,
+                      annotation_position="top left")
+
+    # X-axis: centre on spot with equal padding
+    if near:
+        x_pad = max(abs(max(near) - spot), abs(spot - min(near))) * 1.05
+        fig.update_layout(xaxis=dict(range=[spot - x_pad, spot + x_pad]))
+
+    fig.update_layout(
+        yaxis_title=f"Net GEX ({unit})",
+        bargap=0.15,
+        showlegend=False,
+    )
     return plotly_dark(fig, title, height)
 
 
@@ -600,7 +639,7 @@ def render_gex_engine():
     # entire browser session. We only set defaults when the key is absent.
     _DEFAULTS = {
         "gex_symbol_input":     "QQQ",
-        "gex_use_schwab":       False,
+        # gex_use_schwab removed — Schwab is always primary
         "gex_view_mode":        "Heatmap",
         "gex_auto_refresh":     True,
         "gex_refresh_interval": "2m",
@@ -631,9 +670,9 @@ def render_gex_engine():
     if auto_refresh:
         st.sidebar.caption(f"🟢 Auto-refreshing every {refresh_label}")
         st.sidebar.caption(
-            "ℹ️ OI updates once/day (OCC). "
-            "Spot + IV refresh on every cycle. "
-            "Schwab: live IV each refresh."
+            "ℹ️ Schwab: live IV + spot on every cycle. "
+            "OI updates once/day (OCC). "
+            "Bar heights refresh each morning when OCC publishes."
         )
     else:
         st.sidebar.caption("⚫ Auto-refresh off")
@@ -644,38 +683,25 @@ def render_gex_engine():
     col_s, col_m = st.columns([1, 3])
     with col_s:
         # No 'value=' arg — Streamlit reads from session_state[key] automatically
-        symbol    = st.text_input("Options Symbol", key="gex_symbol_input").strip().upper()
-        # Write back the uppercased value so it persists correctly
-        use_schwab = st.toggle("Use Schwab/TOS (live IV)", key="gex_use_schwab")
+        symbol = st.text_input("Options Symbol", key="gex_symbol_input").strip().upper()
 
-    # ── Data fetch ────────────────────────────────────────────────────────
+    # ── Data fetch — Schwab always primary, yfinance EOD as fallback ──────
     chain_df, spot, source = None, float(st.session_state.get("_last_known_spot", 500.0)), "unknown"
     with col_m:
-        if use_schwab:
-            client = get_schwab_client()
-            if client:
-                st.info("Schwab connected — fetching live chain")
-                # Always pass spot=None so schwab_get_options_chain fetches
-                # the price from the API response itself — avoids using a
-                # stale spot from a previously loaded symbol (e.g. SPY→QQQ)
-                chain_df = schwab_get_options_chain(client, symbol, spot=None)
-                source   = "Schwab API (live IV)"
-                if chain_df is not None and len(chain_df) > 0:
-                    # Get spot from a live quote (after chain is confirmed working)
-                    spot_live = schwab_get_spot(client, symbol)
-                    if spot_live and spot_live > 0:
-                        spot = spot_live
-                    else:
-                        # Fall back to midpoint of chain strikes
-                        spot = float(chain_df["strike"].median())
-                else:
-                    err = st.session_state.get("_schwab_chain_error", "unknown error")
-                    st.warning(f"Schwab chain empty — {err} — falling back to yfinance")
-                    chain_df, spot, source = get_gex_from_yfinance(symbol)
+        client = get_schwab_client()
+        if client:
+            chain_df = schwab_get_options_chain(client, symbol, spot=None)
+            source   = "Schwab API (live IV)"
+            if chain_df is not None and len(chain_df) > 0:
+                spot_live = schwab_get_spot(client, symbol)
+                spot = spot_live if (spot_live and spot_live > 0) else float(chain_df["strike"].median())
+                st.success(f"Schwab connected — live IV · {symbol} · ${spot:.2f}")
             else:
-                st.warning("Schwab not connected — using yfinance. Go to **Schwab/TOS** tab to authorise.")
+                err = st.session_state.get("_schwab_chain_error", "unknown error")
+                st.warning(f"Schwab chain empty ({err}) — using yfinance EOD")
                 chain_df, spot, source = get_gex_from_yfinance(symbol)
         else:
+            st.info("Schwab not authorised — using yfinance EOD data. Go to **Schwab/TOS** tab to connect.")
             chain_df, spot, source = get_gex_from_yfinance(symbol)
 
     # Save last known good spot so next load has a better fallback than 0
@@ -799,15 +825,22 @@ def render_gex_engine():
                                     f"{symbol} GEX", int(hm_height))
             st.plotly_chart(fig_gex, use_container_width=True, key="gex_chart_heatmap")
         else:
-            st.caption("Green = positive gamma (dealers stabilize). Red = negative gamma (dealers amplify). Yellow line = gamma flip.")
-            # Use same strike range setting as heatmap
-
+            regime_str = gs.regime.value.replace("_"," ").title()
+            neg_frac = sum(1 for v in dg.gex_by_strike.values() if v < 0) / max(len(dg.gex_by_strike), 1)
+            if neg_frac > 0.8:
+                regime_note = f"⚠ {neg_frac*100:.0f}% of strikes negative — heavy put positioning, dealers AMPLIFY moves."
+            elif neg_frac < 0.2:
+                regime_note = f"✓ {(1-neg_frac)*100:.0f}% of strikes positive — call-heavy, dealers PIN price."
+            else:
+                regime_note = f"Mixed: {(1-neg_frac)*100:.0f}% positive / {neg_frac*100:.0f}% negative strikes."
+            st.caption(f"Green = positive GEX · Red = negative GEX · Yellow = gamma flip · {regime_note}")
             n_side   = int(st.session_state["gex_strikes_each_side"])
             bar_lo   = spot - n_side
             bar_hi   = spot + n_side
             filtered = {k: v for k, v in dg.gex_by_strike.items() if bar_lo <= k <= bar_hi}
             fig_gex = _greek_bar_chart(filtered, spot,
-                                       "Net GEX by Strike ($M)", _C_POS, _C_NEG, gs.gamma_flip,
+                                       f"Net GEX · {regime_str} · ≤{int(st.session_state.get('gex_hm_dte',45))}DTE",
+                                       _C_POS, _C_NEG, gs.gamma_flip,
                                        height=int(st.session_state["gex_hm_height"]))
             st.plotly_chart(fig_gex, use_container_width=True, key="gex_chart_bar")
 
@@ -1029,23 +1062,18 @@ def render_setups_page():
     if "setups_schwab" not in st.session_state:
         st.session_state["setups_schwab"] = False
 
-    col_sym, col_sch, col_info = st.columns([1, 1, 3])
+    col_sym, col_info = st.columns([1, 3])
     with col_sym:
         symbol = st.text_input("Symbol", key="setups_symbol").strip().upper()
-    with col_sch:
-        use_schwab = st.toggle("Schwab (live IV)", key="setups_schwab")
 
-    chain_df, spot, source = None, 580.0, "unknown"
-    if use_schwab:
-        client = get_schwab_client()
-        if client:
-            chain_df = schwab_get_options_chain(client, symbol, spot=None)
-            source   = "Schwab API (live IV)"
-            if chain_df is not None and len(chain_df) > 0:
-                spot_live = schwab_get_spot(client, symbol)
-                spot = spot_live if (spot_live and spot_live > 0) else float(chain_df["strike"].median())
-            else:
-                chain_df, spot, source = get_gex_from_yfinance(symbol)
+    chain_df, spot, source = None, float(st.session_state.get("_last_known_spot", 500.0)), "unknown"
+    client = get_schwab_client()
+    if client:
+        chain_df = schwab_get_options_chain(client, symbol, spot=None)
+        source   = "Schwab API (live IV)"
+        if chain_df is not None and len(chain_df) > 0:
+            spot_live = schwab_get_spot(client, symbol)
+            spot = spot_live if (spot_live and spot_live > 0) else float(chain_df["strike"].median())
         else:
             chain_df, spot, source = get_gex_from_yfinance(symbol)
     else:

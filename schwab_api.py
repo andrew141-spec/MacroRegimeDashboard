@@ -291,7 +291,7 @@ def schwab_get_options_chain(client, symbol: str = "SPY",
         resp = client.get_option_chain(
             symbol,
             contract_type=schwab.client.Client.Options.ContractType.ALL,
-            strike_count=20,
+            strike_count=40,  # ±20 from ATM — wider than 20 to capture full GEX landscape
         )
 
         if resp.status_code != 200:
@@ -343,7 +343,7 @@ def schwab_get_options_chain(client, symbol: str = "SPY",
                                 "iv":          float(np.clip(iv, 0.01, 5.0)),
                                 "call_oi":     oi if right_char == "C" else 0,
                                 "put_oi":      oi if right_char == "P" else 0,
-                                "schwab_gamma": gk if right_char == "C" else -gk,
+                                "schwab_gamma": gk,  # always positive from Schwab API — sign applied via call_oi/put_oi convention in gex_engine
                             })
                     except Exception:
                         continue

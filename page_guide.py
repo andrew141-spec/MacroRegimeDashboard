@@ -53,7 +53,7 @@ def render_probability_page():
         tips_10y=tips_10y, bank_reserves=bank_reserves,
         bank_credit=bank_credit, ism_no=ism_no,
         gdp_quarterly=gdp_quarterly, mmmf=mmmf,
-        unrate=unrate, hy_spread=hy_spread_raw,
+
     )
 
     SIGNAL_LABELS = {

@@ -19,7 +19,7 @@ from utils import _to_1d, zscore, resample_ffill, yf_close, kelly, current_pct_r
 from config import _get_secret
 from ui_components import pill, pbar, sec_hdr, plotly_dark, regime_chip, autorefresh_js, colored, gauge
 from gex_engine import build_gamma_state, compute_gex_from_chain
-from schwab_api import get_schwab_client, schwab_get_spot, schwab_get_options_chain, schwab_run_auth_flow, schwab_complete_auth, _get_supabase, SCHWAB_AVAILABLE, SUPABASE_AVAILABLE
+from schwab_api import get_schwab_client, schwab_get_spot, schwab_get_options_chain, schwab_run_auth_flow, schwab_complete_auth, _get_supabase, SCHWAB_AVAILABLE, SUPABASE_AVAILABLE, get_intraday_signals
 from data_loaders import load_macro, get_gex_from_yfinance, get_fwd_pe
 from intel_monitor import load_feeds, geo_shock_score, score_relevance, categorise_items, category_shock_score, _all_feeds_flat, INTEL_CATEGORIES
 from signals import compute_leading_stack, compute_1d_prob

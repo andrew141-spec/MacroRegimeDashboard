@@ -18,7 +18,8 @@ from gex_engine import (build_gamma_state, compute_gex_from_chain, find_gamma_fl
                         nearest_expiry_chain, classify_gex_regime, compute_dealer_greeks, DealerGreeks)
 from schwab_api import (get_schwab_client, schwab_get_spot, schwab_get_options_chain,
                         SCHWAB_AVAILABLE)
-from data_loaders import get_gex_from_yfinance
+from data_loaders import (  # yfinance OI fallback removed — Schwab/TOS is the sole OI source
+)
 from probability import get_session_context, evaluate_setups
 
 # ── Colors ────────────────────────────────────────────────────────────────────
@@ -685,7 +686,7 @@ def render_gex_engine():
         # No 'value=' arg — Streamlit reads from session_state[key] automatically
         symbol = st.text_input("Options Symbol", key="gex_symbol_input").strip().upper()
 
-    # ── Data fetch — Schwab always primary, yfinance EOD as fallback ──────
+    # ── Data fetch — Schwab/TOS only (yfinance removed as OI fallback) ──────
     chain_df, spot, source = None, float(st.session_state.get("_last_known_spot", 500.0)), "unknown"
     with col_m:
         client = get_schwab_client()
@@ -704,11 +705,20 @@ def render_gex_engine():
                 st.success(f"Schwab connected — live IV · {symbol} · ${spot:.2f}")
             else:
                 err = st.session_state.get("_schwab_chain_error", "unknown error")
-                st.warning(f"Schwab chain empty ({err}) — using yfinance EOD")
-                chain_df, spot, source = get_gex_from_yfinance(symbol)
+                st.error(
+                    f"⚠️ Schwab returned an empty chain for **{symbol}** — OI data unavailable.\n\n"
+                    f"**Reason:** {err}\n\n"
+                    "OI is sourced exclusively from Schwab/TOS. Please check your connection on the "
+                    "**Schwab/TOS** tab and try re-authorising."
+                )
+                source = "Schwab API (empty chain)"
         else:
-            st.info("Schwab not authorised — using yfinance EOD data. Go to **Schwab/TOS** tab to connect.")
-            chain_df, spot, source = get_gex_from_yfinance(symbol)
+            st.warning(
+                "🔌 **Schwab/TOS not connected.** OI and GEX require a live Schwab connection — "
+                "yfinance is no longer used as a fallback for OI data.\n\n"
+                "Go to the **Schwab/TOS** tab to authorise your account."
+            )
+            source = "not connected"
 
     # Save last known good spot so next load has a better fallback than 0
     if spot and spot > 0:
@@ -721,18 +731,11 @@ def render_gex_engine():
             st.write(f"**chain_df:** {'None' if chain_df is None else f'Empty DataFrame ({len(chain_df)} rows)'}")
             st.write(f"**spot:** {spot}")
             st.write(f"**source:** {source}")
-            try:
-                import yfinance as _yf
-                _t = _yf.Ticker(symbol)
-                _exps = _t.options
-                st.write(f"**ticker.options:** {_exps[:5] if _exps else 'EMPTY LIST'}")
-                _h = _t.history(period="5d")
-                st.write("**ticker.history (last 2 rows):**")
-                st.dataframe(_h.tail(2))
-                _fi = _t.fast_info
-                st.write(f"**fast_info.last_price:** {_fi.last_price}")
-            except Exception as _e:
-                st.write(f"**Direct yfinance error:** {type(_e).__name__}: {_e}")
+            st.write("**OI source:** Schwab/TOS only (yfinance fallback removed)")
+            schwab_err = st.session_state.get("_schwab_chain_error", "none")
+            schwab_dbg = st.session_state.get("_schwab_chain_debug", "none")
+            st.write(f"**Schwab chain error:** {schwab_err}")
+            st.write(f"**Schwab chain debug:** {schwab_dbg}")
         return
 
     # ── Compute all Greeks ────────────────────────────────────────────────
@@ -901,8 +904,8 @@ def render_gex_engine():
     with tab_vex:
         st.markdown(f"{sec_hdr('VANNA EXPOSURE — Reaction to IV Changes')}", unsafe_allow_html=True)
         st.caption("Positive vanna: falling IV → dealers buy underlying (bullish). Negative vanna: falling IV → dealers sell (bearish).")
-        if "yfinance" in source.lower():
-            st.info("📋 VEX computed from EOD IV. With Schwab/TOS connected, this uses live per-strike IV for real-time vanna.")
+        if "not connected" in source.lower() or "empty chain" in source.lower():
+            st.warning("⚠️ VEX requires a live Schwab/TOS connection for per-strike IV and OI data.")
 
         view_mode_vex = st.radio("View", ["Heatmap", "Bar Chart"], horizontal=True, key="vex_view_mode")
         if view_mode_vex == "Heatmap":
@@ -949,8 +952,8 @@ def render_gex_engine():
     with tab_cex:
         st.markdown(f"{sec_hdr('CHARM EXPOSURE — Reaction to Time Decay')}", unsafe_allow_html=True)
         st.caption("Positive charm: time passing → dealers buy underlying (upward drift). Negative charm: dealers sell (downward drift).")
-        if "yfinance" in source.lower():
-            st.info("📋 CEX computed from EOD IV/OI. With Schwab/TOS, charm reflects live 0DTE positioning for intraday drift signals.")
+        if "not connected" in source.lower() or "empty chain" in source.lower():
+            st.warning("⚠️ CEX requires a live Schwab/TOS connection for live 0DTE positioning and intraday drift signals.")
 
         view_mode_cex = st.radio("View", ["Heatmap", "Bar Chart"], horizontal=True, key="cex_view_mode")
         if view_mode_cex == "Heatmap":
@@ -1100,9 +1103,19 @@ def render_setups_page():
             spot_live = schwab_get_spot(client, symbol)
             spot = spot_live if (spot_live and spot_live > 0) else float(chain_df["strike"].median())
         else:
-            chain_df, spot, source = get_gex_from_yfinance(symbol)
+            err = st.session_state.get("_schwab_chain_error", "unknown error")
+            st.error(
+                f"⚠️ Schwab returned an empty chain for **{symbol}**.\n\n"
+                f"**Reason:** {err}\n\n"
+                "OI is sourced exclusively from Schwab/TOS."
+            )
+            source = "Schwab API (empty chain)"
     else:
-        chain_df, spot, source = get_gex_from_yfinance(symbol)
+        st.warning(
+            "🔌 **Schwab/TOS not connected.** OI and GEX require a live Schwab connection.\n\n"
+            "Go to the **Schwab/TOS** tab to authorise your account."
+        )
+        source = "not connected"
 
     if chain_df is None or len(chain_df) == 0:
         st.error(f"No options data for {symbol}. Try refreshing or switching symbol.")

@@ -541,6 +541,31 @@ def render_dashboard():
         st.markdown("<hr/>", unsafe_allow_html=True)
 
         # ── GEX SNAPSHOT ──
+        # VIX term structure context
+        _vts_regime = leading.get("vix_ts_regime", "N/A")
+        _vix3m = leading.get("vix3m_level", float("nan"))
+        _corr_regime = leading.get("corr_regime", "NORMAL")
+        _shc = leading.get("spy_hyg_corr", float("nan"))
+
+        _vts_col = ("#ef4444" if _vts_regime == "Backwardation" else
+                    "#f59e0b" if _vts_regime == "Flat" else "#10b981")
+        _corr_col = ("#ef4444" if _corr_regime == "SYSTEMIC" else
+                     "#f59e0b" if _corr_regime == "STRESS" else "rgba(255,255,255,0.4)")
+
+        _vix3m_str = f"VIX3M {_vix3m:.1f}" if not __import__("math").isnan(_vix3m) else ""
+        _shc_str   = f"SPY↔HYG {_shc:.2f}" if not __import__("math").isnan(_shc) else ""
+
+        st.markdown(
+            f"<div style='font-family:monospace;font-size:10px;color:rgba(255,255,255,0.5);"
+            f"margin-bottom:4px;display:flex;gap:16px;'>"
+            f"<span>Vol TS: <b style='color:{_vts_col};'>{_vts_regime}</b>"
+            f"{' · ' + _vix3m_str if _vix3m_str else ''}</span>"
+            f"<span>Corr Regime: <b style='color:{_corr_col};'>{_corr_regime}</b>"
+            f"{' · ' + _shc_str if _shc_str else ''}</span>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
         # OI staleness assessment
         import datetime as _dt_gex
         _now_et = _dt_gex.datetime.now(_dt_gex.timezone.utc).astimezone(

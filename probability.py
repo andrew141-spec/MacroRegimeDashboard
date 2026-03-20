@@ -17,8 +17,7 @@ import xml.etree.ElementTree as ET
 from config import GammaState, GammaRegime, SetupScore
 from utils import _to_1d, kelly, current_pct_rank
 
-def compute_prob_composite(leading, fear_score, three_puts_score, liq_anxiety,
-                            exhaustion, market_index, geo_shock, regime_change_p,
+def compute_prob_composite(leading, fear_score, geo_shock, regime_change_p,
                             gex_state: GammaState,
                             nfci_coincident: float = 50.0,
                             liq_dir_coincident: float = 50.0) -> Dict:

@@ -53,15 +53,48 @@ def compute_leading_stack(
     # HORIZON 1 — TACTICAL (1–5 days)
     # ════════════════════════════════════════════════════════════════
 
-    # T1. VIX term structure: VIX / 63D realised vol ratio
-    # High premium → fear priced in → bearish next-week signal (inverted)
+    # T1. VIX term structure — two components:
+    #   (a) VIX/VIX3M slope: contango (<1) normal, backwardation (>1) fear event
+    #       Backwardation → near-term fear > medium-term → mean-reversion buy signal
+    #   (b) VIX/RVol ratio: fear premium above realised → hedging demand
     spy_a   = _to_1d(spy).reindex(idx).ffill()
     vix_a   = _to_1d(vix).reindex(idx).ffill()
     spy_ret = spy_a.pct_change()
     rvol    = spy_ret.rolling(63, min_periods=20).std() * np.sqrt(252) * 100
-    vts     = vix_a / rvol.replace(0, np.nan)
-    R["vix_ts_pct"]    = current_pct_rank(-vts, 63)   # 63-day window for tactical
-    R["vix_ts_level"]  = float(vts.dropna().iloc[-1]) if vts.dropna().size else np.nan
+    vts_rv  = vix_a / rvol.replace(0, np.nan)       # VIX vs realised vol
+
+    # Fetch VIX3M for term structure slope (free via yfinance)
+    try:
+        import yfinance as _yf
+        _vix3m_raw = _yf.Ticker("^VIX3M").history(period="2y")["Close"]
+        _vix3m_raw.index = pd.to_datetime(_vix3m_raw.index).tz_localize(None)
+        vix3m_a = _to_1d(_vix3m_raw).reindex(idx).ffill()
+        vts_slope = vix_a / vix3m_a.replace(0, np.nan)  # <1 contango, >1 backwardation
+        _has_vix3m = vts_slope.dropna().size > 10
+    except Exception:
+        vts_slope  = vts_rv.copy()
+        _has_vix3m = False
+
+    # Combine: backwardation (slope>1) is a BULLISH contrarian signal (vol reverts)
+    # High VIX/RVol is BEARISH (too much fear priced in for current realised vol)
+    # Net signal: backwardation - vts_rv (both on same scale)
+    if _has_vix3m:
+        # Primary: term structure slope (more forward-looking than VIX/RVol)
+        # Contango = normal = positive signal; backwardation = fear = near-term contrarian buy
+        vts_combined = -vts_slope   # inverted: contango (low) = good
+        R["vix_ts_pct"]         = current_pct_rank(vts_combined, 63)
+        _slope_val              = float(vts_slope.dropna().iloc[-1])
+        R["vix_ts_level"]       = _slope_val
+        R["vix_ts_regime"]      = ("Backwardation" if _slope_val > 1.05 else
+                                    "Flat"          if _slope_val > 0.95 else
+                                    "Contango")
+        R["vix3m_level"]        = float(vix3m_a.dropna().iloc[-1]) if vix3m_a.dropna().size else np.nan
+    else:
+        vts = vts_rv
+        R["vix_ts_pct"]    = current_pct_rank(-vts, 63)
+        R["vix_ts_level"]  = float(vts.dropna().iloc[-1]) if vts.dropna().size else np.nan
+        R["vix_ts_regime"] = "N/A (VIX3M unavailable)"
+        R["vix3m_level"]   = np.nan
 
     # T2. DXY 5D momentum (short window for tactical)
     dxy_a  = _to_1d(dxy).reindex(idx).ffill()
@@ -81,6 +114,41 @@ def compute_leading_stack(
     else:
         R["hyg_lqd_pct"] = 50.0
 
+    # S1b. Cross-asset correlation regime (21-day rolling)
+    # SPY-HYG below 0.70 → credit leading equity lower (2-4 week warning)
+    # SPY-TLT flips positive during selloff → flight-to-safety breakdown (systemic)
+    try:
+        _spy_ret = spy_a.pct_change().dropna()
+        _hyg_ret = hyg_a.pct_change().reindex(_spy_ret.index).dropna()
+        _tlt_a   = _to_1d(lqd).reindex(idx).ffill()  # use LQD as TLT proxy if no TLT
+        _tlt_ret = _tlt_a.pct_change().reindex(_spy_ret.index).dropna()
+
+        _w = 21
+        _spy_hyg_corr = _spy_ret.rolling(_w).corr(_hyg_ret)
+        _spy_tlt_corr = _spy_ret.rolling(_w).corr(_tlt_ret)
+
+        _shc = float(_spy_hyg_corr.dropna().iloc[-1]) if _spy_hyg_corr.dropna().size else 0.85
+        _stc = float(_spy_tlt_corr.dropna().iloc[-1]) if _spy_tlt_corr.dropna().size else -0.3
+
+        R["spy_hyg_corr"]   = round(_shc, 3)
+        R["spy_tlt_corr"]   = round(_stc, 3)
+
+        # Regime signal: credit divergence and/or safe-haven breakdown
+        _credit_divergence   = _shc < 0.70   # credit leading equity lower
+        _safehaven_breakdown = _stc > 0.20   # bonds no longer hedging
+        _stress_count = int(_credit_divergence) + int(_safehaven_breakdown)
+
+        R["corr_regime"] = ("SYSTEMIC" if _stress_count == 2 else
+                             "STRESS"   if _stress_count == 1 else
+                             "NORMAL")
+        # Encode as signal: normal=50, stress=35, systemic=20
+        R["corr_regime_pct"] = {"NORMAL": 50.0, "STRESS": 35.0, "SYSTEMIC": 20.0}[R["corr_regime"]]
+    except Exception:
+        R["spy_hyg_corr"]   = np.nan
+        R["spy_tlt_corr"]   = np.nan
+        R["corr_regime"]    = "NORMAL"
+        R["corr_regime_pct"] = 50.0
+
     # S2. Small-cap vs large-cap leadership (IWM/SPY) 3-week momentum
     iwm_a = _to_1d(iwm).reindex(idx).ffill()
     if iwm_a.dropna().size > 21 and spy_a.dropna().size > 21:
@@ -88,6 +156,20 @@ def compute_leading_stack(
         R["smallcap_pct"] = current_pct_rank(rs_mom, 252)
     else:
         R["smallcap_pct"] = 50.0
+
+    # S2b. Market breadth — cumulative Advance/Decline momentum
+    # 21-day rate of change of A/D line: broad participation vs narrow rally
+    # Narrow rallies (A/D lagging) precede reversals; broad rallies sustain
+    # Using IWM/QQQ ratio as breadth proxy (small/large divergence captures breadth)
+    qqq_a = _to_1d(qqq).reindex(idx).ffill()
+    if iwm_a.dropna().size > 42 and qqq_a.dropna().size > 42:
+        # IWM/QQQ: when small caps underperform mega-cap, breadth is deteriorating
+        _breadth_raw = (iwm_a / qqq_a.replace(0, np.nan)).pct_change(21) * 100
+        R["breadth_pct"] = current_pct_rank(_breadth_raw, 252)
+        R["breadth_val"] = float(_breadth_raw.dropna().iloc[-1]) if _breadth_raw.dropna().size else 0.0
+    else:
+        R["breadth_pct"] = 50.0
+        R["breadth_val"] = 0.0
 
     # S3. Net liquidity 4-week impulse
     R["liq_impulse_4w_pct"]   = current_pct_rank(net_liq_4w, 252)

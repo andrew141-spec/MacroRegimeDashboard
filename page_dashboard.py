@@ -26,6 +26,16 @@ from signals import compute_leading_stack, compute_1d_prob
 from probability import compute_prob_composite, get_session_context, evaluate_setups, check_failure_modes, classify_macro_regime_abs, regime_transition_prob, driver_alerts
 from page_wim import render_world_intelligence_monitor
 
+def _safe_last(s) -> float:
+    """Return last non-NaN value of a series, or nan if empty."""
+    if s is None: return float("nan")
+    try:
+        d = s.dropna()
+        return float(d.iloc[-1]) if len(d) > 0 else float("nan")
+    except Exception:
+        return float("nan")
+
+
 def render_dashboard():
     """Main integrated dashboard."""
     st.markdown(CSS, unsafe_allow_html=True)
@@ -74,8 +84,10 @@ def render_dashboard():
         ism_no        = ism_no_raw if len(ism_no_raw.dropna()) > 4 else None
         gdp_quarterly = r("GDPC1")
         mmmf          = r("WRMFSL")
-        sahm_rule     = resample_ffill(raw.get("SAHM_RULE", pd.Series(dtype=float)), idx)
-        hy_spread     = resample_ffill(raw.get("BAMLH0A0HYM2", pd.Series(dtype=float)), idx)
+        _sahm_raw  = raw.get("SAHM_RULE", pd.Series(dtype=float))
+        _hy_raw    = raw.get("BAMLH0A0HYM2", pd.Series(dtype=float))
+        sahm_rule  = resample_ffill(_sahm_raw, idx) if len(_sahm_raw.dropna()) > 0 else None
+        hy_spread  = resample_ffill(_hy_raw, idx)   if len(_hy_raw.dropna()) > 0 else None
 
     # ── DERIVED ──
     core_yoy = (core/core.shift(365)-1)*100
@@ -637,10 +649,6 @@ def render_dashboard():
         st.markdown(f"{sec_hdr('MARKET STRUCTURE')}", unsafe_allow_html=True)
         ml1, ml2 = st.columns([1.35,1.0]); mr1, mr2 = st.columns([1.35,1.0])
 
-        def _safe_last(s):
-            d = s.dropna()
-            return float(d.iloc[-1]) if len(d) > 0 else float("nan")
-
         yc = pd.DataFrame({"Tenor":["3M","2Y","10Y","30Y"],
                            "Yield":[_safe_last(y3m),_safe_last(y2),_safe_last(y10),_safe_last(y30)]})
         fig_yc = go.Figure(go.Scatter(x=yc.Tenor, y=yc.Yield, mode="lines+markers+text",
@@ -651,9 +659,15 @@ def render_dashboard():
         mat = pd.DataFrame([[1,2],[3,4]],index=["Inflation ↓","Inflation ↑"],columns=["Growth ↓","Growth ↑"])
         fig_mat = px.imshow(mat, text_auto=False, aspect="auto",
                             color_continuous_scale=[[0,"#10b981"],[0.33,"#f59e0b"],[0.66,"#f97316"],[1,"#ef4444"]])
-        fig_mat.add_trace(go.Scatter(x=[0 if float(growth_z.iloc[-1])<0 else 1],
-                                     y=[0 if float(infl_z.iloc[-1])<0 else 1],
-                                     mode="markers", marker=dict(size=18,symbol="x",color="white")))
+        # Regime map: dot shows current quadrant (0=left/bottom, 1=right/top)
+        _gz = float(growth_z.dropna().iloc[-1]) if growth_z.dropna().size else 0.0
+        _iz = float(infl_z.dropna().iloc[-1])   if infl_z.dropna().size   else 0.0
+        fig_mat.add_trace(go.Scatter(
+            x=[0 if _gz < 0 else 1],
+            y=[1 if _iz < 0 else 0],   # imshow: row 0 = top (Inflation↓), row 1 = bottom (Inflation↑)
+            mode="markers",
+            marker=dict(size=20, symbol="x", color="white", line=dict(width=3, color="white")),
+        ))
         fig_mat.update_coloraxes(showscale=False)
         ml2.plotly_chart(plotly_dark(fig_mat,"Regime Map",270), use_container_width=True)
 
@@ -676,7 +690,7 @@ def render_dashboard():
         t1.metric("Symbol",ticker_tile); t2.metric("5D Return",f"{r5*100:.2f}%" if np.isfinite(r5) else "N/A")
         t3.metric("21D Return",f"{r21*100:.2f}%" if np.isfinite(r21) else "N/A")
         _s2s10_val = float(s_2s10s.dropna().iloc[-1]) if s_2s10s.dropna().size else float("nan")
-        t4.metric("2s10s (bp)", f"{_s2s10_val:.0f}" if not __import__("math").isnan(_s2s10_val) else "N/A")
+        t4.metric("2s10s (bp)", f"{_s2s10_val:.0f}" if not math.isnan(_s2s10_val) else "N/A")
         tc = "#10b981" if (np.isfinite(r21) and r21>0) else "#ef4444"
         # Convert hex colour to rgba for fill — Plotly rejects 8-digit hex
         def _hex_to_rgba(hex_col: str, alpha: float) -> str:
@@ -700,7 +714,7 @@ def render_dashboard():
         # Sahm Rule card
         with ri1:
             sahm_last = _safe_last(sahm_rule) if sahm_rule is not None else float("nan")
-            sahm_ok   = not __import__("math").isnan(sahm_last)
+            sahm_ok   = not math.isnan(sahm_last)
             sahm_trig = sahm_last >= 0.50 if sahm_ok else False
             sahm_warn = sahm_last >= 0.30 if sahm_ok else False
             sahm_col  = "#ef4444" if sahm_trig else ("#f59e0b" if sahm_warn else "#10b981")
@@ -720,7 +734,7 @@ def render_dashboard():
         # HY Spread card
         with ri2:
             hy_last = _safe_last(hy_spread) if hy_spread is not None else float("nan")
-            hy_ok   = not __import__("math").isnan(hy_last)
+            hy_ok   = not math.isnan(hy_last)
             hy_stress  = hy_last > 600 if hy_ok else False
             hy_warning = hy_last > 400 if hy_ok else False
             hy_col     = "#ef4444" if hy_stress else ("#f59e0b" if hy_warning else "#10b981")

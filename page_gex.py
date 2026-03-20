@@ -704,8 +704,8 @@ def render_gex_engine():
         return
 
     # ── Compute all Greeks ────────────────────────────────────────────────
-    gs  = build_gamma_state(chain_df, spot, source)
-    dg  = compute_dealer_greeks(chain_df, spot, source)
+    gs  = build_gamma_state(chain_df, spot, source, max_dte=int(st.session_state.get('gex_hm_dte', 45)))
+    dg  = compute_dealer_greeks(chain_df, spot, source, max_dte=int(st.session_state.get('gex_hm_dte', 45)))
     session   = get_session_context()
     vix_df    = yf.Ticker("^VIX").history(period="1d")
     vix_level = float(vix_df["Close"].iloc[-1]) if len(vix_df) > 0 else 20.0
@@ -1055,8 +1055,8 @@ def render_setups_page():
         st.error(f"No options data for {symbol}. Try refreshing or switching symbol.")
         return
 
-    gs        = build_gamma_state(chain_df, spot, source)
-    dg        = compute_dealer_greeks(chain_df, spot, source)
+    gs        = build_gamma_state(chain_df, spot, source, max_dte=int(st.session_state.get('gex_hm_dte', 45)))
+    dg        = compute_dealer_greeks(chain_df, spot, source, max_dte=int(st.session_state.get('gex_hm_dte', 45)))
     session   = get_session_context()
     vix_df    = yf.Ticker("^VIX").history(period="1d")
     vix_level = float(vix_df["Close"].iloc[-1]) if len(vix_df) > 0 else 20.0

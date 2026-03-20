@@ -26,6 +26,8 @@ INTEL_CATEGORIES = {
         "feeds": {
             "Fed Releases":  "https://www.federalreserve.gov/feeds/press_all.xml",
             "FOMC":          "https://www.federalreserve.gov/feeds/fomcpressreleases.xml",
+            "SEC":           "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=&dateb=&owner=include&count=10&search_text=&output=atom",
+            "White House":   "https://www.whitehouse.gov/feed/",
         },
         "keywords": ["fed","fomc","powell","rate cut","rate hike","balance sheet",
                      "quantitative","qt","qe","tapering","dot plot","basis points",
@@ -79,6 +81,9 @@ INTEL_CATEGORIES = {
         "border": "rgba(249,115,22,0.22)",
         "feeds": {
             "Reuters World": "https://feeds.reuters.com/reuters/worldNews",
+            "CNBC":          "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+            "FT":            "https://www.ft.com/rss/home",
+            "Yahoo Finance": "https://finance.yahoo.com/news/rssindex",
         },
         "keywords": ["tariff","trade war","trade deal","sanction","export control",
                      "import duty","90-day pause","liberation day","china trade",
@@ -95,8 +100,15 @@ INTEL_CATEGORIES = {
         "bg": "rgba(239,68,68,0.07)",
         "border": "rgba(239,68,68,0.22)",
         "feeds": {
-            "BBC World":     "https://feeds.bbci.co.uk/news/world/rss.xml",
-            "Reuters World": "https://feeds.reuters.com/reuters/worldNews",
+            "BBC World":       "https://feeds.bbci.co.uk/news/world/rss.xml",
+            "BBC Middle East": "https://feeds.bbci.co.uk/news/world/middle_east/rss.xml",
+            "Reuters World":   "https://feeds.reuters.com/reuters/worldNews",
+            "Al Jazeera":      "https://www.aljazeera.com/xml/rss/all.xml",
+            "Guardian World":  "https://www.theguardian.com/world/rss",
+            "France 24":       "https://www.france24.com/en/rss",
+            "UN News":         "https://news.un.org/feed/subscribe/en/news/all/rss.xml",
+            "CISA":            "https://www.cisa.gov/cybersecurity-advisories/all.xml",
+            "State Dept":      "https://www.state.gov/rss-feeds/",
         },
         "keywords": ["war","conflict","military","attack","invasion","missile","drone",
                      "nuclear","nato","iran","russia","ukraine","israel","gaza",
@@ -214,6 +226,72 @@ _GEO_SOURCE_WEIGHT = {
     "US Treasury":   0.0,
 }
 
+# ── Country baseline risk scores (0–50, higher = more significant event) ─────
+# When a headline mentions a high-risk country, boost geo score accordingly.
+# Source: WorldMonitor pattern + practitioner calibration
+COUNTRY_BASELINE_RISK: Dict[str, int] = {
+    "US": 5, "RU": 35, "CN": 25, "UA": 50, "IR": 40,
+    "IL": 45, "TW": 30, "KP": 45, "SA": 20, "SY": 50,
+    "YE": 50, "PK": 35, "MM": 45, "LB": 40, "AF": 45,
+}
+COUNTRY_KEYWORDS: Dict[str, List[str]] = {
+    "RU": ["russia", "moscow", "kremlin", "putin", "russian"],
+    "CN": ["china", "beijing", "xi jinping", "pla", "chinese"],
+    "IR": ["iran", "tehran", "irgc", "khamenei", "iranian"],
+    "IL": ["israel", "idf", "gaza", "netanyahu", "israeli"],
+    "TW": ["taiwan", "taipei", "tsai", "taiwanese"],
+    "KP": ["north korea", "pyongyang", "kim jong", "dprk"],
+    "UA": ["ukraine", "kyiv", "zelensky", "ukrainian"],
+    "YE": ["yemen", "houthi", "sanaa", "yemeni"],
+    "SA": ["saudi arabia", "riyadh", "mbs", "aramco"],
+    "SY": ["syria", "damascus", "syrian"],
+}
+
+# ── Strategic chokepoints (WorldMonitor canonical list) ────────────────────
+# Headlines mentioning these WITH a conflict keyword score much higher.
+STRATEGIC_CHOKEPOINTS: Dict[str, List[str]] = {
+    "Suez Canal":          ["suez", "suez canal"],
+    "Malacca Strait":      ["malacca", "strait of malacca"],
+    "Strait of Hormuz":    ["hormuz", "strait of hormuz"],
+    "Bab el-Mandeb":       ["bab el-mandeb", "bab-el-mandeb", "mandeb"],
+    "Panama Canal":        ["panama canal"],
+    "Taiwan Strait":       ["taiwan strait"],
+    "Cape of Good Hope":   ["cape of good hope"],
+    "Gibraltar":           ["gibraltar"],
+    "Bosporus":            ["bosphorus", "bosporus"],
+}
+
+def _country_risk_bonus(txt: str) -> float:
+    """Return a risk bonus (0–15) based on countries mentioned in headline."""
+    bonus = 0.0
+    for code, keywords in COUNTRY_KEYWORDS.items():
+        if any(kw in txt for kw in keywords):
+            bonus = max(bonus, COUNTRY_BASELINE_RISK.get(code, 0) / 10.0)
+    return min(bonus, 15.0)
+
+def _chokepoint_bonus(txt: str) -> float:
+    """Return bonus score if a strategic chokepoint is mentioned."""
+    for name, aliases in STRATEGIC_CHOKEPOINTS.items():
+        if any(alias in txt for alias in aliases):
+            return 8.0  # chokepoint disruption is high-impact by definition
+    return 0.0
+
+
+
+
+def google_news_rss(query: str) -> str:
+    """Generate a targeted Google News RSS feed URL for any query.
+    
+    Useful for creating highly specific feeds without a paid news API.
+    Examples:
+        google_news_rss("site:federalreserve.gov OR FOMC rate decision")
+        google_news_rss("tariff trade war sanctions when:1d")
+        google_news_rss("strait of hormuz OR suez canal disruption")
+    """
+    import urllib.parse
+    params = urllib.parse.urlencode({"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"})
+    return f"https://news.google.com/rss/search?{params}"
+
 def _fetch_url(url, timeout=7):
     req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urlopen(req, timeout=timeout) as r: return r.read().decode("utf-8", errors="ignore")
@@ -241,10 +319,21 @@ def load_feeds(feed_tuple, max_total=120):
         except: pass
     return all_items[:max_total]
 
+# Pre-compile relevance patterns once (word-boundary for all)
+_RELEVANCE_PATTERNS = [
+    (kw, re.compile(r'\b' + re.escape(kw) + r'\b', re.IGNORECASE))
+    for kw in RELEVANCE_KW
+]
+
 def score_relevance(items, max_keep=12):
-    kw = [k.lower() for k in RELEVANCE_KW]
-    scored = [(sum(1 for k in kw if k in (it.title+" "+it.source).lower()), it) for it in items]
-    return [it for s, it in sorted(scored, key=lambda x:-x[0]) if s > 0][:max_keep]
+    scored = []
+    for it in items:
+        txt = (it.title + " " + it.source)
+        count = sum(1 for _, pat in _RELEVANCE_PATTERNS if pat.search(txt))
+        if count > 0:
+            scored.append((count, it))
+    scored.sort(key=lambda x: -x[0])
+    return [it for _, it in scored[:max_keep]]
 
 # Pre-compile word-boundary regex patterns for each keyword once at module load.
 # This prevents "war" matching "hardware", "qt" matching "squat", etc.
@@ -364,7 +453,7 @@ def _geo_item_score(it: FeedItem) -> Tuple[float, str]:
     reason = ""
 
     for kw, kw_score in HIGH_KW_SCORES.items():
-        if kw in txt:
+        if re.search(r'\b' + re.escape(kw) + r'\b', txt):
             if kw in _GEO_NO_CONTEXT_NEEDED or any(kw in phrase for phrase in _GEO_NO_CONTEXT_NEEDED):
                 base_score = kw_score
                 reason = f"[{kw}]"
@@ -381,13 +470,18 @@ def _geo_item_score(it: FeedItem) -> Tuple[float, str]:
 
     if base_score == 0.0:
         for kw, kw_score in MED_KW_SCORES.items():
-            if kw in txt:
+            if re.search(r'\b' + re.escape(kw) + r'\b', txt):
                 base_score = kw_score
                 reason = f"[{kw}]"
                 break
 
     if base_score == 0.0:
         return 0.0, ""
+
+    # Country risk bonus — Iran/Russia/etc. headlines score higher
+    base_score += _country_risk_bonus(txt)
+    # Chokepoint bonus — mentions of Hormuz/Suez/etc. are inherently significant
+    base_score += _chokepoint_bonus(txt)
 
     # Apply source weight
     scored = base_score * source_w

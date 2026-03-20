@@ -231,8 +231,7 @@ def render_dashboard():
     liq_dir_coincident = float(50.0 + np.sign(liq_dir_now) * 20)   # 70=expanding, 30=draining
 
     prob = compute_prob_composite(
-        leading, fear_score, three_puts, liq_anxiety, exhaustion,
-        market_index_score, geo_shock, meta["p_change_20d"], gex_state,
+        leading, fear_score, geo_shock, meta["p_change_20d"], gex_state,
         nfci_coincident=nfci_coincident,
         liq_dir_coincident=liq_dir_coincident,
     )

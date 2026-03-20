@@ -268,6 +268,7 @@ def compute_1d_prob(
     idx: pd.DatetimeIndex,
     sahm_rule=None,
     hy_spread=None,
+    intraday_signals: dict = None,   # from get_intraday_signals() — live session data
 ) -> Dict:
     """
     1-Day directional probability — built around GEX mechanics.
@@ -370,7 +371,11 @@ def compute_1d_prob(
 
     # ── Factor 3: 5D SPY momentum (regime-conditioned) ───────────────────
     spy_5d_ret = float(spy_a.pct_change(5).dropna().iloc[-1]) if spy_a.pct_change(5).dropna().size else 0.0
-    spy_1d_ret = float(spy_a.pct_change(1).dropna().iloc[-1]) if spy_a.pct_change(1).dropna().size else 0.0
+    # For 1D momentum: use live session change if available, else prior close change
+    if intraday_signals and intraday_signals.get("SPY_pct") is not None:
+        spy_1d_ret = float(intraday_signals.get("SPY_pct", 0))
+    else:
+        spy_1d_ret = float(spy_a.pct_change(1).dropna().iloc[-1]) if spy_a.pct_change(1).dropna().size else 0.0
 
     # Key insight: momentum interpretation depends on GEX regime
     if regime in (GammaRegime.STRONG_POSITIVE, GammaRegime.POSITIVE):
@@ -398,12 +403,19 @@ def compute_1d_prob(
     lqd_a   = _to_1d(lqd_series).reindex(idx).ffill()
     dxy_a   = _to_1d(dxy_series).reindex(idx).ffill()
 
-    hyg_1d  = float(hyg_a.pct_change(1).dropna().iloc[-1]) if hyg_a.pct_change(1).dropna().size else 0.0
-    lqd_1d  = float(lqd_a.pct_change(1).dropna().iloc[-1]) if lqd_a.pct_change(1).dropna().size else 0.0
-    dxy_1d  = float(dxy_a.pct_change(1).dropna().iloc[-1]) if dxy_a.pct_change(1).dropna().size else 0.0
+    # Prefer live intraday data from Schwab when available (current session % change)
+    # Fall back to daily close-to-close change from FRED/yfinance
+    if intraday_signals and intraday_signals.get("HYG_pct") is not None:
+        hyg_1d = float(intraday_signals.get("HYG_pct", 0))
+        lqd_1d = float(intraday_signals.get("LQD_pct", 0))
+        dxy_1d = float(intraday_signals.get("UUP_pct", 0))  # UUP = USD ETF
+    else:
+        hyg_1d = float(hyg_a.pct_change(1).dropna().iloc[-1]) if hyg_a.pct_change(1).dropna().size else 0.0
+        lqd_1d = float(lqd_a.pct_change(1).dropna().iloc[-1]) if lqd_a.pct_change(1).dropna().size else 0.0
+        dxy_1d = float(dxy_a.pct_change(1).dropna().iloc[-1]) if dxy_a.pct_change(1).dropna().size else 0.0
 
     # HYG/LQD spread tightening (HYG up relative to LQD) = risk-on = bullish
-    credit_1d_signal = hyg_1d - lqd_1d * 0.5   # HYG weighted more
+    credit_1d_signal = hyg_1d - lqd_1d * 0.5
     # Dollar weakening = risk-on = bullish (inverted)
     dollar_signal    = -dxy_1d
 
@@ -554,6 +566,7 @@ def compute_1d_prob(
         "gex_confidence":  gex_signal_confidence,
         "flip_proximity":  flip_proximity_penalty,
         "session_valid":   session_mult >= 0.5,
+        "using_intraday":  intraday_signals is not None and len(intraday_signals) > 0,
         "sahm_triggered":  (float(sahm_rule.dropna().iloc[-1]) >= 0.50) if (sahm_rule is not None and hasattr(sahm_rule,"dropna") and sahm_rule.dropna().size) else False,
         "hy_spread_level": float(hy_spread.dropna().iloc[-1]) if (hy_spread is not None and hasattr(hy_spread,"dropna") and hy_spread.dropna().size) else 0.0,
         "_note": (
@@ -562,5 +575,3 @@ def compute_1d_prob(
             f"Range: {lo_1d:.0f}-{hi_1d:.0f}%."
         ),
     }
-
-

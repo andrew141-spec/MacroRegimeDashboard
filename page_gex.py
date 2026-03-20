@@ -15,7 +15,7 @@ from utils import _to_1d, zscore, resample_ffill, yf_close, kelly, current_pct_r
 from config import _get_secret
 from ui_components import pill, pbar, sec_hdr, plotly_dark, regime_chip, autorefresh_js, colored, gauge
 from gex_engine import (build_gamma_state, compute_gex_from_chain, find_gamma_flip,
-                        classify_gex_regime, compute_dealer_greeks, DealerGreeks)
+                        nearest_expiry_chain, classify_gex_regime, compute_dealer_greeks, DealerGreeks)
 from schwab_api import (get_schwab_client, schwab_get_spot, schwab_get_options_chain,
                         SCHWAB_AVAILABLE)
 from data_loaders import get_gex_from_yfinance
@@ -838,10 +838,29 @@ def render_gex_engine():
             bar_lo   = spot - n_side
             bar_hi   = spot + n_side
             filtered = {k: v for k, v in dg.gex_by_strike.items() if bar_lo <= k <= bar_hi}
+            # Show TWO bar charts: nearest expiry (0DTE-style) + all near-term
+            near0_chain = nearest_expiry_chain(chain_df)
+            if near0_chain is not None and len(near0_chain) > 0:
+                from gex_engine import compute_gex_from_chain as _cgx
+                near0_gex = _cgx(near0_chain, spot)
+                near0_agg = near0_gex.groupby("strike")["net_gex"].sum()
+                near0_by_strike = near0_agg.to_dict()
+                near0_lo, near0_hi = spot - n_side, spot + n_side
+                near0_filtered = {k: v for k, v in near0_by_strike.items() if near0_lo <= k <= near0_hi}
+                import datetime as _dt2
+                min_dte = int(round(near0_chain["expiry_T"].min() * 365))
+                dte_label = "0DTE" if min_dte <= 1 else f"{min_dte}DTE"
+                fig_near0 = _greek_bar_chart(near0_filtered, spot,
+                                             f"Net GEX · Nearest Expiry ({dte_label})",
+                                             _C_POS, _C_NEG, gs.gamma_flip,
+                                             height=int(st.session_state["gex_hm_height"] // 2))
+                st.plotly_chart(fig_near0, use_container_width=True, key="gex_chart_bar_0dte")
+                st.caption(f"↑ Nearest expiry only ({dte_label}) — matches GEXBot/SpotGamma spot GEX view. ↓ All ≤{int(st.session_state.get('gex_hm_dte',45))}DTE combined.")
+
             fig_gex = _greek_bar_chart(filtered, spot,
                                        f"Net GEX · {regime_str} · ≤{int(st.session_state.get('gex_hm_dte',45))}DTE",
                                        _C_POS, _C_NEG, gs.gamma_flip,
-                                       height=int(st.session_state["gex_hm_height"]))
+                                       height=int(st.session_state["gex_hm_height"] // 2))
             st.plotly_chart(fig_gex, use_container_width=True, key="gex_chart_bar")
 
         c1, c2 = st.columns(2)

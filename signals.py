@@ -266,6 +266,8 @@ def compute_1d_prob(
     fear_score: float,
     session: Dict,
     idx: pd.DatetimeIndex,
+    sahm_rule=None,
+    hy_spread=None,
 ) -> Dict:
     """
     1-Day directional probability — built around GEX mechanics.
@@ -484,6 +486,20 @@ def compute_1d_prob(
     elif fear_score > 55:
         scaled = 50.0 + (scaled - 50.0) * 0.90   # compress deviation by 10% in elevated fear
 
+    # Sahm Rule recession gate
+    if sahm_rule is not None:
+        try:
+            sahm_val = float(sahm_rule.dropna().iloc[-1])
+            if sahm_val >= 0.50:   scaled = min(scaled, 55.0)
+            elif sahm_val >= 0.30: scaled = min(scaled, 65.0)
+        except: pass
+    # HY spread stress gate
+    if hy_spread is not None:
+        try:
+            hy_val = float(hy_spread.dropna().iloc[-1])
+            if hy_val > 600:   scaled = 50.0 + (scaled - 50.0) * 0.50
+            elif hy_val > 400: scaled = 50.0 + (scaled - 50.0) * 0.75
+        except: pass
     prob_1d = float(np.clip(scaled, 10, 90))
 
     # ── Uncertainty band (wider than longer horizons — more noise) ─────
@@ -538,6 +554,8 @@ def compute_1d_prob(
         "gex_confidence":  gex_signal_confidence,
         "flip_proximity":  flip_proximity_penalty,
         "session_valid":   session_mult >= 0.5,
+        "sahm_triggered":  (float(sahm_rule.dropna().iloc[-1]) >= 0.50) if (sahm_rule is not None and hasattr(sahm_rule,"dropna") and sahm_rule.dropna().size) else False,
+        "hy_spread_level": float(hy_spread.dropna().iloc[-1]) if (hy_spread is not None and hasattr(hy_spread,"dropna") and hy_spread.dropna().size) else 0.0,
         "_note": (
             f"1D model: GEX-regime-conditioned. "
             f"Realistic AUC 0.52-0.55. "

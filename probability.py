@@ -259,7 +259,56 @@ _GDP_DATES = {
     "2026-01-28","2026-04-29","2026-07-29","2026-10-28",
 }
 
-_ALL_DATA_DAYS = _FOMC_DATES | _CPI_DATES | _NFP_DATES | _PCE_DATES | _GDP_DATES
+# JOLTS Job Openings (BLS, ~last Tuesday of following month)
+_JOLTS_DATES = {
+    # 2025
+    "2025-01-07","2025-02-04","2025-03-11","2025-04-01",
+    "2025-05-06","2025-06-03","2025-07-01","2025-08-05",
+    "2025-09-02","2025-10-07","2025-11-04","2025-12-02",
+    # 2026
+    "2026-01-06","2026-02-03","2026-03-10","2026-03-31",
+    "2026-05-05","2026-06-02","2026-06-30","2026-08-04",
+    "2026-09-01","2026-10-06","2026-11-03","2026-12-01",
+}
+
+# PPI (BLS, one day before CPI typically)
+_PPI_DATES = {
+    # 2025
+    "2025-01-14","2025-02-11","2025-03-11","2025-04-09",
+    "2025-05-12","2025-06-10","2025-07-10","2025-08-12",
+    "2025-09-09","2025-10-14","2025-11-12","2025-12-09",
+    # 2026
+    "2026-01-13","2026-02-10","2026-03-10","2026-04-08",
+    "2026-05-12","2026-06-09","2026-07-08","2026-08-11",
+    "2026-09-08","2026-10-13","2026-11-10","2026-12-08",
+}
+
+# ISM Manufacturing (first business day of month)
+_ISM_MFG_DATES = {
+    # 2025
+    "2025-01-02","2025-02-03","2025-03-03","2025-04-01",
+    "2025-05-01","2025-06-02","2025-07-01","2025-08-01",
+    "2025-09-02","2025-10-01","2025-11-03","2025-12-01",
+    # 2026
+    "2026-01-02","2026-02-02","2026-03-02","2026-04-01",
+    "2026-05-01","2026-06-01","2026-07-01","2026-08-03",
+    "2026-09-01","2026-10-01","2026-11-02","2026-12-01",
+}
+
+_ALL_DATA_DAYS = (_FOMC_DATES | _CPI_DATES | _NFP_DATES | _PCE_DATES
+                  | _GDP_DATES | _JOLTS_DATES | _PPI_DATES | _ISM_MFG_DATES)
+
+
+def _is_fed_blackout(date: dt.date) -> bool:
+    """FOMC blackout period = 10 calendar days before each decision date.
+    During blackout: no Fed speeches → GEX mechanical levels dominate more.
+    """
+    for fomc_str in _FOMC_DATES:
+        fomc_d = dt.date.fromisoformat(fomc_str)
+        days_to = (fomc_d - date).days
+        if 0 <= days_to <= 10:
+            return True
+    return False
 
 
 def get_calendar_context(date: dt.date = None) -> Dict:
@@ -277,14 +326,20 @@ def get_calendar_context(date: dt.date = None) -> Dict:
     if d_str in _PCE_DATES:  events.append("PCE")
     if d_str in _GDP_DATES:  events.append("GDP")
 
-    is_data_day = len(events) > 0
-    is_fomc     = "FOMC" in events
-    # FOMC days get extra penalty: entire session is event-driven
+    if d_str in _JOLTS_DATES:  events.append("JOLTS")
+    if d_str in _PPI_DATES:    events.append("PPI")
+    if d_str in _ISM_MFG_DATES: events.append("ISM Mfg")
+    is_data_day   = len(events) > 0
+    is_fomc       = "FOMC" in events
+    is_fed_blackout = _is_fed_blackout(d)
+    # FOMC days get extra penalty. Other high-impact days get 0.75x.
+    # Blackout alone doesn't reduce size but is flagged.
     size_penalty = 0.5 if is_fomc else (0.75 if is_data_day else 1.0)
 
     return {
-        "is_data_day":  is_data_day,
-        "is_fomc":      is_fomc,
+        "is_data_day":     is_data_day,
+        "is_fomc":         is_fomc,
+        "is_fed_blackout": is_fed_blackout,
         "events":       events,
         "event_label":  " + ".join(events) if events else "",
         "size_penalty": size_penalty,   # multiply onto session size_mult

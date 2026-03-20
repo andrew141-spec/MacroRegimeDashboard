@@ -240,6 +240,8 @@ def render_dashboard():
         fear_score=fear_score,
         session=get_session_context(),
         idx=idx,
+        sahm_rule=macro.get("SAHM_RULE"),
+        hy_spread=macro.get("BAMLH0A0HYM2"),
     )
     session = get_session_context()
     # vix_level already computed above in 1D model block
@@ -316,6 +318,69 @@ def render_dashboard():
 </div>""", unsafe_allow_html=True)
 
         st.markdown("<hr/>", unsafe_allow_html=True)
+
+        # ── 1D HERO CARD — most actionable signal, displayed prominently ──
+        p1d_hero = prob_1d.get("prob_1d", 50.0)
+        c1d_hero = "#10b981" if p1d_hero > 60 else ("#ef4444" if p1d_hero < 40 else "#f59e0b")
+        dom_sig  = prob_1d.get("dominant_signal", "")
+        dom_dir  = prob_1d.get("dominant_dir", "")
+        sess_ok  = prob_1d.get("session_valid", True)
+        sahm_on  = prob_1d.get("sahm_triggered", False)
+        hy_lvl   = prob_1d.get("hy_spread_level", 0.0)
+        gex_reg  = gex_state.regime.value.replace("_", " ").title()
+
+        warning_tags = ""
+        if sahm_on: warning_tags += "<span style='background:rgba(239,68,68,0.15);color:#ef4444;border-radius:4px;padding:1px 6px;font-size:9px;margin-left:6px;'>SAHM TRIGGERED</span>"
+        if hy_lvl > 600: warning_tags += "<span style='background:rgba(239,68,68,0.15);color:#ef4444;border-radius:4px;padding:1px 6px;font-size:9px;margin-left:6px;'>HY STRESS</span>"
+        if not sess_ok: warning_tags += "<span style='background:rgba(156,163,175,0.15);color:rgba(255,255,255,0.4);border-radius:4px;padding:1px 6px;font-size:9px;margin-left:6px;'>THIN SESSION</span>"
+
+        lo1d_h = prob_1d.get("lo_1d", p1d_hero - 15)
+        hi1d_h = prob_1d.get("hi_1d", p1d_hero + 15)
+        vts_s  = prob_1d.get("score_vts",   50)
+        mom_s  = prob_1d.get("score_mom",   50)
+        mic_s  = prob_1d.get("score_micro", 50)
+        crv_s  = prob_1d.get("score_curve", 50)
+        liq_s  = prob_1d.get("score_liq",   50)
+
+        def _mini_bar(score, label):
+            c = "#10b981" if score > 55 else ("#ef4444" if score < 45 else "#6b7280")
+            w = score
+            return (f"<div style='display:flex;align-items:center;gap:6px;margin:2px 0;'>"
+                    f"<span style='font-size:9px;color:rgba(255,255,255,0.45);width:72px;flex-shrink:0;'>{label}</span>"
+                    f"<div style='flex:1;height:4px;background:rgba(255,255,255,0.08);border-radius:2px;'>"
+                    f"<div style='width:{w:.0f}%;height:4px;background:{c};border-radius:2px;'></div></div>"
+                    f"<span style='font-size:9px;color:{c};width:28px;text-align:right;font-family:monospace;'>{score:.0f}</span>"
+                    f"</div>")
+
+        st.markdown(f"""
+<div style='background:rgba(16,185,129,0.06);border:1px solid rgba(16,185,129,0.22);
+            border-radius:14px;padding:16px 20px;margin-bottom:12px;'>
+  <div style='display:flex;align-items:flex-start;gap:20px;flex-wrap:wrap;'>
+    <div style='min-width:120px;'>
+      <div style='font-family:monospace;font-size:9px;letter-spacing:1px;
+                  text-transform:uppercase;color:rgba(255,255,255,0.45);margin-bottom:4px;'>
+        1-Day Bull Prob · GEX-conditioned {warning_tags}
+      </div>
+      <div style='font-size:54px;font-weight:700;color:{c1d_hero};font-family:monospace;
+                  line-height:1;'>{p1d_hero:.0f}%</div>
+      <div style='font-size:10px;color:rgba(255,255,255,0.40);margin-top:4px;'>
+        Range: {lo1d_h:.0f}–{hi1d_h:.0f}% · GEX: {gex_reg}
+      </div>
+      <div style='font-size:10px;color:rgba(255,255,255,0.50);margin-top:2px;'>
+        Lead: {dom_sig} ({dom_dir})
+      </div>
+    </div>
+    <div style='flex:1;min-width:180px;'>
+      <div style='font-size:9px;color:rgba(255,255,255,0.35);margin-bottom:6px;
+                  text-transform:uppercase;letter-spacing:0.5px;'>Component scores</div>
+      {_mini_bar(vts_s,  "VIX Term Str")}
+      {_mini_bar(mom_s,  "SPY 5D Mom")}
+      {_mini_bar(mic_s,  "Credit/DXY")}
+      {_mini_bar(crv_s,  "Curve")}
+      {_mini_bar(liq_s,  "Net Liq")}
+    </div>
+  </div>
+</div>""", unsafe_allow_html=True)
 
         # ── PROBABILITY ROW — 1D + three forward horizons ──
         st.markdown(f"{sec_hdr('DIRECTIONAL SIGNAL — BY HORIZON')}", unsafe_allow_html=True)

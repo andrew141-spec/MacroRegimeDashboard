@@ -238,6 +238,10 @@ def render_dashboard():
 
     # ── 1-DAY MODEL ──────────────────────────────────────────────────────
     vix_level = float(vix.dropna().iloc[-1]) if vix.dropna().size else 20.0
+    # Fetch live intraday signals via Schwab if connected
+    _schwab_client_1d = get_schwab_client()
+    _intraday = get_intraday_signals(_schwab_client_1d) if _schwab_client_1d else {}
+
     prob_1d = compute_1d_prob(
         gex_state=gex_state,
         spot=spot,
@@ -255,6 +259,7 @@ def render_dashboard():
         idx=idx,
         sahm_rule=sahm_rule,
         hy_spread=hy_spread,
+        intraday_signals=_intraday,
     )
     session = get_session_context()
     # vix_level already computed above in 1D model block
@@ -346,6 +351,8 @@ def render_dashboard():
         if sahm_on: warning_tags += "<span style='background:rgba(239,68,68,0.15);color:#ef4444;border-radius:4px;padding:1px 6px;font-size:9px;margin-left:6px;'>SAHM TRIGGERED</span>"
         if hy_lvl > 600: warning_tags += "<span style='background:rgba(239,68,68,0.15);color:#ef4444;border-radius:4px;padding:1px 6px;font-size:9px;margin-left:6px;'>HY STRESS</span>"
         if not sess_ok: warning_tags += "<span style='background:rgba(156,163,175,0.15);color:rgba(255,255,255,0.4);border-radius:4px;padding:1px 6px;font-size:9px;margin-left:6px;'>THIN SESSION</span>"
+        if prob_1d.get("using_intraday"): warning_tags += "<span style='background:rgba(6,182,212,0.15);color:#06b6d4;border-radius:4px;padding:1px 6px;font-size:9px;margin-left:6px;'>LIVE</span>"
+        if session.get("is_fed_blackout"): warning_tags += "<span style='background:rgba(245,158,11,0.15);color:#f59e0b;border-radius:4px;padding:1px 6px;font-size:9px;margin-left:6px;'>FED BLACKOUT</span>"
 
         lo1d_h = prob_1d.get("lo_1d", p1d_hero - 15)
         hi1d_h = prob_1d.get("hi_1d", p1d_hero + 15)
@@ -534,6 +541,31 @@ def render_dashboard():
         st.markdown("<hr/>", unsafe_allow_html=True)
 
         # ── GEX SNAPSHOT ──
+        # OI staleness assessment
+        import datetime as _dt_gex
+        _now_et = _dt_gex.datetime.now(_dt_gex.timezone.utc).astimezone(
+            _dt_gex.timezone(_dt_gex.timedelta(hours=-4)))
+        _h = _now_et.hour
+        _dow = _now_et.weekday()
+        if _dow >= 5:
+            _oi_msg, _oi_col = "Weekend — OI from Friday close", "var(--yellow)"
+        elif _h < 8:
+            _oi_msg, _oi_col = "Pre-OCC publish — OI from yesterday (~23h old)", "var(--orange)"
+        elif _h < 9:
+            _oi_msg, _oi_col = "OCC published — fresh OI", "var(--green)"
+        else:
+            _oi_msg, _oi_col = "Current trading day OI", "var(--green)"
+
+        _blackout = session.get("is_fed_blackout", False)
+        _blackout_badge = " · 🔇 <b>Fed Blackout</b> (no jawboning, GEX levels dominant)" if _blackout else ""
+
+        st.markdown(
+            f"<div style='font-family:monospace;font-size:9px;color:rgba(255,255,255,0.45);"
+            f"margin-bottom:4px;'>"
+            f"OI: <span style='color:{_oi_col};'>{_oi_msg}</span>"
+            f"{_blackout_badge}</div>",
+            unsafe_allow_html=True
+        )
         st.markdown(f"{sec_hdr('GAMMA EXPOSURE · ' + gex_state.regime.value + ' · ' + gex_state.timestamp)}", unsafe_allow_html=True)
 
         if gex_stale:
@@ -658,14 +690,19 @@ def render_dashboard():
         mat = pd.DataFrame([[1,2],[3,4]],index=["Inflation ↓","Inflation ↑"],columns=["Growth ↓","Growth ↑"])
         fig_mat = px.imshow(mat, text_auto=False, aspect="auto",
                             color_continuous_scale=[[0,"#10b981"],[0.33,"#f59e0b"],[0.66,"#f97316"],[1,"#ef4444"]])
-        # Regime map: dot shows current quadrant (0=left/bottom, 1=right/top)
-        _gz = float(growth_z.dropna().iloc[-1]) if growth_z.dropna().size else 0.0
-        _iz = float(infl_z.dropna().iloc[-1])   if infl_z.dropna().size   else 0.0
+        # Regime map dot — use ABSOLUTE thresholds matching classify_macro_regime_abs()
+        # so the dot position always agrees with the text regime label.
+        # z-scores were shifting the dot based on lookback window, not economic reality.
+        _growth_pos = 1 if curve_raw_latest > 0 else 0      # right col = Growth ↑ (uninverted curve)
+        _infl_high  = 1 if core_yoy_latest  > 3.0 else 0   # bottom row = Inflation ↑ (>3% core CPI)
         fig_mat.add_trace(go.Scatter(
-            x=[0 if _gz < 0 else 1],
-            y=[1 if _iz < 0 else 0],   # imshow: row 0 = top (Inflation↓), row 1 = bottom (Inflation↑)
+            x=[_growth_pos],
+            y=[_infl_high],
             mode="markers",
-            marker=dict(size=20, symbol="x", color="white", line=dict(width=3, color="white")),
+            marker=dict(size=22, symbol="x", color="white", line=dict(width=3, color="white")),
+            hovertemplate=(f"Growth: {'↑ Uninverted' if _growth_pos else '↓ Inverted'}<br>"
+                           f"Inflation: {'↑ Elevated (>{3}%)' if _infl_high else '↓ Below 3%'}<br>"
+                           f"Curve: {curve_raw_latest:.0f}bp · Core CPI: {core_yoy_latest:.1f}%"),
         ))
         fig_mat.update_coloraxes(showscale=False)
         ml2.plotly_chart(plotly_dark(fig_mat,"Regime Map",270), use_container_width=True)

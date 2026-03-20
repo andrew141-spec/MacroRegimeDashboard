@@ -694,7 +694,13 @@ def render_gex_engine():
             source   = "Schwab API (live IV)"
             if chain_df is not None and len(chain_df) > 0:
                 spot_live = schwab_get_spot(client, symbol)
-                spot = spot_live if (spot_live and spot_live > 0) else float(chain_df["strike"].median())
+                if spot_live and spot_live > 0:
+                    spot = spot_live
+                else:
+                    # get_quote failed — use last known spot rather than strike median
+                    # (median of strikes can be $5-10 off actual price)
+                    last_known = float(st.session_state.get("_last_known_spot", 0))
+                    spot = last_known if last_known > 0 else float(chain_df["strike"].median())
                 st.success(f"Schwab connected — live IV · {symbol} · ${spot:.2f}")
             else:
                 err = st.session_state.get("_schwab_chain_error", "unknown error")

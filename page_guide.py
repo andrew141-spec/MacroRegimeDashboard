@@ -58,11 +58,7 @@ def render_probability_page():
 
     SIGNAL_LABELS = {
         "vix_ts_pct":           "VIX Term Structure (VIX/VIX3M slope)",
-        "vix_ts_regime":        "Vol TS Regime",
-        "corr_regime":          "Cross-Asset Correlation Regime",
         "corr_regime_pct":      "Correlation Stress Signal",
-        "spy_hyg_corr":         "SPY↔HYG Correlation (21D)",
-        "spy_tlt_corr":         "SPY↔TLT Correlation (21D)",
         "breadth_pct":          "Market Breadth (IWM/QQQ momentum)",
         "dxy_5d_pct":           "DXY 5D Momentum [5D]",
         "hyg_lqd_pct":          "HYG/LQD Ratio [21D]",
@@ -79,13 +75,19 @@ def render_probability_page():
     }
 
     pcts = [(label, leading.get(key)) for key, label in SIGNAL_LABELS.items()]
-    pcts = [(label, val) for label, val in pcts if val is not None]
+    # Only keep numeric values that can be plotted as percentile bars (0-100 range)
+    pcts = [(label, float(val)) for label, val in pcts
+            if val is not None and isinstance(val, (int, float))
+            and not __import__("math").isnan(float(val))
+            and 0.0 <= float(val) <= 100.0]
 
     if not pcts:
         st.warning("No signal data available yet. Check data sources.")
         return
 
     def _bar_colour(v):
+        try: v = float(v)
+        except (TypeError, ValueError): return "#6b7280"
         if v > 65:   return "#10b981"
         elif v > 55: return "#34d399"
         elif v > 45: return "#f59e0b"

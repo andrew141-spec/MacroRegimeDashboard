@@ -170,7 +170,7 @@ def load_macro(start_iso, end_iso):
 
     # ── Existing series (keep) ────────────────────────────────────────────
     for sid in ["DGS3MO","DGS2","DGS10","DGS30",
-                "CPIAUCSL","CPILFESL","UNRATE","WALCL","WTREGEN","RRPONTSYD","M2SL","NFCI"]:
+                "CPIAUCSL","CPILFESL","UNRATE","WALCL","WTREGEN","RRPONTSYD","M2SL","NFCI","BAMLH0A0HYM2"]:
         try:    out[sid] = fs(sid)
         except: out[sid] = pd.Series(dtype=float)
     try:    out["ICSA"] = fs("ICSA")
@@ -206,6 +206,14 @@ def load_macro(start_iso, end_iso):
     # GDPC1: quarterly real GDP, will be interpolated to daily
     try:    out["GDPC1"] = fs("GDPC1")
     except: out["GDPC1"] = pd.Series(dtype=float)
+
+    # ── Derived: Sahm Rule ────────────────────────────────────────────────
+    # 3-month avg UNRATE minus 12-month minimum — triggers recession signal at >= 0.50
+    if "UNRATE" in out and not out["UNRATE"].empty:
+        ur = out["UNRATE"]
+        out["SAHM_RULE"] = ur.rolling(3, min_periods=2).mean() - ur.rolling(12, min_periods=6).min()
+    else:
+        out["SAHM_RULE"] = pd.Series(dtype=float)
 
     # ── Market series (keep + no change) ─────────────────────────────────
     idx = pd.date_range(start, end, freq="D")

@@ -88,16 +88,17 @@ def compute_gex_from_chain(chain: pd.DataFrame, spot: float,
         and (chain["schwab_gamma"].abs() > 0).any()
     )
     if has_schwab_gamma:
-        # Use Schwab gamma where non-zero, fill gaps with BS
-        chain["gamma"] = chain.apply(
-            lambda row: (
-                abs(float(row["schwab_gamma"]))
-                if ("schwab_gamma" in row.index
-                    and np.isfinite(float(row["schwab_gamma"]))
-                    and abs(float(row["schwab_gamma"])) > 0)
-                else bs_gamma(spot, row["strike"], row["expiry_T"], row["iv"], r)
-            ), axis=1
+        # Schwab gamma is always positive (it's the absolute rate of delta change).
+        # Sign is handled downstream via call_oi (+) and put_oi (-) convention.
+        # Use vectorised operation for performance instead of row-wise apply.
+        bs_g = chain.apply(
+            lambda row: bs_gamma(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
+        schwab_valid = (
+            chain["schwab_gamma"].notna() &
+            chain["schwab_gamma"].apply(np.isfinite) &
+            (chain["schwab_gamma"] > 0)
         )
+        chain["gamma"] = np.where(schwab_valid, chain["schwab_gamma"], bs_g)
     else:
         chain["gamma"] = chain.apply(
             lambda row: bs_gamma(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)

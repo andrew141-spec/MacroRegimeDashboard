@@ -228,6 +228,37 @@ def schwab_complete_auth(client_id: str, client_secret: str,
         return False, f"{type(e).__name__}: {e}"
 
 
+
+
+def get_intraday_signals(client, symbols: list = None) -> dict:
+    """
+    Fetch current session % change for key cross-asset signals via Schwab quotes.
+    Returns dict of {SYM_pct: float, SYM_price: float}.
+    Used to make compute_1d_prob genuinely intraday-aware rather than one-day-lagged.
+    Call every 60-90 seconds during market hours.
+    """
+    if client is None:
+        return {}
+    if symbols is None:
+        symbols = ["SPY", "HYG", "LQD", "UUP", "QQQ", "IWM", "TLT"]
+    
+    out = {}
+    try:
+        # Batch quote request — one API call for all symbols
+        resp = client.get_quotes(symbols)
+        if resp.status_code != 200:
+            return {}
+        data = resp.json()
+        for sym in symbols:
+            q = data.get(sym, {}).get("quote", {})
+            pct  = float(q.get("netPercentChangeInDouble", 0) or 0) / 100.0
+            last = float(q.get("lastPrice", 0) or q.get("mark", 0) or 0)
+            out[f"{sym}_pct"]   = pct
+            out[f"{sym}_price"] = last
+    except Exception:
+        pass
+    return out
+
 def schwab_get_spot(client, symbol: str = "SPY") -> Optional[float]:
     symbol = symbol.strip().upper()
     """Get current quote from Schwab API."""

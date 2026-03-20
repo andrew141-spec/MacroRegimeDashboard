@@ -253,9 +253,33 @@ def build_gamma_state(chain: pd.DataFrame, spot: float, source: str = "yfinance"
     gex_chain = compute_gex_from_chain(chain, spot)
     flip = find_gamma_flip(gex_chain)
     regime, dist, stability = classify_gex_regime(spot, flip)
-    by_strike = dict(zip(gex_chain["strike"].tolist(), gex_chain["net_gex"].tolist()))
-    top_support    = gex_chain[gex_chain["net_gex"] < 0].nsmallest(5, "net_gex")["strike"].tolist()
-    top_resistance = gex_chain[gex_chain["net_gex"] > 0].nlargest(5, "net_gex")["strike"].tolist()
+
+    # Aggregate net_gex BY STRIKE (sum across all expirations) before computing
+    # support/resistance levels and the by_strike dict.
+    # The raw gex_chain has one row per (strike, expiry) — using it directly
+    # causes the same strike to appear multiple times in top_support/resistance,
+    # and by_strike only gets the last expiry's value instead of the total.
+    agg = (gex_chain.groupby("strike")["net_gex"]
+                    .sum()
+                    .reset_index()
+                    .sort_values("strike"))
+
+    by_strike = dict(zip(agg["strike"].tolist(), agg["net_gex"].tolist()))
+
+    # Positive GEX strikes above spot = resistance walls (dealers sell into rallies)
+    pos_above = agg[(agg["net_gex"] > 0) & (agg["strike"] > spot)]
+    top_resistance = pos_above.nlargest(5, "net_gex")["strike"].tolist()
+
+    # Negative GEX strikes below spot = support zones (dealers amplify falls)
+    neg_below = agg[(agg["net_gex"] < 0) & (agg["strike"] < spot)]
+    top_support = neg_below.nsmallest(5, "net_gex")["strike"].tolist()
+
+    # Fallback: if no pos/neg on the correct side, use all pos/neg strikes
+    if not top_resistance:
+        top_resistance = agg[agg["net_gex"] > 0].nlargest(5, "net_gex")["strike"].tolist()
+    if not top_support:
+        top_support = agg[agg["net_gex"] < 0].nsmallest(5, "net_gex")["strike"].tolist()
+
     return GammaState(
         regime=regime, gamma_flip=float(flip) if np.isfinite(flip) else 0.0,
         distance_to_flip_pct=dist, total_gex=float(gex_chain["net_gex"].sum()),

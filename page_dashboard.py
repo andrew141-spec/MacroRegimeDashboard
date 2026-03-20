@@ -172,7 +172,7 @@ def render_dashboard():
     # ── GEX ──
     chain_df, spot, gex_source = get_gex_from_yfinance(gex_symbol)
     if chain_df is not None:
-        gex_state = build_gamma_state(chain_df, spot, gex_source)
+        gex_state = build_gamma_state(chain_df, spot, gex_source, max_dte=45)
         st.session_state["_last_good_gex"] = {
             "state": gex_state,
             "spot":  spot,

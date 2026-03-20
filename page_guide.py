@@ -53,10 +53,17 @@ def render_probability_page():
         tips_10y=tips_10y, bank_reserves=bank_reserves,
         bank_credit=bank_credit, ism_no=ism_no,
         gdp_quarterly=gdp_quarterly, mmmf=mmmf,
+        unrate=unrate, hy_spread=hy_spread_raw,
     )
 
     SIGNAL_LABELS = {
-        "vix_ts_pct":           "VIX Term Structure [5D]",
+        "vix_ts_pct":           "VIX Term Structure (VIX/VIX3M slope)",
+        "vix_ts_regime":        "Vol TS Regime",
+        "corr_regime":          "Cross-Asset Correlation Regime",
+        "corr_regime_pct":      "Correlation Stress Signal",
+        "spy_hyg_corr":         "SPY↔HYG Correlation (21D)",
+        "spy_tlt_corr":         "SPY↔TLT Correlation (21D)",
+        "breadth_pct":          "Market Breadth (IWM/QQQ momentum)",
         "dxy_5d_pct":           "DXY 5D Momentum [5D]",
         "hyg_lqd_pct":          "HYG/LQD Ratio [21D]",
         "smallcap_pct":         "Small-Cap Leadership [21D]",

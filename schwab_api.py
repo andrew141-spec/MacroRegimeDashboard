@@ -368,6 +368,7 @@ def schwab_get_options_chain(client, symbol: str = "SPY",
                     iv=("iv", "mean"),
                     call_oi=("call_oi", "sum"),
                     put_oi=("put_oi", "sum"),
+                    schwab_gamma=("schwab_gamma", "mean"),
                 )
                 .reset_index())
         return df

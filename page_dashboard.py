@@ -74,6 +74,8 @@ def render_dashboard():
         ism_no        = ism_no_raw if len(ism_no_raw.dropna()) > 4 else None
         gdp_quarterly = r("GDPC1")
         mmmf          = r("WRMFSL")
+        sahm_rule     = resample_ffill(raw.get("SAHM_RULE", pd.Series(dtype=float)), idx)
+        hy_spread     = resample_ffill(raw.get("BAMLH0A0HYM2", pd.Series(dtype=float)), idx)
 
     # ── DERIVED ──
     core_yoy = (core/core.shift(365)-1)*100
@@ -240,8 +242,8 @@ def render_dashboard():
         fear_score=fear_score,
         session=get_session_context(),
         idx=idx,
-        sahm_rule=macro.get("SAHM_RULE"),
-        hy_spread=macro.get("BAMLH0A0HYM2"),
+        sahm_rule=sahm_rule,
+        hy_spread=hy_spread,
     )
     session = get_session_context()
     # vix_level already computed above in 1D model block

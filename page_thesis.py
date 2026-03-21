@@ -8,7 +8,7 @@ import plotly.graph_objects as go
 import yfinance as yf
 from scipy.stats import skew as _scipy_skew, kurtosis as _scipy_kurt
 
-from config import GammaState, GammaRegime, CSS
+from config import GammaState, GammaRegime, CSS, REGIME_OPERATIONAL_LABEL
 from utils import _to_1d, zscore, resample_ffill, current_pct_rank
 from ui_components import plotly_dark
 from data_loaders import load_macro, get_gex_from_yfinance
@@ -194,14 +194,23 @@ def _ivsurf_from_chain(chain_df, spot: float, label: str,
     if chain_df is None or len(chain_df) == 0:
         fig = go.Figure()
         plotly_dark(fig, title=f"IV Surface — {label} (DATA UNAVAILABLE)", height=420)
+        if label in ("NDX", "QQQ"):
+            msg = (
+                "<b>No NDX/QQQ options chain data available.</b><br>"
+                "Set GEX Symbol to QQQ or NDX to load this surface.<br>"
+                "When a different underlying is selected, NDX surface<br>"
+                "is intentionally left blank to avoid mislabelled data."
+            )
+        else:
+            msg = (
+                f"<b>No {label} options chain data available.</b><br>"
+                "Data loads automatically via yfinance (no login needed)<br>"
+                "or from Schwab/TOS if connected. If this persists,<br>"
+                "check your internet connection or try refreshing."
+            )
         fig.add_annotation(
             x=0.5, y=0.5, xref="paper", yref="paper",
-            text=(
-                "<b>No options chain data available.</b><br>"
-                "Connect Schwab/TOS or wait for yfinance data.<br>"
-                "A parametric model surface is NOT shown here<br>"
-                "because it would misrepresent actual skew conditions."
-            ),
+            text=msg,
             showarrow=False, font=dict(color="rgba(255,255,255,0.6)", size=13),
             align="center",
         )
@@ -712,9 +721,12 @@ def render_thesis_page():
     vz=zscore(vix_s.fillna(20)); nz=zscore(nfci.fillna(0))
     inv=(s2s10<0).astype(int); lt=(nl4w<0).astype(int)
     fear_raw=0.45*vz+0.35*nz+0.10*inv+0.10*lt
-    fear=float(((fear_raw.iloc[-1]+2)/4).clip(0,1)*100)
+    fear=float(((fear_raw.iloc[-1]+2)/4).clip(0,1)*100)   # 0-100 for dashboard/signals compat
+    fear_z=float(fear_raw.iloc[-1])                        # raw z-score for thesis display
     vl=_sl(vix_s,20.0); sahmv=_sl(sahm,0.0) if sahm is not None else 0.0
-    hyv=_sl(hys,300.0) if hys is not None else 300.0
+    # BAMLH0A0HYM2 from FRED is in percent (3.20 = 320bp). Multiply by 100
+    # to convert to basis points before any comparisons or display.
+    hyv=_sl(hys,3.0)*100 if hys is not None else 300.0
     ur=_sl(unrate,4.0); cyi=_sl(cpi_yoy,2.5); gzv=_sl(gz,0.0); izv=_sl(iz,0.0)
     nl4wv=_sl(nl4w,0.0)
     liq_lab="Expanding" if nl4wv>=0 else "Contracting"
@@ -729,7 +741,7 @@ def render_thesis_page():
     u3m = icsa_4w_chg  # keep u3m alias for fp formula below (unrate direction proxy)
     warsh=((y10.diff(20)<0)&(bs13<0)).astype(int)
     spydd=(spy/spy.rolling(126).max()-1).fillna(0)
-    tp=float(np.clip(45+35*float(spydd.iloc[-1]<=-0.07)+20*(fear>60),0,100))
+    tp=float(np.clip(45+35*float(spydd.iloc[-1]<=-0.07)+20*(fear_z>1.0),0,100))
     fp=float(np.clip(55+25*float((y10_20.iloc[-1]<0)and(u3m>0))-10*float((cyl-3.0)>0)-15*float(warsh.iloc[-1]),0,100))
     tgadd=(tga.diff(28)<0).astype(int); rrpd=(rrp<50).astype(int)
     trp=float(np.clip(50+20*float(tgadd.iloc[-1])+15*float(rrpd.iloc[-1])+15*float(nl4w.iloc[-1]>=0),0,100))
@@ -742,7 +754,12 @@ def render_thesis_page():
     sr=_to_1d(spy).reindex(idx).ffill().pct_change().dropna()
     tr2=_to_1d(tlt).reindex(idx).ffill().pct_change().reindex(sr.index).dropna()
     stlc=round(float(sr.rolling(21).corr(tr2).dropna().iloc[-1]),3) if sr.dropna().size>21 else float("nan")
-    cpi_now=round(float(cpi.pct_change(21).dropna().iloc[-1])*100,3) if cpi.pct_change(21).dropna().size else float("nan")
+    # CPI MoM: use raw monthly FRED series (pct_change(1) = month-over-month).
+    # Do NOT use the daily-ffilled `cpi` series — pct_change(21) on a ffilled
+    # monthly series returns 0 on almost every day because the value is flat
+    # between FRED releases. The raw series has one observation per month.
+    _cpi_raw = raw.get("CPIAUCSL", pd.Series(dtype=float)).dropna()
+    cpi_now = round(float(_cpi_raw.pct_change(1).dropna().iloc[-1]) * 100, 3) if len(_cpi_raw) > 1 else float("nan")
     rd=_retdist(spy,idx,0)
 
     with st.spinner("Fetching live quotes…"):
@@ -789,8 +806,9 @@ def render_thesis_page():
     upper=gex_st.key_resistance[0] if gex_st.key_resistance else gex_spot*1.03
     lower=gex_st.key_support[0] if gex_st.key_support else gex_spot*0.97
     gex_reg=gex_st.regime.value if hasattr(gex_st.regime,"value") else str(gex_st.regime)
-    gex_rc=("#ef4444" if "NEGATIVE" in gex_reg.upper()
-            else "#10b981" if "POSITIVE" in gex_reg.upper() else "#f59e0b")
+    gex_op_label=REGIME_OPERATIONAL_LABEL.get(gex_st.regime, gex_reg)  # e.g. DEALERS_SELL_RALLIES
+    gex_rc=("#ef4444" if "NEGATIVE" in gex_reg.upper() or "SELL" in gex_op_label
+            else "#10b981" if "POSITIVE" in gex_reg.upper() or "BUY" in gex_op_label else "#f59e0b")
     gwas_a=gwas.get("gwas_above") if gwas else None
     gwas_b=gwas.get("gwas_below") if gwas else None
     dur=tstr.get("durability","N/A").upper() if tstr else "N/A"
@@ -827,13 +845,13 @@ def render_thesis_page():
     um=40.0 if ua=="NQ" else 10.0
     def _ua(p): return f"{p*um:,.0f}"
     reg_col={"Goldilocks":"#10b981","Overheating":"#f59e0b","Stagflation":"#ef4444","Deflation":"#6366f1"}.get(macro_reg,"#94a3b8")
-    fl2="ELEVATED" if fear>60 else "MODERATE" if fear>40 else "LOW"
-    fc="#ef4444" if fear>60 else "#f59e0b" if fear>40 else "#10b981"
+    fl2="ELEVATED" if fear_z>1.0 else "MODERATE" if fear_z>0.0 else "COMPLACENT" if fear_z<-1.0 else "LOW"
+    fc="#ef4444" if fear_z>1.0 else "#f59e0b" if fear_z>0.0 else "#10b981"
 
     # ── 1. MARKET REGIME ──────────────────────────────────────────────────
     hdr=(f"<div style='display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px;'>"
          +_pill(f"Market Regime: {macro_reg}",reg_col)
-         +_pill(f"Fear Level: {fl2} ({fear:.2f})",fc)
+         +_pill(f"Fear Level: {fl2} ({fear_z:+.2f}σ)",fc)
          +_pill(f"Liquidity: {liq_lab} (${abs(nl4wv):.0f}B)","#10b981" if nl4wv>=0 else "#ef4444")
          +_pill(f"Recession P(6m): {rec:.1f}%","#ef4444" if rec>50 else "#f59e0b" if rec>30 else "#10b981")
          +"</div>")
@@ -903,7 +921,7 @@ def render_thesis_page():
            +_kv("GEX Lower",f"{lower*_g3_mult:,.2f}","#ef4444")
            +_kv("GWAS Above",f"{gwas_a*_g3_mult:,.2f}" if gwas_a else "N/A","#6366f1")
            +_kv("GWAS Below",f"{gwas_b*_g3_mult:,.2f}" if gwas_b else "N/A","#6366f1")
-           +_kv("GEX Regime",gex_reg,gex_rc)
+           +_kv("GEX Regime",gex_op_label,gex_rc)
            +"</div>")
     gright=("<div>"
             +"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>OPTIONS FLOW</div>"
@@ -926,7 +944,7 @@ def render_thesis_page():
               +gleft+gright+"</div>"
               +f"<div style='margin-top:10px;border-top:1px solid rgba(255,255,255,0.08);padding-top:8px;"
               +f"font-size:12px;color:rgba(255,255,255,0.65);font-style:italic;'>"
-              +f"<span style='color:{gex_rc};font-weight:700;'>{gex_reg}</span> — {narr}</div>")
+              +f"<span style='color:{gex_rc};font-weight:700;'>{gex_op_label}</span> — {narr}</div>")
     st.markdown(_card(gex_body),unsafe_allow_html=True)
 
     # ── 3b. GEX HISTOGRAM ────────────────────────────────────────────────
@@ -995,7 +1013,7 @@ def render_thesis_page():
          +_kv("CPI Nowcast",f"{cpi_now:+.3f}% MoM" if np.isfinite(cpi_now) else "N/A")
          +"</div><div>"
          +_kv("Unemployment",f"{ur:.1f}%")
-         +_kv("HY OAS",f"{hyv:.2f}","#ef4444" if hyv>450 else "#94a3b8")
+         +_kv("HY OAS",f"{hyv:.0f}bp","#ef4444" if hyv>450 else "#f59e0b" if hyv>350 else "#94a3b8")
          +_kv("SPY-TLT Corr",f"{stlc:.3f}" if np.isfinite(stlc) else "N/A",
               "#ef4444" if (np.isfinite(stlc) and stlc>0.2) else "#94a3b8")
          +_kv("Sahm Rule",f"{sahmv:.3f}",
@@ -1011,7 +1029,7 @@ def render_thesis_page():
     vp=np.isfinite(vrp["val"]) and vrp["val"]>0
     vs2=f"{vrp['val']:+.4f}" if np.isfinite(vrp["val"]) else "N/A"
     sigs=(_sig("✅" if vp else "⚠️",f"VRP {'positive' if vp else 'negative'} ({vs2})")
-          +_sig("⚠️" if fear>55 else "✅",f"Fear composite {fl2}")
+          +_sig("⚠️" if fear_z>0.5 else "✅",f"Fear composite {fl2} ({fear_z:+.2f}σ)")
           +_sig("🔴" if rec>60 else "🟡" if rec>35 else "🟢",
                 f"Recession risk {'elevated' if rec>60 else 'moderate' if rec>35 else 'low'} ({rec:.1f}%)"))
     # Convert GEX levels to SPX scale for display (GEX symbol may be SPY=1/10 SPX)
@@ -1028,10 +1046,10 @@ def render_thesis_page():
          +_kv("1σ Weekly",f"{b['w1lo']:,.2f} — {b['w1hi']:,.2f}")
          +_kv("2σ Weekly",f"{b['w2lo']:,.2f} — {b['w2hi']:,.2f}"))
     risks=[]
-    if fear>60: risks.append(("⚠️","Elevated fear composite — potential for sharp moves"))
+    if fear_z>1.0: risks.append(("⚠️","Elevated fear composite — potential for sharp moves"))
     if rec>50: risks.append(("⚠️",f"Recession probability at {rec:.1f}% — monitor labor data"))
     if np.isfinite(stlc) and stlc>0.2: risks.append(("⚠️","Positive stock-bond correlation — diversification impaired"))
-    if "NEGATIVE" in gex_reg.upper(): risks.append(("🔴","Negative gamma regime — dealer hedging amplifies moves. No fading."))
+    if "SELL" in gex_op_label or "NEGATIVE" in gex_reg.upper(): risks.append(("🔴","Negative gamma regime — dealer hedging amplifies moves. No fading."))
     if dur=="FRAGILE": risks.append(("⚠️",f"GEX regime fragile — {frag:.0f}% of gamma ≤7 DTE. Levels expire by Friday."))
     if leading.get("corr_regime") in ("STRESS","SYSTEMIC"): risks.append(("🔴",f"Cross-asset correlation: {leading.get('corr_regime')} — credit leading equity lower"))
     if vts["shape"]=="BACKWARDATION": risks.append(("⚠️","VIX backwardation — near-term stress priced above medium-term"))
@@ -1086,7 +1104,7 @@ def render_thesis_page():
             +_gl("Probability Heatmap","Monte Carlo using Merton jump-diffusion. Shows probability of SPX reaching each price level over next week.")
             +_gl("GEX Histogram","Gamma per strike. Green = positive (dealers stabilize). Red = negative (dealers amplify).")
             +_gl("IV vs RV Chart","VIX overlaid with 21D realized vol. VRP spread: green = IV premium (sell vol), red = IV discount (buy protection).")
-            +_gl("Fear Composite","VIX z-score + NFCI + curve inversion + liquidity tightening. >60 = elevated fear.")),unsafe_allow_html=True)
+            +_gl("Fear Composite","VIX z-score + NFCI + curve inversion + liquidity tightening. Reported as σ from mean. >+1.0σ = elevated fear. <−1.0σ = complacency.")),unsafe_allow_html=True)
 
     st.markdown(
         f"<div style='text-align:center;font-size:10px;color:rgba(255,255,255,0.2);margin-top:16px;'>"

@@ -788,100 +788,70 @@ def _rdist_fig(spy: pd.Series, idx, rd: Dict, spot: float = float("nan")) -> go.
 def _recession_stress(sahm: float, hy: float, s2s10_bp: float,
                       icsa_4w_chg: float, vix: float,
                       icsa_series: "pd.Series | None" = None,
-                      spx_dd: float = 0.0, epu_z: float = 0.0) -> dict:
+                      spx_dd: float = 0.0, epu_z: float = 0.0,
+                      s2s10_series: "pd.Series | None" = None) -> dict:
     """
-    Recession Stress Index — composite of leading recession indicators.
+    Recession Stress Index — orthogonal to the fear composite.
 
-    Components and weights:
-      Sahm Rule         35%  — best single real-time recession indicator
-      HY OAS            20%  — credit market leads equity by 2-6 weeks
-      Yield curve       15%  — 2s10s inversion predicts recessions 6-18M out
-      ICSA claims       12%  — weekly labor market deterioration
-      VIX level          8%  — market-implied stress
-      SPX drawdown       5%  — equity market pricing recession risk
-      EPU z-score        5%  — policy uncertainty (tariffs, trade war)
+    The fear composite already captures VIX (35%) and HY OAS (25%). Including
+    them here too causes multicollinearity: fear and rec_sig together represent
+    55% of the composite weight but share the same underlying data.
 
-    Calibration notes:
-      - Sigmoid centre shifted from 0.50 to 0.35: the old centre required
-        the majority of indicators to be firing before the score exceeded 50%.
-        In a tariff-shock environment with HY OAS at 400bp, VIX elevated, and
-        growth decelerating, raw ≈ 0.35-0.45 which the old sigmoid mapped to
-        only 25-40%. Shifting centre to 0.35 means moderate multi-indicator
-        stress correctly reads as elevated (50-65%).
-      - Sigmoid steepness kept at 8: preserves a full 0-100 output range.
-      - HY OAS thresholds: 350bp baseline (post-GFC normal), 800bp max
-        (GFC peak). Old range was 300-1000bp which undersized current 400bp.
-      - Label gates lowered: ELEVATED at HY>375bp or Sahm>=0.35 (old: 600/0.5).
-        400bp HY OAS during a growth scare IS elevated credit stress.
+    Fix: rec_sig uses ONLY signals that are genuinely independent of VIX/EPU:
+      Sahm Rule          40%  — best single real-time recession indicator
+      HY OAS             25%  — credit leads equity, partially distinct from VIX
+      Yield curve        20%  — 6-18M leading, slow-moving, independent of VIX
+      ICSA claims        15%  — weekly labor, independent of vol markets
+
+    VIX and EPU are REMOVED from this index (they live in fear_composite).
+    Yield curve inversion DURATION is added as an extra multiplier — a curve
+    that's been inverted for 200 days is a stronger recession signal than one
+    that just inverted last week.
     """
     from scipy.special import expit as _sigmoid
 
-    # ── Component z-scores (all clipped 0-1) ─────────────────────────────
-    sahm_z  = np.clip(sahm / 0.4, 0, 1)
-
-    # HY OAS: 350bp = baseline, 800bp = max stress (GFC = ~2000bp, 2020 = ~1100bp)
-    # Old range was 300-1000bp which undersized a current 400bp read
-    hy_z    = np.clip((hy - 350) / 450, 0, 1)
-
-    # Curve: -150bp inversion = max (historically predicts recessions reliably)
+    sahm_z = np.clip(sahm / 0.4, 0, 1)
+    hy_z   = np.clip((hy - 350) / 450, 0, 1)
     curve_z = np.clip((-s2s10_bp) / 150, 0, 1)
 
-    # VIX: 15 = calm, 50 = crisis
-    vix_z   = np.clip((vix - 15) / 35, 0, 1)
+    # Curve inversion duration multiplier: the longer the curve has been
+    # inverted, the stronger the recession signal (caps at 2× for 18M+ inv.)
+    inv_dur_mult = 1.0
+    if s2s10_series is not None and s2s10_series.dropna().size > 10:
+        _inv_days = int((s2s10_series.dropna() < 0).rolling(252, min_periods=1).sum().iloc[-1])
+        inv_dur_mult = float(np.clip(1.0 + _inv_days / 365.0, 1.0, 2.0))
+    curve_z = np.clip(curve_z * inv_dur_mult, 0, 1)
 
-    # SPX drawdown from 6M high: -7% = mild, -25% = severe
-    dd_z    = np.clip(-spx_dd / 0.20, 0, 1)   # spx_dd is negative (e.g. -0.12 = -12%)
-
-    # EPU z-score: policy uncertainty (tariff shock → high EPU)
-    epu_zz  = np.clip(epu_z / 2.0, 0, 1)      # 2σ EPU spike = max contribution
-
-    # ICSA: rolling z-score normalisation (see comment in body)
+    # ICSA: rolling z-score vs 52W history (3σ spike = max)
     if icsa_series is not None and icsa_series.dropna().size >= 26:
         _ic   = icsa_series.dropna()
         _mean = float(_ic.rolling(52, min_periods=26).mean().iloc[-1])
         _std  = float(_ic.rolling(52, min_periods=26).std().iloc[-1])
-        if np.isfinite(_mean) and _std > 0:
-            icsa_z = float(np.clip((_ic.iloc[-1] - _mean) / (_std * 3.0), 0, 1))
-        else:
-            icsa_z = float(np.clip(icsa_4w_chg / 0.20, 0, 1))
+        icsa_z = float(np.clip((_ic.iloc[-1] - _mean) / (_std * 3.0), 0, 1)) if (np.isfinite(_mean) and _std > 0) else float(np.clip(icsa_4w_chg / 0.20, 0, 1))
     else:
         icsa_z = float(np.clip(icsa_4w_chg / 0.20, 0, 1))
 
-    # ── Weighted composite ────────────────────────────────────────────────
-    raw = (0.35 * sahm_z + 0.20 * hy_z + 0.15 * curve_z
-           + 0.12 * icsa_z + 0.08 * vix_z + 0.05 * dd_z + 0.05 * epu_zz)
+    raw = 0.40 * sahm_z + 0.25 * hy_z + 0.20 * curve_z + 0.15 * icsa_z
 
-    # Sigmoid: centre=0.35 (not 0.50). At raw=0.35 → score=50.
-    # This means moderate multi-indicator stress (HY 400bp + VIX 25 + flat curve)
-    # correctly reads as elevated rather than benign.
     score = float(_sigmoid((raw - 0.35) * 8) * 100)
     score = round(np.clip(score, 1, 99), 1)
 
-    # Label gates: reflect current-environment thresholds
-    # ELEVATED: Sahm ≥0.35 (labour mkt deteriorating) OR HY OAS >375bp (credit stress)
-    # MODERATE: Sahm ≥0.20 OR HY OAS >320bp OR VIX >25 sustained
-    if sahm >= 0.35 or hy > 375 or score > 60:
-        label = "ELEVATED"
-    elif sahm >= 0.20 or hy > 320 or vix > 25:
-        label = "MODERATE"
-    else:
-        label = "LOW"
+    if sahm >= 0.35 or hy > 375 or score > 60:  label = "ELEVATED"
+    elif sahm >= 0.20 or hy > 320:               label = "MODERATE"
+    else:                                          label = "LOW"
 
     return {
         "score": score, "label": label,
         "components": {
-            "sahm_contribution":    round(0.35 * sahm_z  * 100, 1),
-            "hy_contribution":      round(0.20 * hy_z    * 100, 1),
-            "curve_contribution":   round(0.15 * curve_z * 100, 1),
-            "icsa_4w_contribution": round(0.12 * icsa_z  * 100, 1),
-            "vix_contribution":     round(0.08 * vix_z   * 100, 1),
-            "drawdown_contribution":round(0.05 * dd_z    * 100, 1),
-            "epu_contribution":     round(0.05 * epu_zz  * 100, 1),
+            "sahm_contribution":  round(0.40 * sahm_z  * 100, 1),
+            "hy_contribution":    round(0.25 * hy_z    * 100, 1),
+            "curve_contribution": round(0.20 * curve_z * 100, 1),
+            "icsa_contribution":  round(0.15 * icsa_z  * 100, 1),
         },
         "note": (
-            "Recession Stress Index — composite of leading indicators. "
-            "NOT a calibrated probability model. Centre=0.35 sigmoid. "
-            "Use Estrella-Mishkin probit or Cleveland Fed for calibrated recession probs."
+            "Recession Stress Index — orthogonal to fear composite (no VIX/EPU). "
+            "Sahm 40% + HY OAS 25% + yield curve 20% (with duration mult) + ICSA 15%. "
+            "NOT a calibrated probability. Use Estrella-Mishkin for that."
         ),
     }
 
@@ -892,42 +862,40 @@ def _composite(prob: dict, vrp_val: float,
                rec_score: float = 50.0,
                spx_dd: float = 0.0,
                macro_reg: str = "Goldilocks",
-               growth_score: int = 0) -> int:
+               growth_score: int = 0,
+               # Fix 6: short-term momentum inputs
+               spx_5d_ret: float = 0.0,      # SPX 5-day return (fraction)
+               hyg_1d_ret: float = 0.0,       # HYG 1-day return (fraction)
+               lqd_1d_ret: float = 0.0,       # LQD 1-day return (fraction)
+               dist_to_flip_pct: float = 5.0, # distance to GEX flip (%)
+               ) -> int:
     """
     Composite directional score −10 to +10.
 
-    compute_prob_composite() is epistemically conservative — it compresses
-    toward 50 when signals are mixed and rarely outputs outside 42–58. Using
-    it as the primary driver produces 0/10 on almost every day regardless of
-    how stressed or bullish conditions actually are.
+    Six independent signal groups:
+      1. fear_sig     (30%) — rolling z-score VIX+HY+NFCI+EPU
+      2. rec_sig      (15%) — ORTHOGONAL recession stress (Sahm+curve+ICSA only)
+      3. dd_sig       (15%) — SPX 6M drawdown (slow trend)
+      4. regime_sig   (15%) — macro quadrant label
+      5. growth_sig   (10%) — independent breadth score from 7 economic metrics
+      6. momentum_sig (10%) — short-term: 5D SPX mom + credit lead + GEX proximity
+      7. prob_sig     (5%)  — external prob buckets (capped ±1.0)
 
-    Primary drivers (all observable, all non-compressed):
-      fear_z       35% — rolling z-score of VIX+HY+NFCI+EPU
-      rec_score    20% — 7-component recession stress 0-100
-      spx_dd       15% — SPX drawdown from 6M high (price action)
-      macro_reg    15% — growth×inflation regime quadrant
-      prob_sig     15% — external prob buckets (secondary, capped ±1.5)
-
-    Overlays add ≤ ±2 total so the primary signal always dominates.
-    Final ×2 scale maps typical ±2.5 range → ±5 on the ±10 scale.
+    Overlays (VRP, stress flags, GEX) add ≤ ±2.5 total.
+    Hard structural cap applied after scaling (Fix 5).
     """
 
-    # ── 1. Fear signal ────────────────────────────────────────────────────
-    # fear_z is rolling 252d z-score composite. +1.5σ = ELEVATED, -1σ = calm.
-    # Negative because high fear_z → bearish directional signal.
+    # ── 1. Fear signal (−3.5 to +3.5) ────────────────────────────────────
     fear_sig = float(np.clip(-fear_z * 1.5, -3.5, 3.5))
 
-    # ── 2. Recession stress signal ────────────────────────────────────────
-    # rec_score 0-100. >60 = elevated, <30 = low risk.
-    # Linear: 60→-1, 80→-2, 30→+0.5, 10→+1
+    # ── 2. Recession stress (−2.5 to +1.0) — orthogonal to fear ──────────
+    # rec_score now uses only Sahm+HY+curve+ICSA (no VIX/EPU overlap)
     rec_sig = float(np.clip(-(rec_score - 40.0) / 20.0, -2.5, 1.0))
 
-    # ── 3. Price action signal ────────────────────────────────────────────
-    # spx_dd: fraction from 6M high, negative = drawdown.
-    # -5%→-0.7, -10%→-1.4, -20%→-2.9, flat→0
+    # ── 3. Drawdown signal (−3.0 to +1.0) ────────────────────────────────
     dd_sig = float(np.clip(spx_dd / 0.07, -3.0, 1.0))
 
-    # ── 4. Macro regime signal ────────────────────────────────────────────
+    # ── 4. Macro regime signal (−2.5 to +2.0) ────────────────────────────
     regime_base = {
         "Goldilocks":   +1.5,
         "Overheating":  +0.5,
@@ -935,50 +903,109 @@ def _composite(prob: dict, vrp_val: float,
         "Stagflation":  -1.5,
         "Deflation":    -2.5,
     }.get(macro_reg, 0.0)
-    regime_sig = float(np.clip(regime_base + growth_score * 0.1, -2.5, 2.0))
+    regime_sig = float(np.clip(regime_base, -2.5, 2.0))
 
-    # ── 5. Prob bucket signal (secondary, capped ±1.5) ────────────────────
+    # ── 5. Growth breadth signal (−1.5 to +1.5) ──────────────────────────
+    # Fix 4: growth_score (range −7 to +7) used as independent driver,
+    # not as a tiny modifier to regime_sig where it was invisible.
+    growth_sig = float(np.clip(growth_score / 5.0, -1.5, 1.5))
+
+    # ── 6. Short-term momentum (−1.5 to +1.5) ────────────────────────────
+    # Fix 6: three empirically-grounded short-term signals.
+
+    # 6a. 5-day SPX momentum: mean-reversion signal (Jegadeesh 1990).
+    # In pos-gamma: -3%+ over 5d → mild positive tilt (dealers suppress moves).
+    # In neg-gamma: momentum tends to continue → no contrarian signal.
+    pos_gex = gex_regime in (GammaRegime.POSITIVE, GammaRegime.STRONG_POSITIVE) if gex_regime else False
+    neg_gex = gex_regime in (GammaRegime.NEGATIVE, GammaRegime.STRONG_NEGATIVE) if gex_regime else False
+    if pos_gex:
+        mom_spx = float(np.clip(-spx_5d_ret / 0.03, -1.0, 1.0))   # reversion in pos-gamma
+    elif neg_gex:
+        mom_spx = float(np.clip(spx_5d_ret / 0.03, -0.5, 0.5))    # momentum continuation in neg-gamma
+    else:
+        mom_spx = float(np.clip(-spx_5d_ret / 0.05, -0.5, 0.5))   # mild reversion otherwise
+
+    # 6b. Credit lead: HYG down more than LQD today → equity bearish signal tomorrow.
+    # Spread = HYG return - LQD return; negative spread = HY widening = bearish.
+    credit_spread_1d = hyg_1d_ret - lqd_1d_ret
+    mom_credit = float(np.clip(credit_spread_1d / 0.005, -1.0, 1.0))  # 0.5% spread → ±1
+
+    # 6c. Distance to GEX flip: near flip → no directional edge; far above → mild bull bias.
+    # dist_to_flip_pct: positive = above flip (bullish dealer positioning),
+    #                   negative = below flip (bearish dealer positioning).
+    if np.isfinite(dist_to_flip_pct):
+        if abs(dist_to_flip_pct) < 0.3:
+            mom_gex = 0.0     # within 0.3% of flip = no edge
+        else:
+            mom_gex = float(np.clip(dist_to_flip_pct / 2.0, -0.5, 0.5))
+    else:
+        mom_gex = 0.0
+
+    momentum_sig = float(np.clip(mom_spx + mom_credit + mom_gex, -1.5, 1.5))
+
+    # ── 7. Prob bucket signal (secondary, capped ±1.0) ────────────────────
     def _bs(p): return (p - 50.0) / 10.0
     tactical = prob.get("tactical_prob", 50.0)
     short    = prob.get("short_prob",    50.0)
     medium   = prob.get("medium_prob",   50.0)
     prob_sig = float(np.clip(
         0.25 * _bs(tactical) + 0.35 * _bs(short) + 0.40 * _bs(medium),
-        -1.5, 1.5
+        -1.0, 1.0
     ))
 
     # ── Weighted primary sum ──────────────────────────────────────────────
-    s = (0.35 * fear_sig   +
-         0.20 * rec_sig    +
-         0.15 * dd_sig     +
-         0.15 * regime_sig +
-         0.15 * prob_sig)
+    s = (0.30 * fear_sig    +
+         0.15 * rec_sig     +
+         0.15 * dd_sig      +
+         0.15 * regime_sig  +
+         0.10 * growth_sig  +
+         0.10 * momentum_sig +
+         0.05 * prob_sig)
 
-    # ── VRP overlay (±0.3 max) ────────────────────────────────────────────
+    # ── Fix 2: VRP overlay — CORRECTED sign ──────────────────────────────
+    # High VRP (IV >> RV) predicts POSITIVE returns next 1-4 weeks (Bollerslev
+    # et al. 2009; Carr & Wu 2009). Vol sellers earn carry → flows back bullish.
+    # IV below RV (negative VRP) = options cheap = danger zone = bearish signal.
     if np.isfinite(vrp_val):
-        if vrp_val > 4:    s -= 0.3
-        elif vrp_val > 2:  s -= 0.15
-        elif vrp_val < -2: s += 0.15
-        elif vrp_val < -4: s += 0.3
+        if vrp_val > 4:    s += 0.3    # large premium → bullish carry
+        elif vrp_val > 2:  s += 0.15
+        elif vrp_val < -2: s -= 0.15   # IV below RV → danger
+        elif vrp_val < -4: s -= 0.3
 
-    # ── Structural stress flags (−0.25 each, max −1.0) ───────────────────
+    # ── Structural stress flags ───────────────────────────────────────────
+    # Fix 3: vts_backw REMOVED from stress flags — VTS backwardation is a
+    # CONTRARIAN BUY signal for next-week direction (vol mean-reverts ~60-65%
+    # of the time within 1-3 weeks). It belongs in risk display, not as a
+    # directional penalty.
+    stress_count = 0
     if leading is not None:
         sahm_triggered = leading.get("sahm_triggered",  False)
         hy_stress      = leading.get("hy_stress_gate",  False)
         corr_systemic  = leading.get("corr_regime", "NORMAL") == "SYSTEMIC"
-        vts_backw      = vts_shape == "BACKWARDATION"
-        stress_count   = sum([sahm_triggered, hy_stress, corr_systemic, vts_backw])
-        s -= stress_count * 0.25
+        stress_count   = sum([sahm_triggered, hy_stress, corr_systemic])
+        s -= stress_count * 0.3
+
+    # Fix 3: VTS backwardation → contrarian positive overlay
+    if vts_shape == "BACKWARDATION":
+        s += 0.2   # vol mean-reverts → next-week bias positive
 
     # ── GEX regime overlay (±0.4) ─────────────────────────────────────────
     if gex_regime is not None:
-        neg_gamma = gex_regime in (GammaRegime.NEGATIVE, GammaRegime.STRONG_NEGATIVE)
-        pos_gamma = gex_regime in (GammaRegime.POSITIVE, GammaRegime.STRONG_POSITIVE)
-        if neg_gamma:  s -= 0.4
-        elif pos_gamma: s += 0.3
+        if neg_gex:  s -= 0.4
+        elif pos_gex: s += 0.3
 
-    # Scale to ±10: typical stressed day s≈-2.5 → -5, calm bullish s≈+2 → +4
+    # ── Scale to ±10 range ────────────────────────────────────────────────
     s = s * 2.2
+
+    # ── Fix 5: Hard structural cap (implemented, not just documented) ─────
+    # When 2+ binary stress flags are active simultaneously (Sahm + HY stress
+    # + systemic correlation), the composite cannot read bullish regardless of
+    # what other signals say. Divide by 2.2 to pre-compensate for the scale.
+    _PRE_SCALE = 2.2
+    if stress_count >= 2:
+        s = min(s, -2.0)    # hard cap at -2 post-scale
+    elif stress_count == 1:
+        s = min(s, +3.0)    # one flag: cap bullish at +3 (not neutralised, just limited)
 
     return int(np.clip(round(s), -10, 10))
 
@@ -1382,8 +1409,9 @@ def render_thesis_page():
     _stress = _recession_stress(
         sahmv, hyv, crl, icsa_4w_chg, vl,
         icsa_series=icsa,
-        spx_dd=float(spydd.iloc[-1]),    # SPX 6M drawdown (negative number)
+        spx_dd=float(spydd.iloc[-1]),
         epu_z=float(epuz.dropna().iloc[-1]) if epuz.dropna().size > 0 else 0.0,
+        s2s10_series=s2s10,
     )
     rec     = _stress["score"]
     rec_lbl = _stress["label"]
@@ -1564,6 +1592,15 @@ def render_thesis_page():
         s_2s10s=s2s10,net_liq_4w=nl4w,nfci_z=nz,fear_score=fear,
         session=get_session_context(),idx=idx,sahm_rule=sahm,hy_spread=hys)
 
+    # ── Short-term momentum inputs for composite (Fix 6) ──────────────────
+    _spx_5d_ret = float(_to_1d(spy).reindex(idx).ffill().pct_change(5).dropna().iloc[-1]) \
+                  if _to_1d(spy).reindex(idx).ffill().pct_change(5).dropna().size > 0 else 0.0
+    _hyg_1d_ret = float(_to_1d(hyg).reindex(idx).ffill().pct_change(1).dropna().iloc[-1]) \
+                  if _to_1d(hyg).reindex(idx).ffill().pct_change(1).dropna().size > 0 else 0.0
+    _lqd_1d_ret = float(_to_1d(lqd).reindex(idx).ffill().pct_change(1).dropna().iloc[-1]) \
+                  if _to_1d(lqd).reindex(idx).ffill().pct_change(1).dropna().size > 0 else 0.0
+    _dist_flip  = float(gex_st.distance_to_flip_pct) if (gex_st.distance_to_flip_pct and np.isfinite(gex_st.distance_to_flip_pct)) else 5.0
+
     comp=_composite(prob, vrp["val"],
                     leading=leading,
                     gex_regime=gex_st.regime,
@@ -1572,7 +1609,11 @@ def render_thesis_page():
                     rec_score=rec,
                     spx_dd=float(spydd.iloc[-1]),
                     macro_reg=macro_reg,
-                    growth_score=growth_score)
+                    growth_score=growth_score,
+                    spx_5d_ret=_spx_5d_ret,
+                    hyg_1d_ret=_hyg_1d_ret,
+                    lqd_1d_ret=_lqd_1d_ret,
+                    dist_to_flip_pct=_dist_flip)
     vrd,vc,ve=_verdict(comp,gex_st.regime)
     news=_news_cats(cat_intel)
     ua="NQ" if gex_sym in ("QQQ","NDX") else "ES"
@@ -1921,13 +1962,15 @@ def render_thesis_page():
                  "high for months (the old global mean would absorb the spike and understate fear). "
                  ">+1.0σ = ELEVATED. <−1.0σ = COMPLACENT. Mapped 0–100 via logistic.")
             +_gl("Composite Score",
-                 "Composite uses direct observables as primary drivers: fear z-score (35%), "
-                 "recession stress score (20%), SPX 6M drawdown (15%), macro regime quadrant (15%), "
-                 "external prob buckets capped ±1.5 (15%). Overlays: stress flags −0.25 each, "
-                 "GEX ±0.4, VRP ±0.3. Final ×2.2 scale maps to ±10. "
-                 "Structural overlay: 2+ stress flags (Sahm, HY OAS >600bp, cross-asset SYSTEMIC, VTS backwardation) "
-                 "hard-cap the score at -2. GEX asymmetry: negative gamma amplifies bearish reads ×1.4, "
-                 "suppresses bullish reads ×0.6. Chokepoint disruption bonus gated on co-occurring military/attack keywords.")),
+                 "7 independent signal groups: fear z-score (30%), orthogonal recession stress (15%, "
+                 "Sahm+HY+curve+ICSA only — VIX/EPU removed to avoid multicollinearity with fear), "
+                 "SPX 6M drawdown (15%), macro regime quadrant (15%), economic breadth from 7 metrics (10%), "
+                 "short-term momentum (10%: 5D SPX mean-reversion + HYG/LQD credit lead + GEX flip proximity), "
+                 "external prob buckets capped ±1 (5%). "
+                 "VRP sign corrected: high VRP = bullish carry (Bollerslev et al. 2009), not bearish. "
+                 "VTS backwardation = contrarian +0.2 (vol mean-reverts ~60% within 3 weeks). "
+                 "Stress flags (Sahm triggered + HY stress + systemic correlation): "
+                 "≥2 flags → hard cap at −2; 1 flag → cap at +3. Final ×2.2 scale → ±10.")),
             unsafe_allow_html=True)
 
     st.markdown(

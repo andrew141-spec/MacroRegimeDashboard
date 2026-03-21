@@ -1238,7 +1238,7 @@ def render_gex_engine():
             pp  = flow.get("put_pct", 0.5)
             uv  = flow.get("using_volume", False)
 
-            data_note = "📡 Using **live intraday volume** from Schwab" if uv else "📋 Using **OI as volume proxy** (volume column not in chain — Schwab may not expose it per-leg)"
+            data_note = "📡 Using **live intraday volume** from Schwab" if uv else "📋 Using **OI as inventory proxy** — volume unavailable. This shows accumulated positioning, NOT today's flow."
             st.caption(data_note)
 
             f1, f2, f3 = st.columns(3)
@@ -1250,6 +1250,7 @@ def render_gex_engine():
 
             # Bar chart
             import plotly.graph_objects as _go
+            _flow_or_oi = "Dollar Flow" if uv else "OI-Weighted Premium (Inventory)"
             fig_flow = _go.Figure()
             fig_flow.add_trace(_go.Bar(
                 x=["Put Premium", "Call Premium"],
@@ -1258,7 +1259,7 @@ def render_gex_engine():
                 text=[f"${pv/1e6:.1f}M", f"${cv/1e6:.1f}M"],
                 textposition="auto",
             ))
-            plotly_dark(fig_flow, title=f"{symbol} Options Dollar Flow — P/C Ratio: {pcr:.2f}", height=320)
+            plotly_dark(fig_flow, title=f"{symbol} Options {_flow_or_oi} — P/C Ratio: {pcr:.2f}", height=320)
             fig_flow.update_layout(yaxis_title="Dollar Premium ($M)")
             st.plotly_chart(fig_flow, use_container_width=True, key="gex_flow_chart")
 

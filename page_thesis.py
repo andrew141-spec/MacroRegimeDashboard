@@ -888,8 +888,6 @@ def _composite(prob: dict, vrp_val: float,
                vts_shape: str = "MIXED") -> int:
 
     def _bucket_score(p: float) -> float:
-        # Divisor 12 vs old 20: a 62% prob now scores +1 instead of requiring
-        # 70% — stops punishing moderate conviction with composite = 0.
         # 50→0, 62→+1, 74→+2, 38→-1, 26→-2
         return (p - 50.0) / 12.0
 
@@ -897,53 +895,52 @@ def _composite(prob: dict, vrp_val: float,
     short    = prob.get("short_prob",    50.0)
     medium   = prob.get("medium_prob",   50.0)
 
-    # Weight toward medium-term: more signal, less noise.
-    # Scale back up so the weighted sum spans the same range as the old
-    # equal-weight sum (each bucket max contribution = ±4.17 at extremes).
+    # Weighted bucket sum — medium-term weighted more heavily.
+    # ×3 scale so the full ±50pt probability range → roughly ±12.5 before clipping.
+    # Each bucket max = ±(50/12)×3 = ±12.5, weighted sum max ≈ ±12.5
     s = (0.25 * _bucket_score(tactical) +
          0.35 * _bucket_score(short) +
          0.40 * _bucket_score(medium)) * 3.0
 
-    # VRP tilt: positive VRP = options expensive → vol sellers have edge
-    # → small bearish lean for directional bulls (suppress upside score).
+    # VRP tilt — small additive adjustment only
     if np.isfinite(vrp_val):
-        if vrp_val > 4:    s -= 0.5
-        elif vrp_val > 2:  s -= 0.25
-        elif vrp_val < -2: s += 0.25
-        elif vrp_val < -4: s += 0.5
+        if vrp_val > 4:    s -= 0.4
+        elif vrp_val > 2:  s -= 0.2
+        elif vrp_val < -2: s += 0.2
+        elif vrp_val < -4: s += 0.4
 
-    # ── Structural risk overlay ───────────────────────────────────────────
-    # Binary regime flags from leading signals. These are hard gates — when
-    # 2+ are active simultaneously, the composite should not be reading neutral
-    # or bullish regardless of probability bucket levels.
+    # ── Structural risk overlay — ADDITIVE penalty, not hard override ─────
+    # Previous code used min(s, -2.0) which hard-floored the score to -2
+    # whenever 2+ stress flags fired simultaneously, regardless of what the
+    # probability signals were actually saying. This caused the composite to
+    # get stuck at -2 → -3 (after GEX amplification) every day that VTS was
+    # in backwardation + any other flag was active — which is a lot of days.
+    #
+    # Fix: each active stress flag contributes a fixed additive penalty (-0.8)
+    # so the composite still reflects the probability signal underneath, just
+    # tilted bearish by the structural environment. Multiple flags stack but
+    # the final clip to ±10 still applies.
     if leading is not None:
         sahm_triggered = leading.get("sahm_triggered",  False)
         hy_stress      = leading.get("hy_stress_gate",  False)
         corr_systemic  = leading.get("corr_regime", "NORMAL") == "SYSTEMIC"
         vts_backw      = vts_shape == "BACKWARDATION"
         stress_count   = sum([sahm_triggered, hy_stress, corr_systemic, vts_backw])
-        if stress_count >= 2:
-            s = min(s, -2.0)   # structural stress: floor bullish reads at -2
-        elif stress_count == 1:
-            s = min(s,  1.0)   # one flag: cap bullish at +1
+        # Each flag subtracts 0.8; 4 flags = -3.2 maximum structural drag
+        s -= stress_count * 0.8
 
-    # ── GEX asymmetric tilt ───────────────────────────────────────────────
-    # Negative gamma is an amplifier, not a symmetric signal. In neg-gamma
-    # regimes dealers hedge by selling into weakness and buying into strength,
-    # amplifying the underlying directional move. So:
-    #   neg-gamma + bearish s  → amplify (×1.4)
-    #   neg-gamma + bullish s  → suppress (×0.6) — downside acceleration risk
-    #   pos-gamma + bullish s  → mild tailwind (×1.2) — dealer mean-reversion
+    # ── GEX asymmetric tilt — additive, not multiplicative ───────────────
+    # Previous code used s *= 1.4 / 0.6 / 1.2. Multiplicative amplification
+    # on an already-adjusted score caused compounding: -2 × 1.4 = -2.8 → -3.
+    # Additive is cleaner: neg-gamma environment adds a fixed bearish tilt
+    # regardless of the magnitude of s.
     if gex_regime is not None:
         neg_gamma = gex_regime in (GammaRegime.NEGATIVE, GammaRegime.STRONG_NEGATIVE)
         pos_gamma = gex_regime in (GammaRegime.POSITIVE, GammaRegime.STRONG_POSITIVE)
         if neg_gamma:
-            if s < 0:
-                s *= 1.4
-            elif s > 0:
-                s *= 0.6
-        elif pos_gamma and s > 0:
-            s *= 1.2
+            s -= 0.8   # neg-gamma: dealers amplify moves, tail risk elevated
+        elif pos_gamma:
+            s += 0.4   # pos-gamma: mild mean-reversion tailwind
 
     return int(np.clip(round(s), -10, 10))
 

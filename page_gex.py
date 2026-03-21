@@ -1185,12 +1185,8 @@ def render_gex_engine():
                 fig_ts.add_hline(y=rv5, line_dash="dash", line_color="#10b981",
                                  annotation_text=f"5D RVol: {rv5:.1f}%",
                                  annotation_position="bottom right")
-            fig_ts.update_layout(
-                title="VIX Term Structure vs Realized Vol",
-                yaxis_title="Volatility (%)",
-                height=350,
-                **plotly_dark(),
-            )
+            plotly_dark(fig_ts, title="VIX Term Structure vs Realized Vol", height=350)
+            fig_ts.update_layout(yaxis_title="Volatility (%)")
             st.plotly_chart(fig_ts, use_container_width=True, key="gex_rvol_chart")
 
         # Regime interpretation
@@ -1262,12 +1258,8 @@ def render_gex_engine():
                 text=[f"${pv/1e6:.1f}M", f"${cv/1e6:.1f}M"],
                 textposition="auto",
             ))
-            fig_flow.update_layout(
-                title=f"{symbol} Options Dollar Flow — P/C Ratio: {pcr:.2f}",
-                yaxis_title="Dollar Premium ($M)",
-                height=320,
-                **plotly_dark(),
-            )
+            plotly_dark(fig_flow, title=f"{symbol} Options Dollar Flow — P/C Ratio: {pcr:.2f}", height=320)
+            fig_flow.update_layout(yaxis_title="Dollar Premium ($M)")
             st.plotly_chart(fig_flow, use_container_width=True, key="gex_flow_chart")
 
             # Gauge-style put% bar
@@ -1339,12 +1331,8 @@ def render_gex_engine():
             if gn:
                 fig_gwas.add_vline(x=gn, line_dash="dot", line_color="#6366f1",
                                    annotation_text=f"Net GEX Ctr ${gn:.2f}", annotation_position="bottom")
-            fig_gwas.update_layout(
-                title="Gamma Gravity Centres (GWAS)",
-                xaxis_title="Strike", yaxis_title="Weighted GEX ($M)",
-                height=320, barmode="overlay",
-                **plotly_dark(),
-            )
+            plotly_dark(fig_gwas, title="Gamma Gravity Centres (GWAS)", height=320)
+            fig_gwas.update_layout(xaxis_title="Strike", yaxis_title="Weighted GEX ($M)", barmode="overlay")
             st.plotly_chart(fig_gwas, use_container_width=True, key="gex_gwas_chart")
 
             # Interpretation
@@ -1401,12 +1389,8 @@ def render_gex_engine():
                     text=[f"${v:.1f}M" for v in values],
                     textposition="auto",
                 ))
-                fig_dur.update_layout(
-                    title="Net GEX by Expiration Bucket",
-                    yaxis_title="Net GEX ($M)",
-                    height=320,
-                    **plotly_dark(),
-                )
+                plotly_dark(fig_dur, title="Net GEX by Expiration Bucket", height=320)
+                fig_dur.update_layout(yaxis_title="Net GEX ($M)")
                 st.plotly_chart(fig_dur, use_container_width=True, key="gex_duration_chart")
 
             # Durability signal

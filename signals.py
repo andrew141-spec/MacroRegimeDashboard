@@ -588,9 +588,14 @@ def compute_1d_prob(
             elif sahm_val >= 0.30: scaled = min(scaled, 65.0)
         except: pass
     # HY spread stress gate
+    # BAMLH0A0HYM2 from FRED is in percent (e.g. 3.20 = 320bp).
+    # Normalise to basis points before comparing against bp thresholds.
     if hy_spread is not None:
         try:
             hy_val = float(hy_spread.dropna().iloc[-1])
+            # Convert percent → bp if value looks like percent (< 30 = definitely %)
+            if hy_val < 30:
+                hy_val = hy_val * 100
             if hy_val > 600:   scaled = 50.0 + (scaled - 50.0) * 0.50
             elif hy_val > 400: scaled = 50.0 + (scaled - 50.0) * 0.75
         except: pass

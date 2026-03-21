@@ -34,7 +34,7 @@ def _sl(s, d=float("nan")):
 def _quotes() -> Dict:
     out = {}
     pairs = [("SPX","^GSPC"),("NDX","^NDX"),("VIX","^VIX"),("VIX3M","^VIX3M"),
-             ("VVIX","^VVIX"),("DXY","DX-Y.NYB"),("GLD","GLD"),("TLT","TLT"),
+             ("VVIX","^VVIX"),("VXN","^VXN"),("DXY","DX-Y.NYB"),("GLD","GLD"),("TLT","TLT"),
              ("TNX","^TNX"),("IRX","^IRX"),("SPY","SPY"),("QQQ","QQQ"),
              ("HYG","HYG"),("ES","ES=F"),("NQ","NQ=F")]
     for k, sym in pairs:
@@ -136,6 +136,270 @@ def _merton_calibrate(vix: float, vvix: float,
         "sj_mult": round(sj_mult, 2),
     }
 
+def _forward_prob_fig(
+    spx: float, vix: float,
+    ndx: float, vxn: float,
+    spy: pd.Series, qqq: pd.Series,
+    idx, days: int = 5, n: int = 6000,
+) -> go.Figure:
+    """
+    Dual SPX / NDX 1-week forward probability heatmap — image-2 style.
+    Two rows: SPX (top) and NDX (bottom).
+    Each row: probability density heatmap (left) + terminal distribution (right).
+    Bottom: scenario comparison chart + summary table.
+    """
+    from plotly.subplots import make_subplots
+    from scipy.stats import norm as _norm
+
+    rng = np.random.default_rng()
+
+    def _rv20(series):
+        s = _to_1d(series).reindex(idx).ffill()
+        return float(s.pct_change().rolling(20, min_periods=10).std().dropna().iloc[-1] * np.sqrt(252) * 100)
+
+    rv_spx = _rv20(spy)
+    rv_ndx = _rv20(qqq)
+
+    def _sim_paths(spot, ann_vol, days, n):
+        """GBM paths, risk-neutral drift."""
+        sig  = ann_vol / 100.0
+        dt   = 1 / 252
+        drift = -0.5 * sig**2
+        paths = np.zeros((n, days + 1))
+        paths[:, 0] = spot
+        for t in range(1, days + 1):
+            z = rng.standard_normal(n)
+            paths[:, t] = paths[:, t-1] * np.exp(drift * dt + sig * np.sqrt(dt) * z)
+        return paths
+
+    def _density_grid(paths, spot, days, n_levels=60):
+        """Return Z[levels, days], level_vals, pct_changes for heatmap."""
+        lo = spot * 0.93
+        hi = spot * 1.07
+        lvls = np.linspace(lo, hi, n_levels)
+        bkt  = (hi - lo) / n_levels
+        Z    = np.zeros((n_levels, days))
+        for d in range(days):
+            f = paths[:, d + 1]
+            for i, lv in enumerate(lvls):
+                Z[i, d] = np.mean((f >= lv) & (f < lv + bkt)) * 100
+        pcts = (lvls / spot - 1) * 100
+        return Z, lvls, pcts
+
+    spx_paths = _sim_paths(spx, vix,   days, n)
+    ndx_paths = _sim_paths(ndx, vxn,   days, n)
+
+    Z_spx, lvls_spx, pcts_spx = _density_grid(spx_paths, spx, days)
+    Z_ndx, lvls_ndx, pcts_ndx = _density_grid(ndx_paths, ndx, days)
+
+    day_labels  = [f"D{i+1}" for i in range(days)]
+    wk_days     = ["Mon", "Tue", "Wed", "Thu", "Fri"][:days]
+    x_labels    = [f"0{i+1}\n{wk_days[i]}" if i < len(wk_days) else f"D{i+1}" for i in range(days)]
+
+    # Terminal distributions (Day 5)
+    term_spx = spx_paths[:, -1]
+    term_ndx = ndx_paths[:, -1]
+
+    def _prob_row(paths, spot):
+        t = paths[:, -1]
+        return {
+            "P(down>3%)": round(np.mean(t < spot * 0.97) * 100, 1),
+            "P(down>2%)": round(np.mean(t < spot * 0.98) * 100, 1),
+            "P(down>1%)": round(np.mean(t < spot * 0.99) * 100, 1),
+            "P(flat±1%)": round(np.mean(np.abs(t / spot - 1) < 0.01) * 100, 1),
+            "P(up>1%)":   round(np.mean(t > spot * 1.01) * 100, 1),
+            "P(up>2%)":   round(np.mean(t > spot * 1.02) * 100, 1),
+            "P(up>3%)":   round(np.mean(t > spot * 1.03) * 100, 1),
+            "p5":  round(float(np.percentile(t, 5)),  2),
+            "p95": round(float(np.percentile(t, 95)), 2),
+            "p1":  round(float(np.percentile(t, 1)),  2),
+            "median": round(float(np.median(t)), 2),
+            "expected": round(float(np.mean(t)), 2),
+        }
+
+    pr_spx = _prob_row(spx_paths, spx)
+    pr_ndx = _prob_row(ndx_paths, ndx)
+
+    # ── Layout ────────────────────────────────────────────────────────────
+    fig = make_subplots(
+        rows=5, cols=2,
+        row_heights=[0.26, 0.26, 0.20, 0.14, 0.14],
+        column_widths=[0.72, 0.28],
+        specs=[
+            [{"type": "heatmap"}, {"type": "bar"}],
+            [{"type": "heatmap"}, {"type": "bar"}],
+            [{"type": "scatter"}, {"type": "scatter"}],
+            [{"type": "table"},   {"type": "table"}],
+            [{"type": "table"},   {"type": "table"}],
+        ],
+        vertical_spacing=0.04,
+        horizontal_spacing=0.04,
+        subplot_titles=[
+            f"SPX Probability Density  |  Spot: {spx:,.2f}  |  VIX: {vix:.1f}%  |  RV(20): {rv_spx:.1f}%",
+            "SPX Terminal",
+            f"NDX Probability Density  |  Spot: {ndx:,.2f}  |  VXN: {vxn:.1f}%  |  RV(20): {rv_ndx:.1f}%",
+            "NDX Terminal",
+            "SPX Scenario Comparison: Median + IQR + 90% CI",
+            "NDX Scenario Comparison: Median + IQR + 90% CI",
+            "SPX — 1-Week Forward Probability Summary", "",
+            "NDX — 1-Week Forward Probability Summary", "",
+        ],
+    )
+
+    # ── Row 1: SPX heatmap + terminal ─────────────────────────────────────
+    fig.add_trace(go.Heatmap(
+        z=Z_spx, x=x_labels, y=[f"{p:+.1f}%" for p in pcts_spx],
+        colorscale="RdYlGn", reversescale=False,
+        showscale=False, zmin=0,
+    ), row=1, col=1)
+
+    # Spot line on heatmap
+    spot_idx_spx = int(np.argmin(np.abs(lvls_spx - spx)))
+    fig.add_hline(y=f"{pcts_spx[spot_idx_spx]:+.1f}%",
+                  line_color="white", line_width=1.2, line_dash="solid", row=1, col=1)
+
+    # Percentile fan lines on heatmap (as scatter on secondary y approach)
+    for pct_val, label, color in [
+        (5, "-2σ", "rgba(239,68,68,0.7)"),
+        (25, "-1σ", "rgba(245,158,11,0.7)"),
+        (75, "+1σ", "rgba(245,158,11,0.7)"),
+        (95, "+2σ", "rgba(239,68,68,0.7)"),
+    ]:
+        fan_y = []
+        for d in range(days):
+            p = spx_paths[:, d+1]
+            val = np.percentile(p, pct_val)
+            pct_change = (val / spx - 1) * 100
+            fan_y.append(f"{pct_change:+.1f}%")
+
+    # Terminal distribution (SPX)
+    hist_vals, bin_edges = np.histogram(term_spx, bins=40, density=True)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    fig.add_trace(go.Bar(
+        x=hist_vals, y=[f"{(v/spx-1)*100:+.1f}%" for v in bin_centers],
+        orientation="h", marker_color="#06b6d4", opacity=0.7,
+        name="SPX terminal", showlegend=False,
+    ), row=1, col=2)
+
+    # ── Row 2: NDX heatmap + terminal ─────────────────────────────────────
+    fig.add_trace(go.Heatmap(
+        z=Z_ndx, x=x_labels, y=[f"{p:+.1f}%" for p in pcts_ndx],
+        colorscale="RdYlGn", reversescale=False,
+        showscale=False, zmin=0,
+    ), row=2, col=1)
+
+    fig.add_trace(go.Bar(
+        x=hist_vals, y=[f"{(v/ndx-1)*100:+.1f}%" for v in
+                        (bin_edges[:-1] + bin_edges[1:]) / 2 / spx * ndx],
+        orientation="h", marker_color="#06b6d4", opacity=0.7,
+        name="NDX terminal", showlegend=False,
+    ), row=2, col=2)
+
+    # ── Row 3: Scenario comparison (SPX left, NDX right) ──────────────────
+    t_axis = np.arange(1, days + 1)
+    for paths, spot_v, row, col in [(spx_paths, spx, 3, 1), (ndx_paths, ndx, 3, 2)]:
+        p5  = [np.percentile(paths[:, d], 5)  for d in range(1, days+1)]
+        p25 = [np.percentile(paths[:, d], 25) for d in range(1, days+1)]
+        p50 = [np.percentile(paths[:, d], 50) for d in range(1, days+1)]
+        p75 = [np.percentile(paths[:, d], 75) for d in range(1, days+1)]
+        p95 = [np.percentile(paths[:, d], 95) for d in range(1, days+1)]
+
+        fig.add_trace(go.Scatter(
+            x=list(t_axis)+list(t_axis[::-1]), y=p5+p95[::-1],
+            fill="toself", fillcolor="rgba(239,68,68,0.15)",
+            line=dict(color="rgba(0,0,0,0)"), name="90% CI", showlegend=(col==1),
+        ), row=row, col=col)
+        fig.add_trace(go.Scatter(
+            x=list(t_axis)+list(t_axis[::-1]), y=p25+p75[::-1],
+            fill="toself", fillcolor="rgba(99,102,241,0.25)",
+            line=dict(color="rgba(0,0,0,0)"), name="IQR", showlegend=(col==1),
+        ), row=row, col=col)
+        fig.add_trace(go.Scatter(
+            x=t_axis, y=p50, line=dict(color="#10b981", width=2),
+            name="Median", showlegend=(col==1),
+        ), row=row, col=col)
+
+    # ── Rows 4–5: Summary tables ──────────────────────────────────────────
+    def _summary_table(pr, spot_v, sym, rv, vix_v):
+        exp_chg = (pr["expected"] / spot_v - 1) * 100
+        med_chg = (pr["median"]   / spot_v - 1) * 100
+        rows = [
+            (f"{sym} Spot",      f"{spot_v:,.2f}", ""),
+            ("Expected (5d)",    f"{pr['expected']:,.2f} ({exp_chg:+.2f}%)", ""),
+            ("Median (5d)",      f"{pr['median']:,.2f} ({med_chg:+.2f}%)", ""),
+            ("", "", ""),
+            ("P(down > 3%)",     f"{pr['P(down>3%)']}%",  "ALERT" if pr["P(down>3%)"] > 30 else ("WATCH" if pr["P(down>3%)"] > 20 else "")),
+            ("P(down > 2%)",     f"{pr['P(down>2%)']}%",  ""),
+            ("P(down > 1%)",     f"{pr['P(down>1%)']}%",  ""),
+            ("P(flat ±1%)",      f"{pr['P(flat±1%)']}%",  ""),
+            ("P(up > 1%)",       f"{pr['P(up>1%)']}%",    ""),
+            ("P(up > 2%)",       f"{pr['P(up>2%)']}%",    ""),
+            ("P(up > 3%)",       f"{pr['P(up>3%)']}%",    ""),
+            ("", "", ""),
+            ("5th pctile",       f"{pr['p5']:,.2f} ({(pr['p5']/spot_v-1)*100:+.2f}%)", ""),
+            ("95th pctile",      f"{pr['p95']:,.2f} ({(pr['p95']/spot_v-1)*100:+.2f}%)", ""),
+            ("1st pctile",       f"{pr['p1']:,.2f} ({(pr['p1']/spot_v-1)*100:+.2f}%)", "TAIL"),
+            ("", "", ""),
+            ("DV",               f"{vix_v:.1f}%", ""),
+            ("RV(20)",           f"{rv:.1f}%", ""),
+            ("RV(5d)",           f"{vix_v * 0.85:.1f}%", ""),
+            ("Skew(60d)",        "n/a", ""),
+        ]
+        return rows
+
+    for pr, spot_v, sym, rv, vix_v, row, col in [
+        (pr_spx, spx, "SPX", rv_spx, vix,  4, 1),
+        (pr_ndx, ndx, "NDX", rv_ndx, vxn,  4, 2),
+    ]:
+        rows = _summary_table(pr, spot_v, sym, rv, vix_v)
+        metrics = [r[0] for r in rows]
+        values  = [r[1] for r in rows]
+        signals = [r[2] for r in rows]
+        sig_colors = ["#ef4444" if s == "ALERT" else "#f59e0b" if s in ("WATCH","TAIL") else "rgba(0,0,0,0)" for s in signals]
+
+        fig.add_trace(go.Table(
+            header=dict(
+                values=["<b>Metric</b>", "<b>Value</b>", "<b>Signal</b>"],
+                fill_color="rgba(30,30,50,0.9)",
+                font=dict(color=["#f59e0b","#f59e0b","#f59e0b"], size=10),
+                align="left", height=20,
+            ),
+            cells=dict(
+                values=[metrics, values, signals],
+                fill_color=[
+                    ["rgba(15,15,25,0.95)"] * len(metrics),
+                    ["rgba(15,15,25,0.95)"] * len(values),
+                    sig_colors,
+                ],
+                font=dict(
+                    color=[
+                        ["rgba(245,158,11,0.9)"] * len(metrics),
+                        ["rgba(255,255,255,0.85)"] * len(values),
+                        ["#ef4444" if s == "ALERT" else "#f59e0b" if s in ("WATCH","TAIL") else "rgba(0,0,0,0)" for s in signals],
+                    ],
+                    size=10, family="monospace",
+                ),
+                align="left", height=18,
+            ),
+        ), row=row, col=col)
+
+    # ── Styling ────────────────────────────────────────────────────────────
+    title_date = pd.Timestamp.now().strftime("%Y-%m-%d")
+    plotly_dark(fig, title=f"SPX / NDX  FORWARD PROBABILITY HEATMAP — 1-WEEK FORECAST — {title_date}", height=1200)
+    fig.update_layout(
+        margin=dict(t=80, b=20, l=50, r=20),
+        legend=dict(orientation="h", y=0.52, x=0, font=dict(size=10)),
+    )
+    # Darken heatmap backgrounds
+    for r in [1, 2]:
+        fig.update_xaxes(showgrid=False, row=r, col=1)
+        fig.update_yaxes(showgrid=False, row=r, col=1)
+        fig.update_xaxes(showgrid=False, row=r, col=2)
+        fig.update_yaxes(showgrid=False, row=r, col=2)
+
+    return fig
+
+
 def _merton_fig(spot: float, vix: float, vvix: float = float("nan"),
                 vts_shape: str = "MIXED", vrp_val: float = 0.0,
                 days=5, n=4000) -> go.Figure:
@@ -227,27 +491,37 @@ def _ivsurf_from_chain(chain_df, spot: float, label: str,
         # Filter to tradeable range and valid IV
         df = df[(df["moneyness"] >= 0.88) & (df["moneyness"] <= 1.12)]
         df = df[(df["dte"] >= 1) & (df["dte"] <= 180)]
-        df = df[(df["iv"] > 0.005) & (df["iv"] < 5.0)]
+        df = df[(df["iv"] > 0.005) & (df["iv"] < 2.0)]   # tightened: >200% IV is bad data
 
-        # Remove extreme outliers: IV > 4× median is almost certainly bad data
+        # Remove extreme outliers: IV > 3× median is almost certainly bad data
         iv_med = df["iv"].median()
-        df = df[df["iv"] < iv_med * 4]
+        df = df[(df["iv"] >= iv_med * 0.25) & (df["iv"] < iv_med * 3.0)]
 
         if len(df) < 6:
             raise ValueError(f"Only {len(df)} valid chain points — insufficient for surface")
 
+        # Compute ATM IV estimate from raw data BEFORE griddata (used for clipping)
+        _atm_mask = df["moneyness"].between(0.98, 1.02)
+        atm_iv_est = float(df[_atm_mask]["iv"].mean() * 100) if _atm_mask.sum() > 0 else vix
+        if not np.isfinite(atm_iv_est) or atm_iv_est <= 0:
+            atm_iv_est = vix
+        # Hard clip bounds: IV must be in [2%, 120%] and within 3× ATM
+        hard_lo = max(2.0,  atm_iv_est * 0.40)
+        hard_hi = min(120.0, atm_iv_est * 3.0)
+
         # Scatter points in (DTE, moneyness) space
         pts_dte = df["dte"].values.astype(float)
         pts_m   = df["moneyness"].values.astype(float)
-        pts_iv  = df["iv"].values.astype(float) * 100  # → %
+        pts_iv  = np.clip(df["iv"].values.astype(float) * 100, hard_lo, hard_hi)
 
         # Dense output grid: 30 moneyness × 20 DTE cells
         dte_grid = np.linspace(pts_dte.min(), min(pts_dte.max(), 120), 20)
         m_grid   = np.linspace(pts_m.min(),   pts_m.max(),   30)
         DTE, MON = np.meshgrid(dte_grid, m_grid)
 
-        # Try cubic interpolation; fall back to linear if too few unique points
-        method = "cubic" if len(df) >= 12 else "linear"
+        # Use linear interpolation — cubic produces wild extrapolated values
+        # outside the convex hull of sparse option chain data points
+        method = "linear" if len(df) >= 8 else "nearest"
         Z = griddata(
             points=np.column_stack([pts_dte, pts_m]),
             values=pts_iv,
@@ -267,13 +541,13 @@ def _ivsurf_from_chain(chain_df, spot: float, label: str,
             ).reshape(DTE.shape)
             Z[nan_mask] = Z_nn[nan_mask]
 
-        # Gentle Gaussian smoothing to remove interpolation ripple
-        Z = gaussian_filter(Z, sigma=0.8)
+        # Hard clip BEFORE smoothing — prevents any interpolation artefact from
+        # propagating into the smoothed surface (the main cause of the 400% spikes
+        # and -300% troughs seen with cubic interpolation on short-dated chains)
+        Z = np.clip(Z, hard_lo, hard_hi)
 
-        # Clip to [50% ATM, 250% ATM] to prevent colour scale distortion
-        atm_iv_est = float(df[df["moneyness"].between(0.98, 1.02)]["iv"].mean() * 100) if len(df[df["moneyness"].between(0.98, 1.02)]) > 0 else vix
-        z_lo, z_hi = atm_iv_est * 0.5, atm_iv_est * 2.5
-        Z = np.clip(Z, z_lo, z_hi)
+        # Gentle Gaussian smoothing to remove remaining interpolation ripple
+        Z = gaussian_filter(Z, sigma=1.0)
 
         # ── Skew & term structure metrics from raw data ───────────────────
         def _avg(mask): return float(df[mask]["iv"].mean() * 100) if mask.sum() > 0 else float("nan")
@@ -339,39 +613,211 @@ def _ivsurf_from_chain(chain_df, spot: float, label: str,
 
 
 def _ivrv_fig(vix_s: pd.Series, spy: pd.Series, idx) -> go.Figure:
-    sa=_to_1d(spy).reindex(idx).ffill(); va=_to_1d(vix_s).reindex(idx).ffill()
-    rv21=(sa.pct_change().rolling(21,min_periods=10).std()*np.sqrt(252)*100)
-    vrp=(va-rv21).dropna(); dates=vrp.index[-252:]
-    fig=go.Figure()
-    fig.add_trace(go.Scatter(x=dates,y=va.reindex(dates),name="VIX",
-                             line=dict(color="#6366f1",width=1.8)))
-    fig.add_trace(go.Scatter(x=dates,y=rv21.reindex(dates),name="21D RV",
-                             line=dict(color="#10b981",width=1.8)))
-    vs=vrp.reindex(dates)
-    fig.add_trace(go.Bar(x=dates,y=vs,name="VRP",yaxis="y2",opacity=0.55,
-                         marker_color=["#10b981" if v>=0 else "#ef4444" for v in vs]))
-    plotly_dark(fig,title="IV vs Realized Volatility — 1 Year",height=340)
-    fig.update_layout(yaxis=dict(title="Vol (%)"),
-                      yaxis2=dict(title="VRP",overlaying="y",side="right",showgrid=False),
-                      legend=dict(orientation="h",y=1.02))
+    from plotly.subplots import make_subplots
+    sa  = _to_1d(spy).reindex(idx).ffill()
+    va  = _to_1d(vix_s).reindex(idx).ffill()
+    rv5  = sa.pct_change().rolling(5,  min_periods=3).std()  * np.sqrt(252) * 100
+    rv21 = sa.pct_change().rolling(21, min_periods=10).std() * np.sqrt(252) * 100
+    rv63 = sa.pct_change().rolling(63, min_periods=30).std() * np.sqrt(252) * 100
+    vrp  = (va - rv21).dropna()
+    dates = va.dropna().index[-252:]
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.65, 0.35],
+        vertical_spacing=0.04,
+        subplot_titles=["", "Variance Risk Premium Spread (VIX - 21d RV)"],
+    )
+
+    # ── Top panel: VIX + RV lines + RV range band ────────────────────────
+    rv5_d  = rv5.reindex(dates)
+    rv63_d = rv63.reindex(dates)
+    rv21_d = rv21.reindex(dates)
+    va_d   = va.reindex(dates)
+
+    # RV range band (5d–63d)
+    fig.add_trace(go.Scatter(
+        x=list(dates) + list(dates[::-1]),
+        y=list(rv5_d.fillna(method="ffill")) + list(rv63_d.fillna(method="ffill")[::-1]),
+        fill="toself", fillcolor="rgba(6,182,212,0.12)",
+        line=dict(color="rgba(0,0,0,0)"), name="5d-63d RV range",
+        showlegend=True,
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=dates, y=va_d, name="VIX (IV)",
+        line=dict(color="#a855f7", width=2),
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=dates, y=rv21_d, name="21d RV",
+        line=dict(color="#06b6d4", width=2),
+    ), row=1, col=1)
+
+    # ── Bottom panel: VRP bars ────────────────────────────────────────────
+    vrp_d = vrp.reindex(dates)
+    colors = ["#10b981" if v >= 0 else "#ef4444" for v in vrp_d.fillna(0)]
+    fig.add_trace(go.Bar(
+        x=dates, y=vrp_d,
+        marker_color=colors, opacity=0.8,
+        name="VRP", showlegend=False,
+    ), row=2, col=1)
+    fig.add_hline(y=0, line_color="rgba(255,255,255,0.3)", line_width=1, row=2, col=1)
+
+    # Dummy traces for legend
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers",
+        marker=dict(color="#10b981", size=8, symbol="square"),
+        name="IV > RV (premium)"), row=2, col=1)
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers",
+        marker=dict(color="#ef4444", size=8, symbol="square"),
+        name="IV < RV (discount)"), row=2, col=1)
+
+    plotly_dark(fig, title="Implied vs Realized Volatility — SPX (1Y)", height=520)
+    fig.update_layout(
+        legend=dict(orientation="h", y=1.02, x=0),
+        yaxis=dict(title="Volatility %", gridcolor="rgba(255,255,255,0.06)"),
+        yaxis2=dict(title="VRP pts",     gridcolor="rgba(255,255,255,0.06)"),
+        xaxis2=dict(title=""),
+        margin=dict(t=60, b=20, l=60, r=20),
+    )
+    fig.update_annotations(font_size=11)
     return fig
 
-def _rdist_fig(spy: pd.Series, idx, rd: Dict) -> go.Figure:
-    sa=_to_1d(spy).reindex(idx).ffill()
-    rets=sa.pct_change().dropna().tail(252)*100
-    sig=rd.get("daily_sigma",1.0)
-    fig=go.Figure()
-    fig.add_trace(go.Histogram(x=rets,nbinsx=60,name="Actual",
-                               marker_color="#6366f1",opacity=0.75,histnorm="probability density"))
-    xn=np.linspace(float(rets.min()),float(rets.max()),200)
-    yn=np.exp(-0.5*(xn/sig)**2)/(sig*np.sqrt(2*np.pi))
-    fig.add_trace(go.Scatter(x=xn,y=yn,name="Normal",
-                             line=dict(color="#f59e0b",width=1.8,dash="dot")))
-    for m,col in [(1,"#10b981"),(2,"#f59e0b")]:
-        for s in [-1,1]:
-            fig.add_vline(x=s*m*sig,line_dash="dash",line_color=col,line_width=1)
-    plotly_dark(fig,title="Return Distribution & Probability Bands (1Y)",height=320)
-    fig.update_layout(xaxis_title="Daily Return (%)",yaxis_title="Density")
+def _rdist_fig(spy: pd.Series, idx, rd: Dict, spot: float = float("nan")) -> go.Figure:
+    from plotly.subplots import make_subplots
+    sa   = _to_1d(spy).reindex(idx).ffill()
+    rets = sa.pct_change().dropna().tail(504) * 100   # 2Y ≈ 504 trading days
+    mu   = rd.get("daily_mu",  float(rets.mean()))
+    sig  = rd.get("daily_sigma", 1.0)
+    skw  = rd.get("skew", 0.0)
+    kurt = rd.get("kurtosis", 0.0)
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        column_widths=[0.65, 0.35],
+        specs=[[{"type": "xy"}, {"type": "xy"}]],
+        horizontal_spacing=0.06,
+    )
+
+    # ── Histogram ─────────────────────────────────────────────────────────
+    fig.add_trace(go.Histogram(
+        x=rets, nbinsx=80, name="Actual",
+        marker_color="#6366f1", opacity=0.75, histnorm="probability density",
+    ), row=1, col=1)
+
+    xn  = np.linspace(float(rets.min()) - 0.5, float(rets.max()) + 0.5, 300)
+    yn  = np.exp(-0.5 * ((xn - mu) / sig) ** 2) / (sig * np.sqrt(2 * np.pi))
+    fig.add_trace(go.Scatter(
+        x=xn, y=yn, name=f"Normal(μ={mu:.3f}, σ={sig:.3f})",
+        line=dict(color="#f59e0b", width=2),
+    ), row=1, col=1)
+
+    # Mean line
+    fig.add_vline(x=mu, line_color="#06b6d4", line_width=1.5,
+                  annotation_text=f"Mean: {mu:.3f}%", annotation_font_size=10,
+                  row=1, col=1)
+
+    # σ bands
+    for m, col_s in [(1, "#10b981"), (2, "#f59e0b"), (3, "#ef4444")]:
+        for s in [-1, 1]:
+            fig.add_vline(x=s * m * sig + mu, line_dash="dash",
+                          line_color=col_s, line_width=1, row=1, col=1)
+
+    # ── Stats panel (right col — invisible axes, monospace annotations) ──
+    # 1-day probability bands
+    d1_lo68 = round(spot * (1 + (mu - sig)   / 100), 2) if np.isfinite(spot) else float("nan")
+    d1_hi68 = round(spot * (1 + (mu + sig)   / 100), 2) if np.isfinite(spot) else float("nan")
+    d1_lo95 = round(spot * (1 + (mu - 2*sig) / 100), 2) if np.isfinite(spot) else float("nan")
+    d1_hi95 = round(spot * (1 + (mu + 2*sig) / 100), 2) if np.isfinite(spot) else float("nan")
+    d1_lo90 = round(spot * (1 + (mu - 1.645*sig) / 100), 2) if np.isfinite(spot) else float("nan")
+    d1_hi90 = round(spot * (1 + (mu + 1.645*sig) / 100), 2) if np.isfinite(spot) else float("nan")
+    d1_lo99 = round(spot * (1 + (mu - 2.576*sig) / 100), 2) if np.isfinite(spot) else float("nan")
+    d1_hi99 = round(spot * (1 + (mu + 2.576*sig) / 100), 2) if np.isfinite(spot) else float("nan")
+
+    wk_sig = sig * np.sqrt(5)
+    w1_lo68 = round(spot * (1 + (mu*5 - wk_sig)   / 100), 2) if np.isfinite(spot) else float("nan")
+    w1_hi68 = round(spot * (1 + (mu*5 + wk_sig)   / 100), 2) if np.isfinite(spot) else float("nan")
+    w1_lo95 = round(spot * (1 + (mu*5 - 2*wk_sig) / 100), 2) if np.isfinite(spot) else float("nan")
+    w1_hi95 = round(spot * (1 + (mu*5 + 2*wk_sig) / 100), 2) if np.isfinite(spot) else float("nan")
+    w1_lo90 = round(spot * (1 + (mu*5 - 1.645*wk_sig) / 100), 2) if np.isfinite(spot) else float("nan")
+    w1_hi90 = round(spot * (1 + (mu*5 + 1.645*wk_sig) / 100), 2) if np.isfinite(spot) else float("nan")
+    w1_lo99 = round(spot * (1 + (mu*5 - 2.576*wk_sig) / 100), 2) if np.isfinite(spot) else float("nan")
+    w1_hi99 = round(spot * (1 + (mu*5 + 2.576*wk_sig) / 100), 2) if np.isfinite(spot) else float("nan")
+
+    days_2sig = int((np.abs(rets) > 2 * sig).sum())
+    pct_2sig  = round(days_2sig / len(rets) * 100, 1)
+    fat_tails = "YES" if pct_2sig > 6.0 else "NO"
+
+    def _fmt(v): return f"{v:,.2f}" if np.isfinite(v) else "N/A"
+
+    panel_lines = [
+        ("GAUSSIAN MEASUREMENTS", None, "#ffffff"),
+        ("", None, None),
+        (f"SPX Spot:        {_fmt(spot)}", None, "#ffffff"),
+        (f"Daily μ:         {mu:+.4f}%", None, "#e2e8f0"),
+        (f"Daily σ:         {sig:.4f}%", None, "#e2e8f0"),
+        (f"Skewness:        {skw:.4f}", None, "#e2e8f0"),
+        (f"Excess Kurtosis: {kurt:.4f}", None, "#e2e8f0"),
+        ("", None, None),
+        ("1-DAY PROBABILITY BANDS", None, "#ffffff"),
+        ("", None, None),
+        (f"  68% (1σ):  {_fmt(d1_lo68)} — {_fmt(d1_hi68)}", None, "#94a3b8"),
+        (f"  90%:       {_fmt(d1_lo90)} — {_fmt(d1_hi90)}", None, "#94a3b8"),
+        (f"  95% (2σ):  {_fmt(d1_lo95)} — {_fmt(d1_hi95)}", None, "#94a3b8"),
+        (f"  99%:       {_fmt(d1_lo99)} — {_fmt(d1_hi99)}", None, "#94a3b8"),
+        ("", None, None),
+        ("1-WEEK PROBABILITY BANDS", None, "#ffffff"),
+        ("", None, None),
+        (f"  68% (1σ):  {_fmt(w1_lo68)} — {_fmt(w1_hi68)}", None, "#94a3b8"),
+        (f"  90%:       {_fmt(w1_lo90)} — {_fmt(w1_hi90)}", None, "#94a3b8"),
+        (f"  95% (2σ):  {_fmt(w1_lo95)} — {_fmt(w1_hi95)}", None, "#94a3b8"),
+        (f"  99%:       {_fmt(w1_lo99)} — {_fmt(w1_hi99)}", None, "#94a3b8"),
+        ("", None, None),
+        ("TAIL ANALYSIS", None, "#ffffff"),
+        ("", None, None),
+        (f"  Days > 2σ:       {pct_2sig}%", None, "#94a3b8"),
+        (f"  (Normal expect:  4.6%)", None, "#64748b"),
+        (f"  Fat tails:       {fat_tails}", "#ef4444" if fat_tails == "YES" else "#10b981", None),
+    ]
+
+    y_step = 1.0 / max(len(panel_lines), 1)
+    for i, (text, override_color, base_color) in enumerate(panel_lines):
+        if not text:
+            continue
+        color = override_color or base_color or "#94a3b8"
+        is_header = base_color == "#ffffff" and not text.startswith(" ")
+        fig.add_annotation(
+            xref="x2 domain", yref="y2 domain",
+            x=0.02, y=1.0 - i * y_step,
+            text=text,
+            showarrow=False,
+            font=dict(
+                family="monospace",
+                size=11 if is_header else 10,
+                color=color,
+            ),
+            xanchor="left", yanchor="top",
+        )
+
+    # Hide right axes
+    fig.update_xaxes(visible=False, row=1, col=2)
+    fig.update_yaxes(visible=False, row=1, col=2)
+    # Add border box for stats panel
+    fig.add_shape(type="rect", xref="x2 domain", yref="y2 domain",
+                  x0=0, y0=0, x1=1, y1=1,
+                  line=dict(color="rgba(255,255,255,0.15)", width=1),
+                  fillcolor="rgba(255,255,255,0.03)",
+                  row=1, col=2)
+
+    plotly_dark(fig, title=f"SPX Daily Return Distribution (2Y)", height=480)
+    fig.update_layout(
+        xaxis=dict(title="Daily Return %", gridcolor="rgba(255,255,255,0.06)"),
+        yaxis=dict(title="Density",        gridcolor="rgba(255,255,255,0.06)"),
+        legend=dict(orientation="v", x=0.36, y=0.99, font=dict(size=10)),
+        margin=dict(t=60, b=40, l=60, r=20),
+        bargap=0.02,
+    )
     return fig
 
 def _recession_stress(sahm: float, hy: float, s2s10_bp: float,
@@ -774,6 +1220,7 @@ def render_thesis_page():
     irxv=irxv/10 if (np.isfinite(irxv) and irxv>20) else irxv
     s2s10v=(tnxv-irxv)*100 if (np.isfinite(tnxv) and np.isfinite(irxv)) else crl
     vix_live=q.get("VIX_last",vl)
+    vxn_live=q.get("VXN_last", vix_live * 1.10)  # VXN ~10% higher than VIX historically
     vrp=_vrp_full(vix_live,spy,idx)
     vts=_vts(q); tail=_tail(q)
     rd=_retdist(spy,idx,spx)
@@ -955,21 +1402,17 @@ def render_thesis_page():
     )
 
     # ── 4. PROBABILITY HEATMAP ────────────────────────────────────────────
-    st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>4. PROBABILITY HEATMAP — MC Simulation</div>",unsafe_allow_html=True)
-    st.caption("1-week forward | Merton jump-diffusion | SPX")
-    _mp = _merton_calibrate(vix_live, tail.get("vvix", float("nan")), vts.get("shape","MIXED"), vrp.get("val",0.0))
-    st.caption(
-        f"Merton jump-diffusion — regime-calibrated: "
-        f"λ={_mp['lam']:.2f}/yr (×{_mp['lam_mult']} from VVIX/VIX) · "
-        f"μ_j={_mp['mj']:.3f} ({_mp['vts_adj_used']} VTS) · "
-        f"σ_j={_mp['sj']:.3f} (×{_mp['sj_mult']} VIX scale) · "
-        f"Base: Broadie-Chernov-Johannes (2007)"
-    )
-    st.plotly_chart(
-        _merton_fig(spx, vix_live, vvix=tail.get("vvix", float("nan")),
-                    vts_shape=vts.get("shape","MIXED"), vrp_val=vrp.get("val",0.0)),
-        use_container_width=True, key="th_hm"
-    )
+    st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>4. SPX / NDX FORWARD PROBABILITY HEATMAP — 1-WEEK FORECAST</div>",unsafe_allow_html=True)
+    st.caption("GBM Monte Carlo (n=6,000) · VIX/VXN implied vol · Risk-neutral drift · 5 trading days")
+    with st.spinner("Running simulations…"):
+        st.plotly_chart(
+            _forward_prob_fig(
+                spx=spx, vix=vix_live,
+                ndx=ndx, vxn=vxn_live,
+                spy=spy, qqq=qqq, idx=idx,
+            ),
+            use_container_width=True, key="th_hm"
+        )
 
     # ── 5 & 6. IV SURFACES ────────────────────────────────────────────────
     c5,c6=st.columns(2)
@@ -993,7 +1436,7 @@ def render_thesis_page():
     st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>8. RETURN DISTRIBUTION & PROBABILITY BANDS</div>",unsafe_allow_html=True)
     if rd:
         st.markdown(f"SPX Spot: `{spx:,.2f}` &nbsp;&nbsp; Daily σ: `{rd['daily_sigma']:.4f}%` &nbsp;&nbsp; Skew: `{rd['skew']:.4f}` &nbsp;&nbsp; Kurtosis: `{rd['kurtosis']:.4f}`")
-        st.plotly_chart(_rdist_fig(spy,idx,rd),use_container_width=True,key="th_rd")
+        st.plotly_chart(_rdist_fig(spy,idx,rd,spot=spx),use_container_width=True,key="th_rd")
 
     # ── 9. MACRO REGIME & NEWS ────────────────────────────────────────────
     nr=""
@@ -1101,7 +1544,7 @@ def render_thesis_page():
         st.markdown(_card(
             _sh(13,"GLOSSARY — READING THE CHARTS")
             +_gl("IV Surface","3D plot: implied vol across strikes (moneyness) and DTE. Steep put skew = downside protection expensive.")
-            +_gl("Probability Heatmap","Monte Carlo using Merton jump-diffusion. Shows probability of SPX reaching each price level over next week.")
+            +_gl("Probability Heatmap","GBM Monte Carlo (n=6,000). Shows probability of SPX/NDX reaching each price level over the next 5 trading days. VIX/VXN implied vol inputs. Includes terminal distribution, scenario bands, and tail probability summary.")
             +_gl("GEX Histogram","Gamma per strike. Green = positive (dealers stabilize). Red = negative (dealers amplify).")
             +_gl("IV vs RV Chart","VIX overlaid with 21D realized vol. VRP spread: green = IV premium (sell vol), red = IV discount (buy protection).")
             +_gl("Fear Composite","VIX z-score + NFCI + curve inversion + liquidity tightening. Reported as σ from mean. >+1.0σ = elevated fear. <−1.0σ = complacency.")),unsafe_allow_html=True)

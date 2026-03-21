@@ -15,7 +15,8 @@ from utils import _to_1d, zscore, resample_ffill, yf_close, kelly, current_pct_r
 from config import _get_secret
 from ui_components import pill, pbar, sec_hdr, plotly_dark, regime_chip, autorefresh_js, colored, gauge
 from gex_engine import (build_gamma_state, compute_gex_from_chain, find_gamma_flip,
-                        nearest_expiry_chain, classify_gex_regime, compute_dealer_greeks, DealerGreeks)
+                        nearest_expiry_chain, classify_gex_regime, compute_dealer_greeks, DealerGreeks,
+                        compute_gwas, compute_gex_term_structure, compute_flow_imbalance)
 from schwab_api import (get_schwab_client, schwab_get_spot, schwab_get_options_chain,
                         SCHWAB_AVAILABLE)
 # yfinance OI fallback removed — Schwab/TOS is the sole OI source for chain/OI data
@@ -36,6 +37,65 @@ def _days_to_exp(label: str) -> int:
         return (exp - dt.date.today()).days
     except Exception:
         return 999  # unknown = treat as far-dated
+
+
+
+@st.cache_data(ttl=300)
+def _fetch_rvol_surface(symbol: str = "SPY") -> dict:
+    """
+    Fetch VIX term structure (VIX / VIX3M / VIX6M) and compute realized vol.
+    All tickers are free on yfinance — no Schwab needed for this.
+
+    Returns:
+      vix1m, vix3m, vix6m      — current IV term structure levels
+      slope_1_3                 — VIX3M - VIX (positive = normal contango)
+      slope_3_6                 — VIX6M - VIX3M
+      rvol_5d                   — 5-day realized vol (annualized)
+      iv_rv_spread              — VIX - RVol (positive = IV premium over realized)
+      term_structure_regime     — "contango" / "backwardation" / "flat"
+    """
+    out = {}
+    try:
+        import yfinance as _yf
+        # VIX term structure — all three free on yfinance
+        for label, ticker in [("vix1m", "^VIX"), ("vix3m", "^VIX3M"), ("vix6m", "^VIX6M")]:
+            try:
+                h = _yf.Ticker(ticker).history(period="2d")
+                out[label] = float(h["Close"].iloc[-1]) if not h.empty else None
+            except Exception:
+                out[label] = None
+
+        # 5-day realized vol for the underlying
+        try:
+            h = _yf.Ticker(symbol).history(period="10d")
+            if len(h) >= 5:
+                log_rets = np.log(h["Close"] / h["Close"].shift(1)).dropna()
+                out["rvol_5d"] = float(log_rets.tail(5).std() * np.sqrt(252) * 100)
+            else:
+                out["rvol_5d"] = None
+        except Exception:
+            out["rvol_5d"] = None
+
+        # Derived metrics
+        v1, v3, v6 = out.get("vix1m"), out.get("vix3m"), out.get("vix6m")
+        out["slope_1_3"] = round(v3 - v1, 2) if (v1 and v3) else None
+        out["slope_3_6"] = round(v6 - v3, 2) if (v3 and v6) else None
+        rv = out.get("rvol_5d")
+        out["iv_rv_spread"] = round(v1 - rv, 2) if (v1 and rv) else None
+
+        if v1 and v3:
+            if v3 > v1 + 0.5:
+                out["term_structure_regime"] = "contango"   # normal — back IV > front
+            elif v1 > v3 + 0.5:
+                out["term_structure_regime"] = "backwardation"  # stress — near IV spike
+            else:
+                out["term_structure_regime"] = "flat"
+        else:
+            out["term_structure_regime"] = "unknown"
+
+    except Exception as e:
+        out["error"] = str(e)
+    return out
 
 
 def _make_heatmap(chain_df: pd.DataFrame, spot: float,
@@ -744,6 +804,12 @@ def render_gex_engine():
     vix_df    = yf.Ticker("^VIX").history(period="1d")
     vix_level = float(vix_df["Close"].iloc[-1]) if len(vix_df) > 0 else 20.0
 
+    # ── Advanced analytics (new) ──────────────────────────────────────────
+    gwas     = compute_gwas(chain_df, spot)
+    term_str = compute_gex_term_structure(chain_df, spot)
+    flow     = compute_flow_imbalance(chain_df, spot)
+    rvol     = _fetch_rvol_surface(symbol)
+
     # ── Header ────────────────────────────────────────────────────────────
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Spot",          f"{spot:.2f}")
@@ -777,8 +843,9 @@ def render_gex_engine():
     _make_heatmap._strike_hi = float(spot + _n)
     _make_heatmap._max_dte   = int(st.session_state["gex_hm_dte"])
 
-    tab_gex, tab_vex, tab_cex, tab_nodes, tab_otm = st.tabs(
-        ["📊 GEX (Gamma)", "🌀 VEX (Vanna)", "⏱ CEX (Charm)", "🎯 Key Nodes", "🔭 OTM Anchors"]
+    tab_gex, tab_vex, tab_cex, tab_nodes, tab_otm, tab_rvol, tab_flow, tab_gwas, tab_durability = st.tabs(
+        ["📊 GEX (Gamma)", "🌀 VEX (Vanna)", "⏱ CEX (Charm)", "🎯 Key Nodes", "🔭 OTM Anchors",
+         "📈 Vol Surface", "💸 Flow Imbalance", "🧲 GWAS", "⏳ GEX Duration"]
     )
 
     with tab_gex:
@@ -1075,6 +1142,298 @@ def render_gex_engine():
 - **Large persistent OTM node** = likely weekly termination target for swings
 - **Sudden disappearance** of large OTM node = higher-timeframe shift in dealer exposure → reassess bias
 """)
+
+    # ── Vol Surface Tab ───────────────────────────────────────────────────
+    with tab_rvol:
+        st.markdown(f"{sec_hdr('REALIZED vs IMPLIED VOL SURFACE')}", unsafe_allow_html=True)
+        st.caption("VIX term structure slope reveals where the options market expects volatility to resolve. "
+                   "Near-term IV crushed + elevated back end = different regime than uniform compression.")
+
+        v1  = rvol.get("vix1m")
+        v3  = rvol.get("vix3m")
+        v6  = rvol.get("vix6m")
+        rv5 = rvol.get("rvol_5d")
+        s13 = rvol.get("slope_1_3")
+        s36 = rvol.get("slope_3_6")
+        ivr = rvol.get("iv_rv_spread")
+        ts_regime = rvol.get("term_structure_regime", "unknown")
+
+        rv1, rv2, rv3, rv4 = st.columns(4)
+        rv1.metric("VIX (1M IV)",  f"{v1:.1f}" if v1 else "N/A")
+        rv2.metric("VIX3M",        f"{v3:.1f}" if v3 else "N/A",
+                   delta=f"slope: {s13:+.1f}" if s13 is not None else None)
+        rv3.metric("VIX6M",        f"{v6:.1f}" if v6 else "N/A",
+                   delta=f"slope: {s36:+.1f}" if s36 is not None else None)
+        rv4.metric("5D RVol",      f"{rv5:.1f}%" if rv5 else "N/A",
+                   delta=f"IV-RV: {ivr:+.1f}" if ivr is not None else None)
+
+        # Term structure chart
+        if v1 and v3 and v6:
+            import plotly.graph_objects as _go
+            fig_ts = _go.Figure()
+            fig_ts.add_trace(_go.Scatter(
+                x=["1M (VIX)", "3M (VIX3M)", "6M (VIX6M)"],
+                y=[v1, v3, v6],
+                mode="lines+markers+text",
+                text=[f"{v1:.1f}", f"{v3:.1f}", f"{v6:.1f}"],
+                textposition="top center",
+                line=dict(color="#6366f1", width=2),
+                marker=dict(size=10),
+                name="IV Term Structure",
+            ))
+            if rv5:
+                fig_ts.add_hline(y=rv5, line_dash="dash", line_color="#10b981",
+                                 annotation_text=f"5D RVol: {rv5:.1f}%",
+                                 annotation_position="bottom right")
+            fig_ts.update_layout(
+                title="VIX Term Structure vs Realized Vol",
+                yaxis_title="Volatility (%)",
+                height=350,
+                **plotly_dark(),
+            )
+            st.plotly_chart(fig_ts, use_container_width=True, key="gex_rvol_chart")
+
+        # Regime interpretation
+        if ts_regime == "backwardation":
+            color, border = "rgba(239,68,68,0.08)", "rgba(239,68,68,0.30)"
+            msg = ("🔴 **BACKWARDATION** — Near-term IV > 3M IV. "
+                   "Options market pricing acute near-term stress. "
+                   "This is NOT uniform vol compression — gamma risks are front-loaded. "
+                   "GEX levels may shift rapidly as front-month OI dominates.")
+        elif ts_regime == "contango":
+            color, border = "rgba(16,185,129,0.08)", "rgba(16,185,129,0.30)"
+            msg = ("🟢 **CONTANGO** — Back IV > Front IV. "
+                   "Normal structure. Market pricing mean-reversion toward calmer conditions. "
+                   "Near-term IV compression likely → positive vanna tailwind if sustained.")
+        else:
+            color, border = "rgba(255,255,255,0.04)", "rgba(255,255,255,0.12)"
+            msg = "⚪ **FLAT** — IV roughly equal across term. No strong directional vol regime signal."
+
+        st.markdown(f"<div class='panel' style='background:{color};border-color:{border};margin-top:10px;'>{msg}</div>",
+                    unsafe_allow_html=True)
+
+        if ivr is not None:
+            if ivr > 5:
+                st.markdown(f"**IV Premium:** {ivr:+.1f} pts above realized → options expensive, vol sellers favoured, mean-reversion environment.")
+            elif ivr < -3:
+                st.markdown(f"**IV Discount:** {ivr:+.1f} pts below realized → options cheap, realized vol outrunning implied → vol buyers favoured, trending environment.")
+            else:
+                st.markdown(f"**IV-RV Spread:** {ivr:+.1f} pts — near fair value. No strong structural vol edge.")
+
+        st.markdown("""
+**Reading the Term Structure:**
+- **Steep contango** (VIX3M >> VIX): market expects current vol to subside → favours positive vanna setups, IV-compression trades
+- **Backwardation** (VIX > VIX3M): acute front-end stress; GEX levels more volatile, dealer hedging accelerates near-term
+- **Flat + IV >> RVol**: options overpriced → sell premium, fade vol spikes
+- **Flat + RVol >> IV**: market underpricing actual moves → buy protection, reduce short-gamma exposure
+""")
+
+    # ── Flow Imbalance Tab ────────────────────────────────────────────────
+    with tab_flow:
+        st.markdown(f"{sec_hdr('OPTIONS FLOW IMBALANCE — Put/Call Dollar Premium')}", unsafe_allow_html=True)
+        st.caption("Dollar premium volume = what's happening NOW. OI is yesterday's snapshot. "
+                   "Heavy put dollar flow = active hedging / fear. Call dominance = speculation / complacency.")
+
+        if flow:
+            pv  = flow.get("put_dollar_vol", 0)
+            cv  = flow.get("call_dollar_vol", 0)
+            pcr = flow.get("pc_ratio", 1.0)
+            fb  = flow.get("flow_bias", "neutral")
+            pp  = flow.get("put_pct", 0.5)
+            uv  = flow.get("using_volume", False)
+
+            data_note = "📡 Using **live intraday volume** from Schwab" if uv else "📋 Using **OI as volume proxy** (volume column not in chain — Schwab may not expose it per-leg)"
+            st.caption(data_note)
+
+            f1, f2, f3 = st.columns(3)
+            f1.metric("Put $ Premium",  f"${pv/1e6:.1f}M")
+            f2.metric("Call $ Premium", f"${cv/1e6:.1f}M")
+            f3.metric("P/C Ratio",      f"{pcr:.2f}",
+                      delta="Fear" if pcr > 1.3 else ("Greed" if pcr < 0.77 else "Neutral"),
+                      delta_color="inverse" if pcr > 1.3 else "normal")
+
+            # Bar chart
+            import plotly.graph_objects as _go
+            fig_flow = _go.Figure()
+            fig_flow.add_trace(_go.Bar(
+                x=["Put Premium", "Call Premium"],
+                y=[pv / 1e6, cv / 1e6],
+                marker_color=[_C_NEG, _C_POS],
+                text=[f"${pv/1e6:.1f}M", f"${cv/1e6:.1f}M"],
+                textposition="auto",
+            ))
+            fig_flow.update_layout(
+                title=f"{symbol} Options Dollar Flow — P/C Ratio: {pcr:.2f}",
+                yaxis_title="Dollar Premium ($M)",
+                height=320,
+                **plotly_dark(),
+            )
+            st.plotly_chart(fig_flow, use_container_width=True, key="gex_flow_chart")
+
+            # Gauge-style put% bar
+            st.markdown(f"**Put share of total flow:** {pp*100:.1f}%")
+            st.progress(float(pp))
+
+            if fb == "bearish":
+                st.markdown(f"""<div class='warn-card' style='background:rgba(239,68,68,0.08);border-color:rgba(239,68,68,0.30);'>
+                  🔴 <b>BEARISH FLOW</b> — P/C ratio {pcr:.2f} → Put premium heavily dominant.
+                  Active hedging or directional put buying in progress. Confirms downside pressure.
+                </div>""", unsafe_allow_html=True)
+            elif fb == "bullish":
+                st.markdown(f"""<div class='warn-card' style='background:rgba(16,185,129,0.07);border-color:rgba(16,185,129,0.30);'>
+                  🟢 <b>BULLISH FLOW</b> — P/C ratio {pcr:.2f} → Call premium dominant.
+                  Speculative call buying or put selling. Complacency signal — watch for vol expansion.
+                </div>""", unsafe_allow_html=True)
+            else:
+                st.markdown(f"⚪ **NEUTRAL FLOW** — P/C ratio {pcr:.2f}. Balanced put/call dollar premium. No strong directional flow signal.")
+
+        st.markdown("""
+**Why Dollar Premium > OI for Real-Time Reads:**
+- OI only updates once/day (OCC settlement). It tells you yesterday's positioning.
+- Volume × premium = what traders are actually paying right now.
+- A $5 put with 10,000 contracts = $5M premium. A $0.10 OTM call with 100,000 contracts = $1M. OI count misleads; dollar weight clarifies.
+- P/C ratio > 1.3: elevated fear / active hedging → watch for mean-reversion once hedges expire
+- P/C ratio < 0.8: speculative call buying → vol expansion risk, don't fade too aggressively
+""")
+
+    # ── GWAS Tab ─────────────────────────────────────────────────────────
+    with tab_gwas:
+        st.markdown(f"{sec_hdr('GAMMA-WEIGHTED AVERAGE STRIKE (GWAS)')}", unsafe_allow_html=True)
+        st.caption("Probabilistic gravity centres for dealer hedging — where price gets 'pinned' in positive gamma. "
+                   "More informative than discrete walls which imply false precision.")
+
+        if gwas:
+            ga = gwas.get("gwas_above")
+            gb = gwas.get("gwas_below")
+            gn = gwas.get("gwas_net")
+            ma = gwas.get("total_gex_above", 0)
+            mb = gwas.get("total_gex_below", 0)
+
+            g1, g2, g3 = st.columns(3)
+            g1.metric("GWAS Above Spot",
+                      f"${ga:.2f}" if ga else "N/A",
+                      delta=f"{(ga - spot):.2f} ({(ga-spot)/spot*100:+.2f}%)" if ga else None)
+            g2.metric("GWAS Below Spot",
+                      f"${gb:.2f}" if gb else "N/A",
+                      delta=f"{(gb - spot):.2f} ({(gb-spot)/spot*100:+.2f}%)" if gb else None,
+                      delta_color="inverse")
+            g3.metric("Net Positive GEX Centre",
+                      f"${gn:.2f}" if gn else "N/A",
+                      delta=f"{(gn - spot):+.2f}" if gn else None)
+
+            # Visual: spot vs GWAS levels on a mini chart
+            import plotly.graph_objects as _go
+            fig_gwas = _go.Figure()
+
+            # Magnitude bars
+            if ga:
+                fig_gwas.add_trace(_go.Bar(x=[ga], y=[ma / 1e6], name="GWAS Above",
+                                           marker_color=_C_POS, width=0.5,
+                                           text=[f"${ga:.1f}"], textposition="auto"))
+            if gb:
+                fig_gwas.add_trace(_go.Bar(x=[gb], y=[mb / 1e6], name="GWAS Below",
+                                           marker_color=_C_NEG, width=0.5,
+                                           text=[f"${gb:.1f}"], textposition="auto"))
+            fig_gwas.add_vline(x=spot, line_dash="dash", line_color="white",
+                               annotation_text=f"Spot ${spot:.2f}", annotation_position="top")
+            if gn:
+                fig_gwas.add_vline(x=gn, line_dash="dot", line_color="#6366f1",
+                                   annotation_text=f"Net GEX Ctr ${gn:.2f}", annotation_position="bottom")
+            fig_gwas.update_layout(
+                title="Gamma Gravity Centres (GWAS)",
+                xaxis_title="Strike", yaxis_title="Weighted GEX ($M)",
+                height=320, barmode="overlay",
+                **plotly_dark(),
+            )
+            st.plotly_chart(fig_gwas, use_container_width=True, key="gex_gwas_chart")
+
+            # Interpretation
+            if ga and gb:
+                range_pct = (ga - gb) / spot * 100
+                st.markdown(f"**Implied pin range:** ${gb:.2f} – ${ga:.2f} ({range_pct:.1f}% wide)")
+                if range_pct < 1.5:
+                    st.markdown("🧲 **Tight pin zone** — gamma gravity concentrated. Expect intraday mean-reversion inside this band.")
+                elif range_pct > 4.0:
+                    st.markdown("📐 **Wide gravity range** — diffuse gamma support. Less pinning force; larger intraday swings possible.")
+                else:
+                    st.markdown("📊 **Moderate pin zone** — standard gamma gravity. Use GWAS levels as soft S/R, not hard walls.")
+
+        st.markdown("""
+**GWAS vs Discrete Walls:**
+- Classic GEX walls say "resistance at $5475" — implying a binary level. Reality is a diffuse zone.
+- GWAS is the gamma-weighted *centre of mass* of dealer hedging above/below spot.
+- Price doesn't bounce off a wall — it gravitates toward and gets absorbed by the weighted centre.
+- In strong positive gamma: spot orbits the net GEX centre intraday.
+- GWAS above > GWAS below in magnitude = more upside hedging flow → upside gravity stronger.
+""")
+
+    # ── GEX Duration / Term Structure Tab ────────────────────────────────
+    with tab_durability:
+        st.markdown(f"{sec_hdr('GEX TERM STRUCTURE — Regime Durability')}", unsafe_allow_html=True)
+        st.caption("A positive gamma regime driven by 2DTE options is gone by Friday. "
+                   "Monthly gamma provides structural support. This distinction is critical for position sizing.")
+
+        if term_str:
+            g07  = term_str.get("gex_0_7dte", 0)
+            g845 = term_str.get("gex_8_45dte", 0)
+            frag = term_str.get("fragility_ratio", 0.5)
+            dur  = term_str.get("durability", "mixed")
+            buckets = term_str.get("dte_buckets", [])
+
+            d1, d2, d3 = st.columns(3)
+            d1.metric("0–7 DTE GEX",   f"${g07/1e6:.1f}M",
+                      delta="Weekly / 0DTE", delta_color="off")
+            d2.metric("8–45 DTE GEX",  f"${g845/1e6:.1f}M",
+                      delta="Monthly", delta_color="off")
+            d3.metric("Weekly Fragility", f"{frag*100:.0f}%",
+                      delta=dur.upper(),
+                      delta_color="inverse" if dur == "fragile" else "normal")
+
+            # DTE bucket bar chart
+            if buckets:
+                import plotly.graph_objects as _go
+                labels = [b[0] for b in buckets]
+                values = [b[1] / 1e6 for b in buckets]
+                colors = [_C_POS if v > 0 else _C_NEG for v in values]
+                fig_dur = _go.Figure(_go.Bar(
+                    x=labels, y=values,
+                    marker_color=colors,
+                    text=[f"${v:.1f}M" for v in values],
+                    textposition="auto",
+                ))
+                fig_dur.update_layout(
+                    title="Net GEX by Expiration Bucket",
+                    yaxis_title="Net GEX ($M)",
+                    height=320,
+                    **plotly_dark(),
+                )
+                st.plotly_chart(fig_dur, use_container_width=True, key="gex_duration_chart")
+
+            # Durability signal
+            if dur == "fragile":
+                st.markdown(f"""<div class='warn-card' style='background:rgba(239,68,68,0.08);border-color:rgba(239,68,68,0.30);'>
+                  ⚠️ <b>FRAGILE GAMMA REGIME</b> — {frag*100:.0f}% of net GEX expires within 7 days.
+                  Current gamma environment is NOT durable. Regime can flip by end of week as weeklies expire.
+                  <b>Position sizing implication:</b> treat current gamma walls as short-lived. Do not size for a multi-day pin.
+                </div>""", unsafe_allow_html=True)
+            elif dur == "durable":
+                st.markdown(f"""<div class='warn-card' style='background:rgba(16,185,129,0.07);border-color:rgba(16,185,129,0.30);'>
+                  ✅ <b>DURABLE GAMMA REGIME</b> — Only {frag*100:.0f}% of net GEX in weeklies.
+                  Monthly options dominate. Current gamma structure is structurally supported through expiration.
+                  <b>Position sizing implication:</b> gamma walls and flip levels are durable across sessions. Higher conviction for range trades.
+                </div>""", unsafe_allow_html=True)
+            else:
+                st.markdown(f"⚪ **MIXED DURABILITY** — {frag*100:.0f}% weekly. Moderate regime confidence. Re-assess after weekly expiry.")
+
+        st.markdown("""
+**Why GEX Duration Matters:**
+- 45 DTE filter captures *magnitude* of GEX but hides *when* it expires.
+- Weekly-concentrated positive gamma regime: flip levels meaningful Mon–Wed, then degrade Thu/Fri as gamma melts.
+- Monthly-concentrated regime: gamma walls persist across the expiry cycle; S/R levels are durable for swing trades.
+- High fragility + end-of-week approaching: reduce position size, widen stops, expect regime shift.
+- Low fragility: gamma structure survives expiry; key nodes remain valid for 2–4 weeks.
+""")
+
 
 
 def render_setups_page():

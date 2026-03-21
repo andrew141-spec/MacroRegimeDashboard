@@ -18,8 +18,7 @@ from gex_engine import (build_gamma_state, compute_gex_from_chain, find_gamma_fl
                         nearest_expiry_chain, classify_gex_regime, compute_dealer_greeks, DealerGreeks)
 from schwab_api import (get_schwab_client, schwab_get_spot, schwab_get_options_chain,
                         SCHWAB_AVAILABLE)
-from data_loaders import (  # yfinance OI fallback removed — Schwab/TOS is the sole OI source
-)
+# yfinance OI fallback removed — Schwab/TOS is the sole OI source for chain/OI data
 from probability import get_session_context, evaluate_setups
 
 # ── Colors ────────────────────────────────────────────────────────────────────

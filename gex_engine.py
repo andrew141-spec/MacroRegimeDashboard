@@ -1,4 +1,4 @@
-# gex_engine.py — GEX computation: gamma per strike, flip detection, regime
+# gex_engine.py — GEX computation: gamma per strike, flip detection, regime, advanced analytics
 import math, datetime as dt
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
@@ -314,6 +314,172 @@ def build_gamma_state(chain: pd.DataFrame, spot: float, source: str = "yfinance"
     )
 
 # ============================================================
-# IBKR CONNECTION
+# ADVANCED ANALYTICS — GWAS / TERM STRUCTURE / FLOW IMBALANCE
 # ============================================================
-# ============================================================
+
+def compute_gwas(chain: pd.DataFrame, spot: float) -> dict:
+    """
+    Gamma-Weighted Average Strike (GWAS) above and below spot.
+
+    Instead of discrete "wall at $X", this gives a probabilistic gravity
+    centre for positive-gamma pinning zones — the diffuse region where
+    dealer hedging creates mean-reversion pressure.
+
+    Returns dict with:
+      gwas_above  — gamma-weighted avg strike of all strikes above spot
+      gwas_below  — gamma-weighted avg strike of all strikes below spot
+      gwas_net    — net gravity centre across all strikes (call-weighted)
+      total_gex_above / total_gex_below — magnitudes for sizing
+    """
+    if chain is None or chain.empty:
+        return {}
+
+    # Work from per-strike aggregated GEX (sum across expirations)
+    gex_chain = compute_gex_from_chain(chain, spot)
+    agg = gex_chain.groupby("strike")["net_gex"].sum().reset_index()
+
+    above = agg[agg["strike"] > spot].copy()
+    below = agg[agg["strike"] < spot].copy()
+
+    def _wt_avg(df):
+        weights = df["net_gex"].abs()
+        total = weights.sum()
+        if total == 0:
+            return None, 0.0
+        return float((df["strike"] * weights).sum() / total), float(total)
+
+    gwas_above, mag_above = _wt_avg(above)
+    gwas_below, mag_below = _wt_avg(below)
+
+    # Net gravity: positive-GEX strikes only (true pin zones)
+    pos = agg[agg["net_gex"] > 0]
+    wt_pos = pos["net_gex"].sum()
+    gwas_net = float((pos["strike"] * pos["net_gex"]).sum() / wt_pos) if wt_pos > 0 else None
+
+    return {
+        "gwas_above":       gwas_above,
+        "gwas_below":       gwas_below,
+        "gwas_net":         gwas_net,
+        "total_gex_above":  mag_above,
+        "total_gex_below":  mag_below,
+    }
+
+
+def compute_gex_term_structure(chain: pd.DataFrame, spot: float) -> dict:
+    """
+    GEX Term Structure: ratio of near-term to longer-dated gamma.
+
+    Splits chain into:
+      ≤7 DTE  — weekly / 0DTE positioning (expires fast, fragile)
+      8-45 DTE — monthly positioning (durable regime support)
+
+    A positive gamma regime driven by weeklies evaporates by Friday.
+    Monthly gamma provides structural support that persists across sessions.
+
+    Returns:
+      gex_0_7dte       — total net GEX for ≤7 DTE
+      gex_8_45dte      — total net GEX for 8-45 DTE
+      fragility_ratio  — 0_7 / total (0=all monthlies, 1=all weeklies)
+      durability       — "durable" / "fragile" / "mixed"
+      dte_buckets      — list of (label, gex) for bar chart
+    """
+    if chain is None or chain.empty:
+        return {}
+
+    gex_chain = compute_gex_from_chain(chain, spot)
+    gex_chain["dte"] = (gex_chain["expiry_T"] * 365).round().astype(int)
+
+    buckets = [
+        ("0–7 DTE",   gex_chain[gex_chain["dte"] <= 7]["net_gex"].sum()),
+        ("8–21 DTE",  gex_chain[(gex_chain["dte"] > 7)  & (gex_chain["dte"] <= 21)]["net_gex"].sum()),
+        ("22–45 DTE", gex_chain[(gex_chain["dte"] > 21) & (gex_chain["dte"] <= 45)]["net_gex"].sum()),
+        ("46+ DTE",   gex_chain[gex_chain["dte"] > 45]["net_gex"].sum()),
+    ]
+
+    gex_0_7   = float(gex_chain[gex_chain["dte"] <= 7]["net_gex"].sum())
+    gex_8_45  = float(gex_chain[(gex_chain["dte"] > 7) & (gex_chain["dte"] <= 45)]["net_gex"].sum())
+    total_abs = abs(gex_0_7) + abs(gex_8_45)
+    fragility = abs(gex_0_7) / total_abs if total_abs > 0 else 0.5
+
+    if fragility > 0.65:
+        durability = "fragile"   # regime collapses as weeklies expire
+    elif fragility < 0.30:
+        durability = "durable"   # monthly gamma dominates → structural
+    else:
+        durability = "mixed"
+
+    return {
+        "gex_0_7dte":      gex_0_7,
+        "gex_8_45dte":     gex_8_45,
+        "fragility_ratio": fragility,
+        "durability":      durability,
+        "dte_buckets":     buckets,
+    }
+
+
+def compute_flow_imbalance(chain: pd.DataFrame, spot: float) -> dict:
+    """
+    Put/Call Dollar Volume Imbalance.
+
+    Volume = what's happening NOW. OI = yesterday's positions.
+    Dollar premium = volume × mid_price (or IV-approximated premium).
+
+    If 'volume' column present (Schwab intraday), uses it directly.
+    Falls back to OI as a proxy when volume is unavailable.
+
+    Returns:
+      put_dollar_vol   — total put dollar premium (volume × approx price)
+      call_dollar_vol  — total call dollar premium
+      pc_ratio         — put / call dollar ratio (>1.2 = fear, <0.8 = greed)
+      flow_bias        — "bearish" / "bullish" / "neutral"
+      put_pct          — put share of total dollar flow
+    """
+    if chain is None or chain.empty:
+        return {}
+
+    df = chain.copy()
+    has_volume = "volume" in df.columns and df["volume"].notna().any() and (df["volume"] > 0).any()
+
+    # Approximate premium per contract: Black-Scholes call/put price
+    # (fast approximation using ATM IV for simplicity; good enough for ratio)
+    def _approx_premium(row, is_call):
+        S, K, T, iv = spot, row["strike"], max(row.get("expiry_T", 0.01), 1/365), row.get("iv", 0.20)
+        if T <= 0 or iv <= 0:
+            return max(S - K, 0) if is_call else max(K - S, 0)
+        d1 = (math.log(S / K) + (0.05 + 0.5 * iv**2) * T) / (iv * math.sqrt(T))
+        d2 = d1 - iv * math.sqrt(T)
+        if is_call:
+            return float(S * scipy_norm.cdf(d1) - K * math.exp(-0.05 * T) * scipy_norm.cdf(d2))
+        else:
+            return float(K * math.exp(-0.05 * T) * scipy_norm.cdf(-d2) - S * scipy_norm.cdf(-d1))
+
+    # Use volume if available, else OI as proxy
+    flow_col = "volume" if has_volume else None
+
+    call_rows = df[df["call_oi"] > 0].copy() if not has_volume else df[df.get("call_volume", pd.Series(dtype=float)) > 0].copy()
+    put_rows  = df[df["put_oi"] > 0].copy()
+
+    # Simpler: use OI × premium as the dollar weight
+    call_premium = df.apply(lambda r: _approx_premium(r, True)  * (r.get("volume", r["call_oi"]) if has_volume else r["call_oi"]) * 100, axis=1).sum()
+    put_premium  = df.apply(lambda r: _approx_premium(r, False) * (r.get("volume", r["put_oi"])  if has_volume else r["put_oi"])  * 100, axis=1).sum()
+
+    total = call_premium + put_premium
+    pc_ratio = put_premium / call_premium if call_premium > 0 else 1.0
+    put_pct  = put_premium / total if total > 0 else 0.5
+
+    if pc_ratio > 1.3:
+        flow_bias = "bearish"   # heavy put premium = fear / hedging
+    elif pc_ratio < 0.77:
+        flow_bias = "bullish"   # call premium dominant = speculation / complacency
+    else:
+        flow_bias = "neutral"
+
+    return {
+        "put_dollar_vol":  float(put_premium),
+        "call_dollar_vol": float(call_premium),
+        "pc_ratio":        float(pc_ratio),
+        "flow_bias":       flow_bias,
+        "put_pct":         float(put_pct),
+        "using_volume":    has_volume,
+    }
+

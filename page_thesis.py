@@ -885,75 +885,98 @@ def _recession_stress(sahm: float, hy: float, s2s10_bp: float,
 
 def _composite(prob: dict, vrp_val: float,
                leading: dict = None, gex_regime: "GammaRegime | None" = None,
-               vts_shape: str = "MIXED") -> int:
+               vts_shape: str = "MIXED",
+               fear_z: float = 0.0,
+               rec_score: float = 50.0,
+               spx_dd: float = 0.0,
+               macro_reg: str = "Goldilocks",
+               growth_score: int = 0) -> int:
     """
     Composite directional score −10 to +10.
 
-    Design philosophy:
-      - The PROBABILITY SIGNAL (tactical/short/medium buckets) is the primary
-        driver. It should dominate the score when there is genuine directional
-        conviction (prob >> 50% or << 50%).
-      - Structural overlays (stress flags, GEX regime, VRP) are TILTS — they
-        shift the score by ±0.5 to ±1.5 total, not enough to override a clear
-        probability signal but enough to matter when signals are mixed.
-      - compute_prob_composite() compresses toward 50 when uncertain. On a
-        typical mixed-signal day it outputs 48–55%. The scoring must translate
-        this into a readable −2 to +2 range before overlays, not ±0.1.
+    compute_prob_composite() is epistemically conservative — it compresses
+    toward 50 when signals are mixed and rarely outputs outside 42–58. Using
+    it as the primary driver produces 0/10 on almost every day regardless of
+    how stressed or bullish conditions actually are.
 
-    Scaling:
-      _bucket_score at p=55  → (55-50)/8 = 0.625
-      _bucket_score at p=60  → (60-50)/8 = 1.25
-      _bucket_score at p=70  → (70-50)/8 = 2.5
-      Weighted sum of three buckets all at 60% → ~1.25 (before overlays)
-      Weighted sum of three buckets all at 70% → ~2.5 (before overlays)
-      Max theoretical (all buckets at 100%) → (50/8) = 6.25
-      Overlays add/subtract ≤ 2.0 total → final range stays within ±8
+    Primary drivers (all observable, all non-compressed):
+      fear_z       35% — rolling z-score of VIX+HY+NFCI+EPU
+      rec_score    20% — 7-component recession stress 0-100
+      spx_dd       15% — SPX drawdown from 6M high (price action)
+      macro_reg    15% — growth×inflation regime quadrant
+      prob_sig     15% — external prob buckets (secondary, capped ±1.5)
+
+    Overlays add ≤ ±2 total so the primary signal always dominates.
+    Final ×2 scale maps typical ±2.5 range → ±5 on the ±10 scale.
     """
 
-    def _bucket_score(p: float) -> float:
-        # Divisor 8: 55%→+0.6, 60%→+1.25, 65%→+1.9, 70%→+2.5
-        return (p - 50.0) / 8.0
+    # ── 1. Fear signal ────────────────────────────────────────────────────
+    # fear_z is rolling 252d z-score composite. +1.5σ = ELEVATED, -1σ = calm.
+    # Negative because high fear_z → bearish directional signal.
+    fear_sig = float(np.clip(-fear_z * 1.5, -3.5, 3.5))
 
+    # ── 2. Recession stress signal ────────────────────────────────────────
+    # rec_score 0-100. >60 = elevated, <30 = low risk.
+    # Linear: 60→-1, 80→-2, 30→+0.5, 10→+1
+    rec_sig = float(np.clip(-(rec_score - 40.0) / 20.0, -2.5, 1.0))
+
+    # ── 3. Price action signal ────────────────────────────────────────────
+    # spx_dd: fraction from 6M high, negative = drawdown.
+    # -5%→-0.7, -10%→-1.4, -20%→-2.9, flat→0
+    dd_sig = float(np.clip(spx_dd / 0.07, -3.0, 1.0))
+
+    # ── 4. Macro regime signal ────────────────────────────────────────────
+    regime_base = {
+        "Goldilocks":   +1.5,
+        "Overheating":  +0.5,
+        "Disinflation": -0.5,
+        "Stagflation":  -1.5,
+        "Deflation":    -2.5,
+    }.get(macro_reg, 0.0)
+    regime_sig = float(np.clip(regime_base + growth_score * 0.1, -2.5, 2.0))
+
+    # ── 5. Prob bucket signal (secondary, capped ±1.5) ────────────────────
+    def _bs(p): return (p - 50.0) / 10.0
     tactical = prob.get("tactical_prob", 50.0)
     short    = prob.get("short_prob",    50.0)
     medium   = prob.get("medium_prob",   50.0)
+    prob_sig = float(np.clip(
+        0.25 * _bs(tactical) + 0.35 * _bs(short) + 0.40 * _bs(medium),
+        -1.5, 1.5
+    ))
 
-    # Weighted sum — medium-term signal carries more weight (less noise)
-    s = (0.25 * _bucket_score(tactical) +
-         0.35 * _bucket_score(short) +
-         0.40 * _bucket_score(medium))
+    # ── Weighted primary sum ──────────────────────────────────────────────
+    s = (0.35 * fear_sig   +
+         0.20 * rec_sig    +
+         0.15 * dd_sig     +
+         0.15 * regime_sig +
+         0.15 * prob_sig)
 
-    # ── VRP tilt (±0.3 max) ───────────────────────────────────────────────
-    # Positive VRP = options expensive vs realized vol → slight bearish tilt
-    # for directional longs (vol crush risk, complacency signal)
+    # ── VRP overlay (±0.3 max) ────────────────────────────────────────────
     if np.isfinite(vrp_val):
         if vrp_val > 4:    s -= 0.3
         elif vrp_val > 2:  s -= 0.15
         elif vrp_val < -2: s += 0.15
         elif vrp_val < -4: s += 0.3
 
-    # ── Structural stress flags (−0.4 each, max −1.6 total) ──────────────
-    # Each flag is a meaningful regime signal but should not overwhelm the
-    # probability buckets. Four flags firing = −1.6, still within ±2 overlay
-    # budget so a bullish probability signal can partially offset.
+    # ── Structural stress flags (−0.25 each, max −1.0) ───────────────────
     if leading is not None:
         sahm_triggered = leading.get("sahm_triggered",  False)
         hy_stress      = leading.get("hy_stress_gate",  False)
         corr_systemic  = leading.get("corr_regime", "NORMAL") == "SYSTEMIC"
         vts_backw      = vts_shape == "BACKWARDATION"
         stress_count   = sum([sahm_triggered, hy_stress, corr_systemic, vts_backw])
-        s -= stress_count * 0.4
+        s -= stress_count * 0.25
 
-    # ── GEX regime tilt (±0.5 max) ───────────────────────────────────────
-    # Neg-gamma: dealers amplify directional moves → bearish tilt (tail risk)
-    # Pos-gamma: dealers suppress moves → mild bullish tilt (range/pin)
+    # ── GEX regime overlay (±0.4) ─────────────────────────────────────────
     if gex_regime is not None:
         neg_gamma = gex_regime in (GammaRegime.NEGATIVE, GammaRegime.STRONG_NEGATIVE)
         pos_gamma = gex_regime in (GammaRegime.POSITIVE, GammaRegime.STRONG_POSITIVE)
-        if neg_gamma:
-            s -= 0.5
-        elif pos_gamma:
-            s += 0.3
+        if neg_gamma:  s -= 0.4
+        elif pos_gamma: s += 0.3
+
+    # Scale to ±10: typical stressed day s≈-2.5 → -5, calm bullish s≈+2 → +4
+    s = s * 2.2
 
     return int(np.clip(round(s), -10, 10))
 
@@ -1534,7 +1557,12 @@ def render_thesis_page():
     comp=_composite(prob, vrp["val"],
                     leading=leading,
                     gex_regime=gex_st.regime,
-                    vts_shape=vts.get("shape","MIXED"))
+                    vts_shape=vts.get("shape","MIXED"),
+                    fear_z=fear_z,
+                    rec_score=rec,
+                    spx_dd=float(spydd.iloc[-1]),
+                    macro_reg=macro_reg,
+                    growth_score=growth_score)
     vrd,vc,ve=_verdict(comp,gex_st.regime)
     news=_news_cats(cat_intel)
     ua="NQ" if gex_sym in ("QQQ","NDX") else "ES"

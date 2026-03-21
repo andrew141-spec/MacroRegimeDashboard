@@ -97,11 +97,20 @@ def _merton_fig(spot: float, vix: float, days=5, n=4000) -> go.Figure:
         f=paths[:,d+1]
         for i,lv in enumerate(lvls):
             Z[i,d]=np.mean((f>=lv)&(f<lv+bkt))*100
+    y_labels=[f"{lv:.0f}" for lv in lvls]
     fig=go.Figure(go.Heatmap(z=Z,x=[f"Day {i+1}" for i in range(days)],
-        y=[f"{lv:.0f}" for lv in lvls],colorscale="Viridis",showscale=True,
+        y=y_labels,colorscale="Viridis",showscale=True,
         colorbar=dict(title="Prob%",thickness=12)))
-    fig.add_hline(y=f"{spot:.0f}",line_dash="dash",line_color="white",line_width=1.5,
-                  annotation_text=f"Spot {spot:.0f}",annotation_position="left")
+    # Categorical y-axis: add_hline fails. Use add_shape with paper coords instead.
+    closest_idx=int(np.argmin(np.abs(lvls-spot)))
+    y_paper=closest_idx/max(len(lvls)-1,1)
+    fig.add_shape(type="line",xref="paper",yref="paper",
+                  x0=0,x1=1,y0=y_paper,y1=y_paper,
+                  line=dict(color="white",width=1.5,dash="dash"))
+    fig.add_annotation(xref="paper",yref="paper",x=0.01,y=y_paper,
+                       text=f"Spot {spot:.0f}",showarrow=False,
+                       font=dict(color="white",size=10),
+                       xanchor="left",yanchor="bottom")
     plotly_dark(fig,title="Probability Heatmap — Merton Jump-Diffusion (1-week)",height=420)
     fig.update_layout(xaxis_title="Trading Day Forward",yaxis_title="Price Level")
     return fig

@@ -139,7 +139,7 @@ def _merton_calibrate(vix: float, vvix: float,
 def _merton_fig(spot: float, vix: float, vvix: float = float("nan"),
                 vts_shape: str = "MIXED", vrp_val: float = 0.0,
                 days=5, n=4000) -> go.Figure:
-    np.random.seed(42)
+    rng = np.random.default_rng()   # unseeded local generator — varies each call
     dt_s = 1 / 252
     sig  = vix / 100
     params = _merton_calibrate(vix, vvix, vts_shape, vrp_val)
@@ -148,9 +148,9 @@ def _merton_fig(spot: float, vix: float, vvix: float = float("nan"),
 
     paths = np.zeros((n, days + 1)); paths[:, 0] = spot
     for t in range(1, days + 1):
-        z  = np.random.standard_normal(n)
-        nj = np.random.poisson(lam * dt_s, n)
-        j  = np.random.normal(mj, sj, n) * nj
+        z  = rng.standard_normal(n)
+        nj = rng.poisson(lam * dt_s, n)
+        j  = rng.normal(mj, sj, n) * nj
         paths[:, t] = paths[:, t-1] * np.exp(drift * dt_s + sig * np.sqrt(dt_s) * z + j)
     lo=spot*0.93; hi=spot*1.07; lvls=np.linspace(lo,hi,24); bkt=(hi-lo)/24
     Z=np.zeros((24,days))
@@ -366,7 +366,7 @@ def _rdist_fig(spy: pd.Series, idx, rd: Dict) -> go.Figure:
     return fig
 
 def _recession_stress(sahm: float, hy: float, s2s10_bp: float,
-                      ur_3m_chg: float, vix: float) -> dict:
+                      icsa_4w_chg: float, vix: float) -> dict:
     """
     Recession Stress Index — a composite indicator, NOT a calibrated probability.
 
@@ -374,15 +374,16 @@ def _recession_stress(sahm: float, hy: float, s2s10_bp: float,
       1. Sahm Rule (0–0.5+ scale, most direct recession onset signal)
       2. HY OAS (credit stress, historical recession threshold ~500bp)
       3. Yield curve (2s10s inversion depth and duration proxy)
-      4. Unemployment trend (3M change)
-      5. VIX level (financial stress)
+      4. Initial jobless claims 4-week % change (ICSA — weekly, leads UNRATE)
+      5. VIX level (financial conditions proxy)
 
     These factors are standardized and combined with weights derived from
     the empirical literature on recession leading indicators:
       - Sahm Rule: 35% (most reliable real-time signal, Sahm 2019)
       - HY OAS:    25% (credit leads equity and employment)
       - Yield curve:20% (classic Estrella-Mishkin probit)
-      - UR 3M Δ:  12% (3-month unemployment change — independent from Sahm)
+      - ICSA 4W Δ: 12% (initial jobless claims — weekly frequency, genuinely
+                        orthogonal to Sahm which uses monthly UNRATE averages)
       - VIX:        8% (financial conditions proxy)
 
     Output is mapped to [0, 99] via a logistic function to avoid the
@@ -403,18 +404,19 @@ def _recession_stress(sahm: float, hy: float, s2s10_bp: float,
     # -150bp = deep inversion (strong recession signal), +50bp = normal
     curve_z = np.clip((-s2s10_bp - 0) / 150, 0, 1)  # 0 at flat, 1 at -150bp
 
-    # UR trend: 3-month change in unemployment rate.
-    # 0.0pp = stable, +0.3pp = deteriorating, +0.5pp = Sahm trigger territory.
-    # Normalise against the 0.5pp historical recession-onset threshold.
-    # ur_3m_chg is the actual 3M unemployment change passed in (not sahm).
-    ur_z = np.clip(ur_3m_chg / 0.4, 0, 1)  # 0=stable, 1=Sahm-level deterioration
+    # ICSA 4-week % change: genuinely orthogonal to Sahm Rule.
+    # Sahm uses monthly UNRATE 3M avg vs 12M min — a lagging stock measure.
+    # ICSA is weekly flow data that leads payrolls and UNRATE by 4–8 weeks.
+    # 0% = stable, +10% = deteriorating, +20% = recession-onset pace.
+    # Normalise: 20% 4-week rise historically coincides with recession onset.
+    icsa_z = np.clip(icsa_4w_chg / 0.20, 0, 1)
 
     # VIX: 15=normal, 25=elevated, 40=crisis
     vix_z = np.clip((vix - 15) / 35, 0, 1)
 
     # Weighted composite
     raw = (0.35 * sahm_z + 0.25 * hy_z + 0.20 * curve_z
-           + 0.12 * ur_z + 0.08 * vix_z)
+           + 0.12 * icsa_z + 0.08 * vix_z)
 
     # Map to 0-99 via logistic (avoids false precision near 0 and 100)
     # Calibrate so raw=0 → ~5%, raw=0.5 → ~50%, raw=1.0 → ~95%
@@ -433,10 +435,10 @@ def _recession_stress(sahm: float, hy: float, s2s10_bp: float,
         "score": score,
         "label": label,
         "components": {
-            "sahm_contribution":  round(0.35 * sahm_z * 100, 1),
-            "hy_contribution":    round(0.25 * hy_z   * 100, 1),
+            "sahm_contribution":  round(0.35 * sahm_z  * 100, 1),
+            "hy_contribution":    round(0.25 * hy_z    * 100, 1),
             "curve_contribution": round(0.20 * curve_z * 100, 1),
-            "ur_3m_contribution": round(0.12 * ur_z    * 100, 1),
+            "icsa_4w_contribution": round(0.12 * icsa_z * 100, 1),
             "vix_contribution":   round(0.08 * vix_z   * 100, 1),
         },
         "note": (
@@ -697,7 +699,8 @@ def render_thesis_page():
         hy_r=raw.get("BAMLH0A0HYM2",pd.Series(dtype=float))
         sahm=resample_ffill(sahm_r,idx) if len(sahm_r.dropna())>0 else None
         hys=resample_ffill(hy_r,idx) if len(hy_r.dropna())>0 else None
-
+        icsa_r=raw.get("ICSA",pd.Series(dtype=float))
+        icsa=resample_ffill(icsa_r,idx) if len(icsa_r.dropna())>0 else None
     core_yoy=(core/core.shift(365)-1)*100
     cpi_yoy=(cpi/cpi.shift(365)-1)*100
     s2s10=(y10-y2)*100
@@ -715,7 +718,15 @@ def render_thesis_page():
     ur=_sl(unrate,4.0); cyi=_sl(cpi_yoy,2.5); gzv=_sl(gz,0.0); izv=_sl(iz,0.0)
     nl4wv=_sl(nl4w,0.0)
     liq_lab="Expanding" if nl4wv>=0 else "Contracting"
-    y10_20=y10.diff(20); u3m=float(unrate.diff(90).iloc[-1]) if len(unrate)>90 else 0.0
+    y10_20=y10.diff(20)
+    # ICSA 4-week % change: weekly, leads UNRATE, orthogonal to Sahm Rule.
+    # Replaces the old u3m (UNRATE 90-day diff) which was redundant with Sahm.
+    if icsa is not None and icsa.dropna().size > 28:
+        _icsa_clean = icsa.dropna()
+        icsa_4w_chg = float(_icsa_clean.pct_change(28).dropna().iloc[-1])
+    else:
+        icsa_4w_chg = 0.0
+    u3m = icsa_4w_chg  # keep u3m alias for fp formula below (unrate direction proxy)
     warsh=((y10.diff(20)<0)&(bs13<0)).astype(int)
     spydd=(spy/spy.rolling(126).max()-1).fillna(0)
     tp=float(np.clip(45+35*float(spydd.iloc[-1]<=-0.07)+20*(fear>60),0,100))
@@ -725,7 +736,7 @@ def render_thesis_page():
     threeP=float(np.clip(0.35*trp+0.35*fp+0.30*tp,0,100))
     # Recession Stress Index — regime-calibrated stress score, NOT a calibrated probability
     # Using pre-quotes yield curve (crl) and pre-quotes VIX (vl); updated after quotes below
-    _stress = _recession_stress(sahmv, hyv, crl, u3m, vl)
+    _stress = _recession_stress(sahmv, hyv, crl, icsa_4w_chg, vl)
     rec     = _stress["score"]
     rec_lbl = _stress["label"]
     sr=_to_1d(spy).reindex(idx).ffill().pct_change().dropna()
@@ -786,6 +797,8 @@ def render_thesis_page():
     frag=tstr.get("fragility_ratio",0.5)*100 if tstr else 50.0
     pcr=fl.get("pc_ratio",1.0) if fl else 1.0
     fb=fl.get("flow_bias","neutral") if fl else "neutral"
+    _fl_using_vol = fl.get("using_volume", False) if fl else False
+    _fl_bias_label = "Flow Bias" if _fl_using_vol else "OI Bias (inventory)"
 
     with st.spinner("Computing signals…"):
         leading=compute_leading_stack(
@@ -895,7 +908,7 @@ def render_thesis_page():
     gright=("<div>"
             +"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>OPTIONS FLOW</div>"
             +_kv("P/C Dollar Ratio",f"{pcr:.2f}","#ef4444" if pcr>1.3 else "#10b981" if pcr<0.8 else "#94a3b8")
-            +_kv("Flow Bias",fb.upper(),"#ef4444" if fb=="bearish" else "#10b981" if fb=="bullish" else "#94a3b8")
+            +_kv(_fl_bias_label,fb.upper(),"#ef4444" if fb=="bearish" else "#10b981" if fb=="bullish" else "#94a3b8")
             +_kv("GEX Duration",f"{dur} ({frag:.0f}% weekly)","#ef4444" if dur=="FRAGILE" else "#10b981")
             +_kv("Net GEX",f"${gex_st.total_gex/1e9:.1f}B" if (gex_st.total_gex and abs(gex_st.total_gex)>=1e9) else f"${gex_st.total_gex/1e6:.0f}M" if gex_st.total_gex else "N/A")
             +_kv("Dist to Flip",f"{gex_st.distance_to_flip_pct:+.2f}%"))
@@ -947,7 +960,12 @@ def render_thesis_page():
         st.plotly_chart(_ivsurf_from_chain(chain_df if "chain_df" in dir() else None, float(gex_spot), "SPX", vix_live, vts.get("shape","MIXED")), use_container_width=True, key="th_ivs_spx")
     with c6:
         st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>6. IMPLIED VOL SURFACE — NDX</div>",unsafe_allow_html=True)
-        st.plotly_chart(_ivsurf_from_chain(chain_df if "chain_df" in dir() else None, float(gex_spot), "NDX", vix_live*0.92, vts.get("shape","MIXED")), use_container_width=True, key="th_ivs_ndx")
+        # Only pass the chain if it's actually NDX/QQQ data — do NOT fake NDX
+        # surface by scaling SPY/SPX chain with a kludge multiplier.
+        _ndx_chain = (chain_df if ("chain_df" in dir() and chain_df is not None
+                                   and gex_sym in ("QQQ", "NDX", "^NDX"))
+                      else None)
+        st.plotly_chart(_ivsurf_from_chain(_ndx_chain, float(gex_spot), "NDX", vix_live, vts.get("shape","MIXED")), use_container_width=True, key="th_ivs_ndx")
 
     # ── 7. IV vs RV ───────────────────────────────────────────────────────
     st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>7. IMPLIED vs REALIZED VOLATILITY</div>",unsafe_allow_html=True)

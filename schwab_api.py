@@ -368,12 +368,15 @@ def schwab_get_options_chain(client, symbol: str = "SPY",
 
                             if iv <= 0 or not np.isfinite(iv):
                                 iv = 0.18
+                            vol = int(contract.get("totalVolume", 0) or 0)
                             rows.append({
-                                "strike":      strike,
-                                "expiry_T":    T,
-                                "iv":          float(np.clip(iv, 0.01, 5.0)),
-                                "call_oi":     oi if right_char == "C" else 0,
-                                "put_oi":      oi if right_char == "P" else 0,
+                                "strike":       strike,
+                                "expiry_T":     T,
+                                "iv":           float(np.clip(iv, 0.01, 5.0)),
+                                "call_oi":      oi if right_char == "C" else 0,
+                                "put_oi":       oi if right_char == "P" else 0,
+                                "call_volume":  vol if right_char == "C" else 0,
+                                "put_volume":   vol if right_char == "P" else 0,
                                 "schwab_gamma": gk,  # always positive from Schwab API — sign applied via call_oi/put_oi convention in gex_engine
                             })
                     except Exception:
@@ -399,6 +402,8 @@ def schwab_get_options_chain(client, symbol: str = "SPY",
                     iv=("iv", "mean"),
                     call_oi=("call_oi", "sum"),
                     put_oi=("put_oi", "sum"),
+                    call_volume=("call_volume", "sum"),
+                    put_volume=("put_volume", "sum"),
                     schwab_gamma=("schwab_gamma", "mean"),
                 )
                 .reset_index())
@@ -407,5 +412,3 @@ def schwab_get_options_chain(client, symbol: str = "SPY",
     except Exception as e:
         st.session_state["_schwab_chain_error"] = f"{type(e).__name__}: {e}"
         return None
-
-

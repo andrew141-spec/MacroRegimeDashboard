@@ -179,19 +179,21 @@ def _merton_fig(spot: float, vix: float, vvix: float = float("nan"),
 def _ivsurf_from_chain(chain_df, spot: float, label: str,
                         vix: float, vts_shape: str) -> go.Figure:
     """
-    Build IV surface from ACTUAL options chain data (chain_df).
+    Build IV surface from actual options chain data using scattered 2D interpolation.
 
-    If chain_df is None or empty, returns a clearly-labelled placeholder figure
-    explaining that real data is unavailable — rather than silently showing a
+    The chain has sparse discrete data (few expiry buckets × few strikes), so a
+    simple pivot → fillna approach creates jagged spikes. Instead we:
+      1. Extract (moneyness, DTE, IV) scatter points from the raw chain
+      2. Interpolate onto a smooth dense grid using scipy.interpolate.griddata
+         with cubic method (falls back to linear if too few points)
+      3. Clip outliers and smooth with a 2D gaussian filter to remove edge artifacts
+
+    If chain_df is unavailable, shows a clearly-labelled placeholder — never a
     fake parametric surface.
-
-    The surface is built from per-strike, per-expiry IV already in the chain,
-    interpolated over a moneyness × DTE grid. No parametric assumptions about
-    skew slope or term structure slope are used — those come from the data.
     """
     if chain_df is None or len(chain_df) == 0:
         fig = go.Figure()
-        plotly_dark(fig, title=f"IV Surface — {label} (DATA UNAVAILABLE)", height=380)
+        plotly_dark(fig, title=f"IV Surface — {label} (DATA UNAVAILABLE)", height=420)
         fig.add_annotation(
             x=0.5, y=0.5, xref="paper", yref="paper",
             text=(
@@ -200,85 +202,127 @@ def _ivsurf_from_chain(chain_df, spot: float, label: str,
                 "A parametric model surface is NOT shown here<br>"
                 "because it would misrepresent actual skew conditions."
             ),
-            showarrow=False, font=dict(color="rgba(255,255,255,0.6)", size=12),
+            showarrow=False, font=dict(color="rgba(255,255,255,0.6)", size=13),
             align="center",
         )
         return fig
 
     try:
+        from scipy.interpolate import griddata
+        from scipy.ndimage import gaussian_filter
+
         df = chain_df.copy()
-        # expiry_T is in years; convert to DTE
-        df["dte"] = (df["expiry_T"] * 365).round().astype(int)
+        df["dte"] = (df["expiry_T"] * 365).clip(lower=1)
         df["moneyness"] = df["strike"] / spot
 
-        # Filter to reasonable range
+        # Filter to tradeable range and valid IV
         df = df[(df["moneyness"] >= 0.88) & (df["moneyness"] <= 1.12)]
         df = df[(df["dte"] >= 1) & (df["dte"] <= 180)]
-        df = df[df["iv"] > 0.01]
+        df = df[(df["iv"] > 0.005) & (df["iv"] < 5.0)]
 
-        if len(df) < 10:
-            raise ValueError("Insufficient chain data for surface")
+        # Remove extreme outliers: IV > 4× median is almost certainly bad data
+        iv_med = df["iv"].median()
+        df = df[df["iv"] < iv_med * 4]
 
-        # Build grid via pivot — average IV where multiple contracts exist per cell
-        # Round moneyness to nearest 0.01 for grid stability
-        df["m_bucket"] = (df["moneyness"] / 0.01).round() * 0.01
-        agg = df.groupby(["m_bucket", "dte"])["iv"].mean().reset_index()
-        pivot = agg.pivot(index="m_bucket", columns="dte", values="iv")
-        # Forward-fill missing DTEs (interpolate term structure)
-        pivot = pivot.interpolate(axis=1, limit_direction="both")
-        pivot = pivot.fillna(method="bfill").fillna(method="ffill")
+        if len(df) < 6:
+            raise ValueError(f"Only {len(df)} valid chain points — insufficient for surface")
 
-        Z_raw = pivot.values * 100  # to %
-        m_labels = [f"{m*100:.0f}%" for m in pivot.index]
-        dte_labels = list(pivot.columns)
+        # Scatter points in (DTE, moneyness) space
+        pts_dte = df["dte"].values.astype(float)
+        pts_m   = df["moneyness"].values.astype(float)
+        pts_iv  = df["iv"].values.astype(float) * 100  # → %
 
-        # Colour range: symmetric around ATM IV to highlight skew clearly
-        atm_iv = float(df[df["dte"].between(20, 35)]["iv"].mean()) * 100 if len(df[df["dte"].between(20, 35)]) > 0 else vix
-        z_mid = atm_iv
-        z_range = [max(0, z_mid * 0.5), z_mid * 2.0]
+        # Dense output grid: 30 moneyness × 20 DTE cells
+        dte_grid = np.linspace(pts_dte.min(), min(pts_dte.max(), 120), 20)
+        m_grid   = np.linspace(pts_m.min(),   pts_m.max(),   30)
+        DTE, MON = np.meshgrid(dte_grid, m_grid)
 
-        # Skew metrics for annotation
-        calls_25d = df[(df["moneyness"] > 1.02) & (df["moneyness"] < 1.06) & (df["dte"].between(20,35))]["iv"].mean()
-        puts_25d  = df[(df["moneyness"] > 0.94) & (df["moneyness"] < 0.98) & (df["dte"].between(20,35))]["iv"].mean()
-        skew_25d  = (puts_25d - calls_25d) * 100 if (np.isfinite(puts_25d) and np.isfinite(calls_25d)) else float("nan")
-        skew_str  = f"25Δ Skew: {skew_25d:+.1f}pts" if np.isfinite(skew_25d) else ""
+        # Try cubic interpolation; fall back to linear if too few unique points
+        method = "cubic" if len(df) >= 12 else "linear"
+        Z = griddata(
+            points=np.column_stack([pts_dte, pts_m]),
+            values=pts_iv,
+            xi=np.column_stack([DTE.ravel(), MON.ravel()]),
+            method=method,
+            fill_value=np.nan,
+        ).reshape(DTE.shape)
 
-        # Term structure: front vs back
-        front_atm = df[(df["moneyness"].between(0.99, 1.01)) & (df["dte"] <= 14)]["iv"].mean() * 100
-        back_atm  = df[(df["moneyness"].between(0.99, 1.01)) & (df["dte"].between(30, 60))]["iv"].mean() * 100
-        ts_str    = f"TS: {front_atm:.1f}% → {back_atm:.1f}%" if (np.isfinite(front_atm) and np.isfinite(back_atm)) else ""
+        # Fill any NaN edges with nearest-neighbour
+        nan_mask = ~np.isfinite(Z)
+        if nan_mask.any():
+            Z_nn = griddata(
+                points=np.column_stack([pts_dte, pts_m]),
+                values=pts_iv,
+                xi=np.column_stack([DTE.ravel(), MON.ravel()]),
+                method="nearest",
+            ).reshape(DTE.shape)
+            Z[nan_mask] = Z_nn[nan_mask]
 
-        regime_note = {"BACKWARDATION": "⚠️ VTS Backwardation", "CONTANGO": "✓ VTS Contango", "MIXED": "~ VTS Mixed"}.get(vts_shape, "")
+        # Gentle Gaussian smoothing to remove interpolation ripple
+        Z = gaussian_filter(Z, sigma=0.8)
 
-        title_str = f"IV Surface — {label} | {regime_note} | {skew_str} | {ts_str}"
+        # Clip to [50% ATM, 250% ATM] to prevent colour scale distortion
+        atm_iv_est = float(df[df["moneyness"].between(0.98, 1.02)]["iv"].mean() * 100) if len(df[df["moneyness"].between(0.98, 1.02)]) > 0 else vix
+        z_lo, z_hi = atm_iv_est * 0.5, atm_iv_est * 2.5
+        Z = np.clip(Z, z_lo, z_hi)
+
+        # ── Skew & term structure metrics from raw data ───────────────────
+        def _avg(mask): return float(df[mask]["iv"].mean() * 100) if mask.sum() > 0 else float("nan")
+        puts_25d  = _avg((df["moneyness"].between(0.93, 0.97)) & (df["dte"].between(15, 45)))
+        calls_25d = _avg((df["moneyness"].between(1.03, 1.07)) & (df["dte"].between(15, 45)))
+        skew_25d  = puts_25d - calls_25d
+        front_atm = _avg((df["moneyness"].between(0.985, 1.015)) & (df["dte"] <= 10))
+        back_atm  = _avg((df["moneyness"].between(0.985, 1.015)) & (df["dte"].between(25, 70)))
+        skew_str  = f"25Δ Skew: {skew_25d:+.1f}pts" if (np.isfinite(puts_25d) and np.isfinite(calls_25d)) else "skew: n/a"
+        ts_str    = f"TS: {front_atm:.1f}% → {back_atm:.1f}%" if (np.isfinite(front_atm) and np.isfinite(back_atm)) else "TS: n/a"
+        regime_note = {"BACKWARDATION": "⚠️ Backwardation", "CONTANGO": "✓ Contango", "MIXED": "~ Mixed"}.get(vts_shape, "")
+        n_points = len(df)
 
         fig = go.Figure(go.Surface(
-            x=dte_labels,
-            y=m_labels,
-            z=Z_raw,
-            colorscale="RdYlGn_r",
+            x=dte_grid,
+            y=m_grid * 100,   # display as moneyness %
+            z=Z,
+            colorscale=[
+                [0.0,  "#1e3a5f"],   # deep blue   — low IV (cheap OTM calls)
+                [0.25, "#2563eb"],   # blue
+                [0.45, "#10b981"],   # green        — near ATM
+                [0.65, "#f59e0b"],   # amber
+                [0.85, "#ef4444"],   # red
+                [1.0,  "#7f1d1d"],   # dark red     — extreme OTM put skew
+            ],
             showscale=True,
-            colorbar=dict(title="IV%", thickness=12),
-            opacity=0.92,
-            cmin=z_range[0],
-            cmax=z_range[1],
+            colorbar=dict(title="IV%", thickness=14, len=0.75),
+            opacity=0.95,
+            contours=dict(
+                z=dict(show=True, usecolormap=True, highlightcolor="white",
+                       project=dict(z=True)),
+            ),
+            lighting=dict(ambient=0.7, diffuse=0.8, roughness=0.5, specular=0.3),
+            lightposition=dict(x=100, y=200, z=0),
         ))
-        plotly_dark(fig, title=title_str, height=400)
-        fig.update_layout(scene=dict(
-            xaxis_title="DTE",
-            yaxis_title="Moneyness",
-            zaxis_title="IV%",
-            bgcolor="rgba(0,0,0,0)",
-        ))
+
+        plotly_dark(fig, title=f"IV Surface — {label}  |  {regime_note}  |  {skew_str}  |  {ts_str}  ({n_points} pts)", height=460)
+        fig.update_layout(
+            scene=dict(
+                xaxis=dict(title="DTE", backgroundcolor="rgba(0,0,0,0)",
+                           gridcolor="rgba(255,255,255,0.08)", showbackground=True),
+                yaxis=dict(title="Moneyness (%)", backgroundcolor="rgba(0,0,0,0)",
+                           gridcolor="rgba(255,255,255,0.08)", showbackground=True),
+                zaxis=dict(title="IV%", backgroundcolor="rgba(0,0,0,0)",
+                           gridcolor="rgba(255,255,255,0.08)", showbackground=True),
+                bgcolor="rgba(0,0,0,0)",
+                camera=dict(eye=dict(x=1.6, y=-1.6, z=0.9)),  # better default angle
+            ),
+            margin=dict(l=0, r=0, t=50, b=0),
+        )
         return fig
 
     except Exception as exc:
-        # Data available but surface build failed — show honest error
         fig = go.Figure()
         plotly_dark(fig, title=f"IV Surface — {label} (BUILD ERROR)", height=380)
         fig.add_annotation(
             x=0.5, y=0.5, xref="paper", yref="paper",
-            text=f"Surface build failed: {exc}<br>Raw chain data present but insufficient for surface.",
+            text=f"Surface build failed: {type(exc).__name__}: {exc}",
             showarrow=False, font=dict(color="rgba(255,200,0,0.8)", size=11),
             align="center",
         )

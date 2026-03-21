@@ -1162,50 +1162,109 @@ def render_thesis_page():
     cyl=_sl(core_yoy,2.5); crl=_sl(s2s10,0.0)
     gz=zscore(s2s10.fillna(0)); iz=zscore(core_yoy.fillna(cyl))
 
-    # ── Macro regime — local classification ───────────────────────────────
-    # classify_macro_regime_abs in probability.py uses thresholds calibrated
-    # for a post-2021 inflationary world. In a tariff-shock / growth-scare
-    # environment where core CPI is decelerating rapidly and the curve is
-    # flat-to-inverted, it systematically reads "Goldilocks" or "Overheating"
-    # when the correct read is "Disinflation" or "Deflation Risk".
+    # ── Raw metric scalars (needed by regime classifier below) ────────────
+    # These are computed here — display strings / Fed signals computed later.
+    _icsa_v_raw  = _sl(icsa, float("nan")) if icsa is not None else float("nan")
+    _icsa_v_k    = _icsa_v_raw / 1000 if np.isfinite(_icsa_v_raw) else float("nan")
+    _nfp_v       = float(nfp_s.dropna().diff(1).dropna().iloc[-1]) if (nfp_s is not None and nfp_s.dropna().size > 1) else float("nan")
+    _ccpi_v      = _sl(core_yoy, float("nan"))
+    _ppi_mom     = float(ppi_s.dropna().pct_change(1).dropna().iloc[-1] * 100) if (ppi_s is not None and ppi_s.dropna().size > 1) else float("nan")
+    _ism_mfg_v   = _sl(ism, float("nan")) if ism is not None else float("nan")
+    _ism_nm_v    = _sl(ism_nm, float("nan")) if ism_nm is not None else float("nan")
+    _chi_v       = _sl(chi_pmi, float("nan")) if chi_pmi is not None else float("nan")
+    _conf_v      = _sl(conf_s, float("nan")) if conf_s is not None else float("nan")
+
+    # ── Macro regime — multi-metric classification ────────────────────────
+    # Uses all 10 metrics from the framework image with their exact thresholds.
     #
-    # 2×2 framework (growth z-score × inflation z-score):
-    #   Growth proxy:    2s10s spread (steepening = growth optimism)
-    #   Inflation proxy: core CPI YoY (level AND direction of travel)
+    # Each metric contributes a GROWTH score and an INFLATION score:
+    #   Growth score  >0 → expansionary conditions → supports Goldilocks/Overheating
+    #   Growth score  <0 → contractionary conditions → supports Stagflation/Deflation
+    #   Inflation score >0 → inflation hot → Overheating/Stagflation
+    #   Inflation score <0 → inflation cooling → Goldilocks/Deflation
     #
-    # Quadrants:
-    #   Growth+, Inflation+  → Overheating   (curve steep, CPI hot)
-    #   Growth+, Inflation−  → Goldilocks    (curve steep, CPI cooling)
-    #   Growth−, Inflation+  → Stagflation   (curve flat/inv, CPI still hot)
-    #   Growth−, Inflation−  → Deflation     (curve flat/inv, CPI cooling)
-    #
-    # Additionally flag "Disinflation" when CPI is decelerating fast even if
-    # still above 2% — this is the current environment (CPI falling from 3%+
-    # toward 2% with growth uncertainty from tariff shock).
-    _gz_now  = _sl(gz, 0.0)   # 2s10s z-score
-    _iz_now  = _sl(iz, 0.0)   # core CPI YoY z-score
-    # Direction of travel: is core CPI trending down over the past 3 months?
+    # Metric → Growth / Inflation signal mapping:
+    #   Unemployment  high → bad growth (-1), low → good growth (+1)       | no inflation signal
+    #   ICSA          high → bad growth (-1), low → good growth (+1)       | no inflation signal
+    #   NFP           high → good growth (+1), low → bad growth (-1)       | no inflation signal
+    #   CPI YoY       high → hot inflation (+1 inf), low → cool (-1 inf)   | slight growth drag if >3%
+    #   Core CPI YoY  high → hot inflation (+1 inf), low → cool (-1 inf)   | no growth signal
+    #   PPI MoM       high → hot inflation (+1 inf), low → cool (-1 inf)   | no growth signal
+    #   ISM Mfg PMI   >55 → good growth (+1), <50 → bad growth (-1)        | >55 mild inflation
+    #   ISM Non-Mfg   >55 → good growth (+1), <50 → bad growth (-1)        | >55 mild inflation
+    #   Chicago PMI   >55 → good growth (+1), <50 → bad growth (-1)        | no inflation signal
+    #   Cons Conf     >120 → good growth (+1), <100 → bad growth (-1)      | no inflation signal
+
+    # Use scalars computed above — fall back to NaN-safe defaults
+    _ur_val    = ur                                        # percent
+    _icsa_val  = _icsa_v_k if np.isfinite(_icsa_v_k) else float("nan")  # thousands
+    _nfp_val   = _nfp_v                                   # thousands MoM
+    _cpi_val   = cyi                                       # percent YoY
+    _ccpi_val  = _ccpi_v                                  # percent YoY
+    _ppi_val   = _ppi_mom                                 # percent MoM
+    _ism_val   = _ism_mfg_v                               # index
+    _ism_nm_val= _ism_nm_v                                # index
+    _chi_val   = _chi_v                                   # index
+    _conf_val  = _conf_v                                  # index
+
+    def _score(val, good_hi, good_lo, bad_hi, bad_lo):
+        """Return +1 (good), 0 (neutral), -1 (bad). Handles NaN → 0."""
+        if not np.isfinite(val): return 0
+        if val >= good_hi: return +1
+        if val <= bad_lo:  return -1
+        return 0
+
+    # Growth scores (+1 = expansion, -1 = contraction)
+    _g_ur    = _score(_ur_val,   -99,  -99, 5.5, 4.0) * -1  # high UR → bad growth
+    _g_icsa  = _score(_icsa_val, -99,  -99, 350, 250) * -1  # high claims → bad growth
+    _g_nfp   = _score(_nfp_val,  250,   50, -99, -99)        # high NFP → good growth
+    _g_ism   = _score(_ism_val,   55,   50, -99,  50)        # >55 good, <50 bad
+    _g_ism_nm= _score(_ism_nm_val,55,   50, -99,  50)
+    _g_chi   = _score(_chi_val,   55,   50, -99,  50)
+    _g_conf  = _score(_conf_val, 120,  100, -99, 100)
+
+    growth_score = (_g_ur + _g_icsa + _g_nfp +
+                    _g_ism + _g_ism_nm + _g_chi + _g_conf)  # range: -7 to +7
+
+    # Inflation scores (+1 = hot, -1 = cool)
+    _i_cpi   = _score(_cpi_val,   2.5,  1.5, -99, 1.5)  # >2.5% hot, <1.5% cool
+    _i_ccpi  = _score(_ccpi_val,  2.5,  1.5, -99, 1.5)
+    _i_ppi   = _score(_ppi_val,   0.2,  0.0, -99, 0.0)  # >0.2% hot, <0% cool
+    # ISM expansions can also signal reflation
+    _i_ism_r = +1 if (np.isfinite(_ism_val) and _ism_val > 55) else (
+               -1 if (np.isfinite(_ism_val) and _ism_val < 48) else 0)
+
+    inflation_score = _i_cpi + _i_ccpi + _i_ppi + _i_ism_r  # range: -4 to +4
+
+    # Direction of travel modifier: is core CPI actively falling?
     _core_3m_chg = float(core_yoy.dropna().diff(63).dropna().iloc[-1]) if core_yoy.dropna().size > 63 else 0.0
-    _disinflating = _core_3m_chg < -0.10   # falling >10bp over 3M = clear disinflation trend
+    _disinflating = _core_3m_chg < -0.10  # falling >10bp over 3M
 
-    if _gz_now >= 0 and _iz_now >= 0:
-        macro_reg = "Overheating"
-    elif _gz_now >= 0 and _iz_now < 0:
-        macro_reg = "Goldilocks"
-    elif _gz_now < 0 and _iz_now >= 0:
-        # Stagflation — but if CPI is actively falling, soften to Disinflation
+    # Classify regime from growth_score × inflation_score
+    if growth_score >= 1 and inflation_score >= 1:
+        macro_reg = "Overheating"      # strong growth + hot inflation
+    elif growth_score >= 1 and inflation_score <= 0:
+        macro_reg = "Goldilocks"       # strong growth + cooling inflation
+    elif growth_score <= -1 and inflation_score >= 1:
+        # Stagflation — soften if CPI is already falling (transitory stagflation)
         macro_reg = "Disinflation" if _disinflating else "Stagflation"
+    elif growth_score <= -1 and inflation_score <= -1:
+        macro_reg = "Deflation"        # weak growth + falling prices
+    elif growth_score <= -1 and inflation_score == 0:
+        macro_reg = "Disinflation"     # weak growth + neutral inflation = slowing
     else:
-        # Growth−, Inflation−
-        macro_reg = "Deflation" if _iz_now < -0.5 else "Disinflation"
+        # Mixed signals — use z-score tiebreaker
+        _gz_now = _sl(gz, 0.0)
+        _iz_now = _sl(iz, 0.0)
+        if _gz_now >= 0 and _iz_now >= 0:   macro_reg = "Overheating"
+        elif _gz_now >= 0 and _iz_now < 0:  macro_reg = "Goldilocks"
+        elif _gz_now < 0 and _iz_now >= 0:  macro_reg = "Disinflation" if _disinflating else "Stagflation"
+        else:                                macro_reg = "Deflation" if _iz_now < -0.5 else "Disinflation"
 
-    # Override: external regime classifier for continuity with other pages
-    # (only use if it returns a non-default value)
+    # Override: external classifier only when it reads more stress than we do
     try:
         _ext_reg = classify_macro_regime_abs(cyl, crl)
-        # Only trust it when it's in strong agreement with our z-score read
-        # i.e. don't let it override a Deflation/Disinflation call with Goldilocks
-        if _ext_reg in ("Stagflation", "Deflation") and macro_reg not in ("Overheating",):
+        if _ext_reg in ("Stagflation", "Deflation") and macro_reg in ("Goldilocks", "Overheating"):
             macro_reg = _ext_reg
     except Exception:
         pass
@@ -1277,10 +1336,9 @@ def render_thesis_page():
     cpi_now = round(float(_cpi_raw.pct_change(1).dropna().iloc[-1]) * 100, 3) if len(_cpi_raw) > 1 else float("nan")
     rd=_retdist(spy,idx,0)
 
-    # ── Macro framework metric scalars & Fed signal ratings ───────────────
-    # Thresholds from the uploaded framework image.
-    # Fed signal: "Expansionary" (green), "Neutral" (yellow), "Contractionary" (red)
-    # Each returns (value_str, signal_str, signal_color)
+    # ── Macro framework metric display strings & Fed signal ratings ───────
+    # Raw scalars already computed above. Here we produce display strings
+    # and Fed action signals using the image thresholds.
 
     def _fed_sig(val, high_is_exp: bool, hi_thresh, lo_thresh, fmt=".1f"):
         """Classify a metric into Fed action signal using image thresholds.
@@ -1291,59 +1349,50 @@ def render_thesis_page():
             return "N/A", "N/A", "#94a3b8"
         vs = f"{val:{fmt}}"
         if high_is_exp:
-            if val > hi_thresh:   return vs, "Expansionary",    "#10b981"
+            if val > hi_thresh:    return vs, "Expansionary",   "#10b981"
             elif val >= lo_thresh: return vs, "Neutral",         "#f59e0b"
             else:                  return vs, "Contractionary",  "#ef4444"
         else:
-            if val > hi_thresh:   return vs, "Contractionary",  "#ef4444"
+            if val > hi_thresh:    return vs, "Contractionary",  "#ef4444"
             elif val >= lo_thresh: return vs, "Neutral",         "#f59e0b"
             else:                  return vs, "Expansionary",    "#10b981"
 
     # Unemployment Rate — High: >5.5% (Exp), Normal: 4–5.5%, Low: <4% (Con)
     _ur_v, _ur_sig, _ur_col = _fed_sig(ur, True, 5.5, 4.0, ".1f")
 
-    # Initial Jobless Claims — High: >350k (Exp), Normal: 250-350k, Low: <250k (Con)
-    _icsa_v = _sl(icsa, float("nan")) if icsa is not None else float("nan")
-    _icsa_v_k = _icsa_v / 1000 if np.isfinite(_icsa_v) else float("nan")  # display in thousands
+    # Initial Jobless Claims
     _icsa_vs, _icsa_sig, _icsa_col = _fed_sig(_icsa_v_k, True, 350, 250, ".0f")
     _icsa_vs = f"{_icsa_v_k:.0f}k" if np.isfinite(_icsa_v_k) else "N/A"
 
-    # Nonfarm Payrolls MoM change (thousands) — High: >250k (Con), Normal: 50-250k, Low: <50k (Exp)
-    _nfp_v = float(nfp_s.dropna().diff(1).dropna().iloc[-1]) if (nfp_s is not None and nfp_s.dropna().size > 1) else float("nan")
+    # Nonfarm Payrolls MoM change (thousands)
     _nfp_vs, _nfp_sig, _nfp_col = _fed_sig(_nfp_v, False, 250, 50, ".0f")
     _nfp_vs = f"{_nfp_v:+.0f}k" if np.isfinite(_nfp_v) else "N/A"
 
-    # CPI YoY — High: >2% (Con), Normal: ~2%, Low: <2% (Exp)
+    # CPI YoY
     _cpi_vs, _cpi_sig, _cpi_col = _fed_sig(cyi, False, 2.5, 1.5, ".2f")
     _cpi_vs = f"{cyi:.2f}%"
 
-    # Core CPI YoY — High: >2% (Con), Normal: ~2%, Low: <2% (Exp)
-    _ccpi_v = _sl(core_yoy, float("nan"))
+    # Core CPI YoY
     _ccpi_vs, _ccpi_sig, _ccpi_col = _fed_sig(_ccpi_v, False, 2.5, 1.5, ".2f")
     _ccpi_vs = f"{_ccpi_v:.2f}%" if np.isfinite(_ccpi_v) else "N/A"
 
-    # PPI MoM — High: >0.2% (Con), Normal: 0–0.2%, Low: <0% (Exp)
-    _ppi_mom = float(ppi_s.dropna().pct_change(1).dropna().iloc[-1] * 100) if (ppi_s is not None and ppi_s.dropna().size > 1) else float("nan")
+    # PPI MoM
     _ppi_vs, _ppi_sig, _ppi_col = _fed_sig(_ppi_mom, False, 0.2, 0.0, "+.2f")
     _ppi_vs = f"{_ppi_mom:+.2f}%" if np.isfinite(_ppi_mom) else "N/A"
 
-    # ISM Manufacturing PMI — High: >55 (Con), Normal: 50-55, Low: <50 (Exp)
-    _ism_mfg_v = _sl(ism, float("nan")) if ism is not None else float("nan")
+    # ISM Manufacturing PMI
     _ism_vs, _ism_sig, _ism_col = _fed_sig(_ism_mfg_v, False, 55, 50, ".1f")
     _ism_vs = f"{_ism_mfg_v:.1f}" if np.isfinite(_ism_mfg_v) else "N/A"
 
-    # ISM Non-Manufacturing PMI — High: >55 (Con), Normal: 50-55, Low: <50 (Exp)
-    _ism_nm_v = _sl(ism_nm, float("nan")) if ism_nm is not None else float("nan")
+    # ISM Non-Manufacturing PMI
     _ism_nm_vs, _ism_nm_sig, _ism_nm_col = _fed_sig(_ism_nm_v, False, 55, 50, ".1f")
     _ism_nm_vs = f"{_ism_nm_v:.1f}" if np.isfinite(_ism_nm_v) else "N/A"
 
-    # Chicago PMI — High: >55 (Con), Normal: 50-55, Low: <50 (Exp)
-    _chi_v = _sl(chi_pmi, float("nan")) if chi_pmi is not None else float("nan")
+    # Chicago PMI
     _chi_vs, _chi_sig, _chi_col = _fed_sig(_chi_v, False, 55, 50, ".1f")
     _chi_vs = f"{_chi_v:.1f}" if np.isfinite(_chi_v) else "N/A"
 
-    # Consumer Confidence (UMich) — High: >120 (Con), Normal: 100-120, Low: <100 (Exp)
-    _conf_v = _sl(conf_s, float("nan")) if conf_s is not None else float("nan")
+    # Consumer Confidence (UMich)
     _conf_vs, _conf_sig, _conf_col = _fed_sig(_conf_v, False, 120, 100, ".1f")
     _conf_vs = f"{_conf_v:.1f}" if np.isfinite(_conf_v) else "N/A"
 

@@ -207,6 +207,12 @@ def load_macro(start_iso, end_iso):
     try:    out["GDPC1"] = fs("GDPC1")
     except: out["GDPC1"] = pd.Series(dtype=float)
 
+    # ── NEW: Economic Policy Uncertainty (Baker-Bloom-Davis) ─────────────
+    # USEPUINDXD: daily EPU index. ~100 = calm, 200-400 = policy shock.
+    # Used in the 4-component fear composite alongside VIX, NFCI, HY OAS.
+    try:    out["USEPUINDXD"] = fs("USEPUINDXD")
+    except: out["USEPUINDXD"] = pd.Series(dtype=float)
+
     # ── Derived: Sahm Rule ────────────────────────────────────────────────
     # 3-month avg UNRATE minus 12-month minimum — triggers recession signal at >= 0.50
     if "UNRATE" in out and not out["UNRATE"].empty:
@@ -236,4 +242,3 @@ def get_fwd_pe(ticker):
 # Organised into 7 signal categories matching the thesis document.
 # Each category has: feeds, keywords, impact weights, and a colour.
 # ============================================================
-

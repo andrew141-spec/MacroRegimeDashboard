@@ -1173,6 +1173,9 @@ def render_thesis_page():
     _ism_nm_v    = _sl(ism_nm, float("nan")) if ism_nm is not None else float("nan")
     _chi_v       = _sl(chi_pmi, float("nan")) if chi_pmi is not None else float("nan")
     _conf_v      = _sl(conf_s, float("nan")) if conf_s is not None else float("nan")
+    # ur and cyi also needed by regime classifier
+    ur  = _sl(unrate, 4.0)
+    cyi = _sl(cpi_yoy, 2.5)
 
     # ── Macro regime — multi-metric classification ────────────────────────
     # Uses all 10 metrics from the framework image with their exact thresholds.

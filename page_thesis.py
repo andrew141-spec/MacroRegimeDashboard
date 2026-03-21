@@ -489,8 +489,8 @@ def _ivsurf_from_chain(chain_df, spot: float, label: str,
         df["moneyness"] = df["strike"] / spot
 
         # Filter to tradeable range and valid IV
-        df = df[(df["moneyness"] >= 0.88) & (df["moneyness"] <= 1.12)]
-        df = df[(df["dte"] >= 1) & (df["dte"] <= 180)]
+        df = df[(df["moneyness"] >= 0.88) & (df["moneyness"] <= 1.15)]
+        df = df[(df["dte"] >= 1) & (df["dte"] <= 10)]
         df = df[(df["iv"] > 0.005) & (df["iv"] < 2.0)]   # tightened: >200% IV is bad data
 
         # Remove extreme outliers: IV > 3× median is almost certainly bad data
@@ -515,7 +515,8 @@ def _ivsurf_from_chain(chain_df, spot: float, label: str,
         pts_iv  = np.clip(df["iv"].values.astype(float) * 100, hard_lo, hard_hi)
 
         # Dense output grid: 30 moneyness × 20 DTE cells
-        dte_grid = np.linspace(pts_dte.min(), min(pts_dte.max(), 120), 20)
+        dte_max  = min(float(pts_dte.max()), 10.0)
+        dte_grid = np.linspace(max(float(pts_dte.min()), 1.0), dte_max, 16)
         m_grid   = np.linspace(pts_m.min(),   pts_m.max(),   30)
         DTE, MON = np.meshgrid(dte_grid, m_grid)
 
@@ -576,10 +577,7 @@ def _ivsurf_from_chain(chain_df, spot: float, label: str,
             showscale=True,
             colorbar=dict(title="IV%", thickness=14, len=0.75),
             opacity=0.95,
-            contours=dict(
-                z=dict(show=True, usecolormap=True, highlightcolor="white",
-                       project=dict(z=True)),
-            ),
+            contours=dict(z=dict(show=False))
             lighting=dict(ambient=0.7, diffuse=0.8, roughness=0.5, specular=0.3),
             lightposition=dict(x=100, y=200, z=0),
         ))

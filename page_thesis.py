@@ -12,7 +12,7 @@ from config import GammaState, GammaRegime, CSS
 from utils import _to_1d, zscore, resample_ffill, current_pct_rank
 from ui_components import plotly_dark
 from data_loaders import load_macro, get_gex_from_yfinance
-from gex_engine import (build_gamma_state, compute_gwas,
+from gex_engine import (build_gamma_state, compute_gwas, compute_gex_from_chain, compute_dealer_greeks,
                          compute_gex_term_structure, compute_flow_imbalance)
 from schwab_api import get_schwab_client, schwab_get_spot, schwab_get_options_chain
 from signals import compute_leading_stack, compute_1d_prob
@@ -560,6 +560,112 @@ def _gl(term,defn):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+
+def _gex_histogram(chain_df, spot: float, flip: float,
+                   max_dte: int = 45, height: int = 360) -> go.Figure:
+    """
+    GEX bar chart derived directly from the live options chain.
+    Pulls net GEX per strike from compute_gex_from_chain (same engine as
+    the GEX Engine page) so the bars are identical to what you see there.
+
+    Green = positive GEX (dealers long gamma, stabilising).
+    Red    = negative GEX (dealers short gamma, amplifying).
+    Yellow dashed = gamma flip level.
+    White dotted  = current spot.
+    """
+    _C_POS  = "#10b981"
+    _C_NEG  = "#ef4444"
+    _C_FLIP = "#f59e0b"
+
+    if chain_df is None or len(chain_df) == 0:
+        fig = go.Figure()
+        plotly_dark(fig, title="GEX Histogram (no chain data)", height=height)
+        return fig
+
+    try:
+        near_chain = chain_df[chain_df["expiry_T"] <= max_dte / 365.0].copy()
+        if near_chain.empty:
+            near_chain = chain_df.copy()
+
+        gex_chain = compute_gex_from_chain(near_chain, spot)
+
+        # Aggregate net GEX by strike across all expirations
+        agg = (gex_chain.groupby("strike")["net_gex"]
+                        .sum()
+                        .reset_index()
+                        .sort_values("strike"))
+
+        # Filter to ±10% around spot for readability
+        lo, hi = spot * 0.90, spot * 1.10
+        agg = agg[(agg["strike"] >= lo) & (agg["strike"] <= hi)]
+
+        if agg.empty:
+            raise ValueError("No strikes in ±10% range")
+
+        strikes = agg["strike"].tolist()
+        vals_m  = (agg["net_gex"] / 1e6).tolist()   # $ millions
+
+        # Auto-scale to $B if large
+        max_abs = max(abs(v) for v in vals_m)
+        if max_abs >= 5000:
+            vals_display = [v / 1000 for v in vals_m]
+            unit = "$B"
+        else:
+            vals_display = vals_m
+            unit = "$M"
+
+        colors = [_C_POS if v > 0 else _C_NEG for v in vals_display]
+
+        fig = go.Figure(go.Bar(
+            x=strikes,
+            y=vals_display,
+            marker_color=colors,
+            marker_line_width=0,
+            opacity=0.88,
+            name="Net GEX",
+        ))
+
+        # Zero line
+        fig.add_hline(y=0, line_color="rgba(255,255,255,0.30)", line_width=1)
+
+        # Spot line
+        fig.add_vline(
+            x=spot, line_dash="dot",
+            line_color="rgba(255,255,255,0.75)", line_width=1.5,
+            annotation_text=f"SPOT {spot:.0f}",
+            annotation_font_size=10,
+            annotation_font_color="rgba(255,255,255,0.85)",
+            annotation_position="top right",
+        )
+
+        # Gamma flip line
+        if flip and lo < flip < hi:
+            fig.add_vline(
+                x=flip, line_dash="dash",
+                line_color=_C_FLIP, line_width=1.5,
+                annotation_text=f"FLIP {flip:.0f}",
+                annotation_font_size=10,
+                annotation_font_color=_C_FLIP,
+                annotation_position="top left",
+            )
+
+        # Centre x-axis on spot
+        x_pad = max(abs(hi - spot), abs(spot - lo)) * 1.05
+        fig.update_layout(
+            xaxis=dict(range=[spot - x_pad, spot + x_pad], title="Strike"),
+            yaxis_title=f"Net GEX ({unit})",
+            bargap=0.12,
+            showlegend=False,
+        )
+        plotly_dark(fig, title=f"GEX Histogram — {unit} per Strike (≤{max_dte} DTE)", height=height)
+        return fig
+
+    except Exception as exc:
+        fig = go.Figure()
+        plotly_dark(fig, title=f"GEX Histogram (error: {exc})", height=height)
+        return fig
+
+
 def render_thesis_page():
     st.markdown(CSS, unsafe_allow_html=True)
     st.markdown("## 📋 Daily Thesis Briefing")
@@ -660,9 +766,13 @@ def render_thesis_page():
             tstr=compute_gex_term_structure(chain_df,float(gex_spot))
             fl=compute_flow_imbalance(chain_df,float(gex_spot))
             net_gex=gex_st.total_gex; gex_score=int(np.clip(net_gex/1e9*10,-50,50))
+            # ATM IV from chain: strikes within ±1% of spot, averaged across expirations
+            _atm_m = chain_df["strike"].between(float(gex_spot)*0.99, float(gex_spot)*1.01)
+            _atm_v = chain_df[_atm_m]["iv"].dropna()
+            atm_iv_chain = float(_atm_v.mean() * 100) if len(_atm_v) > 0 else None
         else:
             gex_st=GammaState(data_source="unavailable",timestamp=dt.datetime.now().strftime("%H:%M:%S"))
-            gwas=tstr=fl={}; net_gex=gex_score=0
+            gwas=tstr=fl={}; net_gex=gex_score=0; atm_iv_chain=None
 
     flip=gex_st.gamma_flip or gex_spot
     upper=gex_st.key_resistance[0] if gex_st.key_resistance else gex_spot*1.03
@@ -752,8 +862,12 @@ def render_thesis_page():
          +_kv("21D RV",f"{vrp['rv21']:.2f}%" if np.isfinite(vrp['rv21']) else "N/A")
          +_kv("VRP Spread",f"{vrp['spread']:+.2f}" if np.isfinite(vrp['spread']) else "N/A",vc2)
          +"<div style='margin-top:8px;font-size:10px;color:rgba(255,255,255,0.4);letter-spacing:0.1em;'>ATM IV</div>"
-         +_kv("SPX ATM IV",f"{vix_live:.1f}%")
-         +_kv("NDX ATM IV",f"{vix_live*0.88:.1f}%")
+         +_kv("SPX ATM IV",
+              f"{atm_iv_chain:.1f}%" if (atm_iv_chain and gex_sym in ("SPY","SPX"))
+              else f"{vix_live:.1f}% (VIX proxy)")
+         +_kv("NDX ATM IV",
+              f"{atm_iv_chain:.1f}%" if (atm_iv_chain and gex_sym in ("QQQ","NDX"))
+              else f"{q.get('VIX3M_last', vix_live * 0.92):.1f}% (VIX3M proxy)")
          +"</div></div>")
     st.markdown(_card(vol),unsafe_allow_html=True)
 
@@ -798,6 +912,13 @@ def render_thesis_page():
               +f"font-size:12px;color:rgba(255,255,255,0.65);font-style:italic;'>"
               +f"<span style='color:{gex_rc};font-weight:700;'>{gex_reg}</span> — {narr}</div>")
     st.markdown(_card(gex_body),unsafe_allow_html=True)
+
+    # ── 3b. GEX HISTOGRAM ────────────────────────────────────────────────
+    st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>GEX HISTOGRAM — Net Gamma Exposure per Strike</div>",unsafe_allow_html=True)
+    st.plotly_chart(
+        _gex_histogram(chain_df if chain_df is not None else None, float(gex_spot), float(flip)),
+        use_container_width=True, key="th_gex_hist"
+    )
 
     # ── 4. PROBABILITY HEATMAP ────────────────────────────────────────────
     st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>4. PROBABILITY HEATMAP — MC Simulation</div>",unsafe_allow_html=True)

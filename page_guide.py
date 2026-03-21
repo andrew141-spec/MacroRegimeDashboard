@@ -163,7 +163,7 @@ def render_guide():
     st.markdown("## 📖 Dashboard Guide")
     st.markdown("*Every concept explained in depth — what it is, why it exists, how it is computed, and how it feeds into the model.*")
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
         "🏠 Overview",
         "⚡ GEX Engine",
         "🔬 Greeks Deep Dive",
@@ -172,6 +172,7 @@ def render_guide():
         "📋 Execution",
         "⚠️ Risk Signals",
         "🔧 Setup & Data",
+        "🔵 GEX → NQ/ES",
     ])
 
     # ─────────────────────────────────────────────────────────
@@ -1168,4 +1169,261 @@ This dashboard is for **educational and research purposes only**. It is not inve
 All trading involves substantial risk of loss. Past performance of any signal, indicator, or model does not guarantee future results. The probability outputs reflect historical statistical relationships that may not persist. Macro regimes change. Model assumptions can be wrong. Position sizes derived from Kelly fractions assume edge estimates that are uncertain.
 
 Use this dashboard as one input among many. Always apply your own judgment. Always use stops.
+""")
+
+    with tab9:
+        st.markdown("### 🔵 Translating GEX Levels to NQ / ES Futures")
+        st.markdown("""
+The GEX Engine is built on **SPY and QQQ options** — the most liquid options markets in the world.
+But if you trade futures (ES, NQ, MES, MNQ), you need to convert those ETF-based levels into
+futures prices. This tab explains the mechanics, the conversion math, and how each GEX signal
+manifests differently in the futures tape.
+
+---
+
+### Why ETF Options Drive Futures Prices
+
+SPY and QQQ options represent the deepest options liquidity on the planet — far deeper than
+/ES or /NQ options. The dealer hedging flows from SPY/QQQ options therefore dominate the
+price action of the underlying index, which in turn forces futures to track.
+
+The direction of causality:
+```
+SPY/QQQ Options Dealers hedge → SPY/QQQ price moves → Index arbitrageurs → /ES and /NQ move
+```
+
+Futures lead intraday during low-volume periods (pre-market, overnight). ETF options lead
+during regular trading hours when dealer hedging dominates. Both converge at the index level
+via arbitrage — the premium/discount between futures and fair value is typically <0.1%.
+
+---
+
+### Converting SPY/QQQ GEX Levels to Futures Prices
+
+#### SPY → ES (/ES, MES)
+
+SPY tracks the S&P 500 at approximately **1/10th the index value**.
+
+```
+ES price ≈ SPY price × 10
+
+GEX strike (SPY) → ES level = SPY strike × 10
+```
+
+**Example:**
+- GEX flip level: SPY $542.00
+- ES equivalent:  5420
+- GWAS above:     SPY $547.50 → ES 5475
+- GWAS below:     SPY $538.00 → ES 5380
+
+**Multiplier note:** The ratio drifts slightly due to SPY's dividend treatment and fund expenses.
+The exact multiplier on any given day is: `SPY price / (S&P 500 index / 10)`. For practical
+intraday use, 10× is accurate to within 0.1%.
+
+---
+
+#### QQQ → NQ (/NQ, MNQ)
+
+QQQ tracks the Nasdaq-100 at approximately **1/40th the index value**.
+
+```
+NQ price ≈ QQQ price × 40
+
+GEX strike (QQQ) → NQ level = QQQ strike × 40
+```
+
+**Example:**
+- GEX flip level: QQQ $468.00
+- NQ equivalent:  18720
+- GWAS above:     QQQ $472.50 → NQ 18900
+- GWAS below:     QQQ $462.00 → NQ 18480
+
+**Multiplier note:** QQQ's ratio to NQ is less stable than SPY/ES because QQQ reinvests
+dividends differently. The exact multiplier: `QQQ price / (Nasdaq-100 index / 40)`. Use
+40× as a working approximation; verify against the live NQ futures quote.
+
+---
+
+### Tick Value and Dollar Impact
+
+Understanding how much a GEX level matters in dollar terms:
+
+| Instrument | Tick Size | Tick Value | 1 Point Value |
+|-----------|-----------|------------|---------------|
+| /ES (full) | 0.25 pts  | $12.50     | $50.00        |
+| MES (micro)| 0.25 pts  | $1.25      | $5.00         |
+| /NQ (full) | 0.25 pts  | $5.00      | $20.00        |
+| MNQ (micro)| 0.25 pts  | $0.50      | $2.00         |
+
+**GEX wall distance in dollars (/ES):**
+If the nearest GEX wall is 8 SPY points away (e.g., flip at 542, spot at 534):
+```
+8 SPY points × 10 = 80 ES points × $50/point = $4,000 per /ES contract
+```
+This is how much the market needs to travel before dealer hedging reverses regime.
+
+---
+
+### How Each GEX Signal Reads on the Futures Tape
+
+#### Gamma Flip Level → Key S/R in Futures
+
+The gamma flip translates directly to a key price level in ES/NQ. Above it, futures tend to
+be choppy and mean-reverting (positive gamma damping). Below it, futures exhibit trending,
+directional behaviour with less resistance to moves.
+
+**In the futures tape:**
+- **Above flip (positive gamma):** Expect 2–5 point ES pops to fade into resistance. Ranges compress.
+  Large orders get absorbed quickly. Bid-ask spread narrows. Good for fading extremes.
+- **Below flip (negative gamma):** Moves extend. Rally attempts fail quickly. Drops accelerate.
+  Market impact is higher — your stop needs to be wider or you accept more slippage.
+
+**Practical rule:** When ES is 10+ points below the flip, do not trade reversals. The mean-reversion
+logic that works in positive gamma breaks down. Trade with the trend or sit out.
+
+---
+
+#### GWAS → Intraday Gravity Centre in NQ/ES
+
+The gamma-weighted average strike (GWAS) translates to a *gravity zone* rather than a line.
+
+Convert GWAS to futures, then add a ±0.2% zone around it:
+```
+GWAS above (SPY $547.50) → ES 5475 → zone: 5464–5486
+GWAS below (SPY $538.00) → ES 5380 → zone: 5369–5391
+```
+
+**In the tape:**
+- ES/NQ will oscillate between these zones during positive gamma regimes
+- If price reaches GWAS above and stalls → high-probability short scalp back toward spot
+- If price reaches GWAS below and holds → high-probability long scalp back toward spot
+- If price **breaks through** GWAS zone cleanly → regime shift likely; previous zone becomes
+  new opposition
+
+---
+
+#### GEX Walls → Specific ES/NQ Levels
+
+Discrete GEX walls (largest absolute GEX strikes) convert to futures levels with this heuristic:
+
+**Zone sizing:**
+- Wall ≥ $500M GEX: treat as ±2 ES points zone (~0.04%)
+- Wall $200–500M GEX: treat as ±4 ES points zone
+- Wall <$200M GEX: treat as soft level only — single-bar confirmation required
+
+Large walls don't cause a binary rejection — they create **absorption zones** where the order flow
+thickens and moves slow. A 5-minute ES candle that wicks 3 points into a large wall and closes
+inside it is a textbook wall rejection. A close through the wall signals the wall has broken.
+
+---
+
+#### Vanna (VEX) → How IV Moves Affect ES/NQ Direction
+
+Vanna quantifies how much dealer delta changes when IV changes. In futures terms:
+
+**Positive vanna near spot:**
+- VIX rises (e.g., from 18 to 22) → dealers are forced to BUY futures to re-hedge
+- This buying floor under ES/NQ partially offsets the selloff
+- Result: ES drops less than you'd expect from VIX spike alone → do not chase shorts on IV spikes
+
+**Negative vanna near spot:**
+- VIX rises → dealers SELL futures to re-hedge
+- Their selling amplifies the selloff — momentum accelerates through lows
+- Result: ES drops more than VIX alone suggests → short-side momentum is legitimate, don't fade early
+
+**The vanna trade on NQ:**
+NQ is more vanna-sensitive than ES because Nasdaq options (QQQ) tend to carry higher IV and
+shorter-duration positioning. A VIX move that creates a 0.5% vanna flow in ES may create a
+1–1.5% flow in NQ. When the model shows negative vanna, NQ typically leads ES lower.
+
+---
+
+#### Charm (CEX) → Drift Throughout the Trading Session
+
+Charm is the time-decay component of dealer re-hedging. It creates a predictable directional
+drift during the session that is independent of news:
+
+**Positive charm near spot (typical in low-vol bull markets):**
+- As each hour passes, dealer deltas increase → they mechanically buy futures
+- Results in a persistent upward drift during the session, particularly 10:30–13:00 ET
+- ES/NQ tend to grind higher without obvious catalysts — this *is* the catalyst
+
+**Negative charm (elevated IV, put-heavy positioning):**
+- Time passing forces dealer selling → persistent downside drift during quiet periods
+- ES/NQ fade on low volume rallies, grinding lower even without news
+- Most visible on Tuesdays and Wednesdays (maximum charm decay mid-week)
+
+**EOD charm unwind:**
+The last 30 minutes of trading (15:30–16:00 ET) sees charm effects compound as 0DTE options
+approach expiry. If charm is positive, expect MOC buying pressure and ES/NQ closing near highs.
+If negative, expect MOC selling. This is mechanical, not sentiment — it happens regardless of
+what the news cycle is doing.
+
+---
+
+#### GEX Term Structure (Duration) → Position Sizing for NQ/ES Trades
+
+The fragility ratio (% of GEX in ≤7 DTE options) directly informs how long your levels stay valid:
+
+| Fragility | What it means for NQ/ES | Sizing implication |
+|-----------|--------------------------|-------------------|
+| >65% (fragile) | Gamma walls expire by Friday | Day-trade only. No overnight holds against GEX levels. Tighten stops |
+| 30–65% (mixed)  | Regime partially durable | Swing position OK but size down 30–50%. Re-evaluate post-expiry |
+| <30% (durable)  | Monthly gamma dominant | Full size. Levels valid 2–4 weeks. Can hold against intraday noise |
+
+**The weekly expiry problem:**
+Every Friday, large amounts of 0DTE and weekly gamma expire. The regime classification can
+flip violently at 16:00 ET Friday when open interest vanishes. Monday morning ES/NQ often open
+into a completely different gamma regime than Friday's close. **Always re-run the GEX engine
+Monday pre-open before placing trades based on Friday's levels.**
+
+---
+
+#### Flow Imbalance (P/C Ratio) → ES/NQ Tape Behaviour
+
+The put/call dollar premium ratio tells you what large players are buying right now:
+
+| P/C Ratio | ES/NQ implication |
+|-----------|-------------------|
+| >1.5 (heavy puts) | Institutional hedging in progress. Rallies get sold. NQ underperforms ES. ES grinding lower on low volume is a trap — do not buy the dip until ratio normalises |
+| 1.0–1.5 (elevated) | Moderate caution. Upside capped by hedge supply. Fade sharp ES/NQ rips. |
+| 0.8–1.0 (neutral)  | Balanced flow. Trade the technicals. GEX levels are cleaner. |
+| <0.8 (call heavy)  | Speculative call buying. ES/NQ can melt up on low volume. Vol compression risk. Do not short into call-heavy flow without a macro catalyst. |
+
+---
+
+### Quick Reference: GEX → NQ/ES Cheat Sheet
+
+```
+SPY GEX level × 10  = ES price
+QQQ GEX level × 40  = NQ price
+
+Positive gamma (above flip):
+  ES/NQ: fade moves to GWAS levels, expect mean-reversion, reduce size
+  Best setups: GWAS rejection, key node touch-and-reverse, charm drift trades
+
+Negative gamma (below flip):
+  ES/NQ: do not fade — momentum rules, adds to winners, wider stops
+  Best setups: trend continuation, GWAS breakdown, vanna-amplified vol spike shorts
+
+Vanna positive + VIX rising:
+  → Mechanical buying floor under ES/NQ. Buy the dip. Scale in.
+  → NQ often outperforms ES on vanna-supported moves.
+
+Vanna negative + VIX rising:
+  → Mechanical selling in ES/NQ. Do NOT buy the dip early.
+  → NQ leads lower. Wait for VIX to peak before fading the move.
+
+Charm positive (time passing):
+  → ES/NQ grind higher into close. Sell the open weakness, buy the close strength.
+
+Charm negative (time passing):
+  → ES/NQ fade into close. Sell morning rips. Do not hold longs into 15:00 ET.
+
+Fragile regime (>65% weekly gamma):
+  → All levels expire Friday. Day-trade only. No swing positions against GEX walls.
+
+Durable regime (<30% weekly gamma):
+  → ES/NQ levels reliable 2–4 weeks. Full size. Hold against intraday noise.
+```
 """)

@@ -1,626 +1,1429 @@
-# page_thesis.py — Daily Thesis Briefing (full 13-section report)
-import math, datetime as dt
-from typing import Dict, List, Tuple
+# page_guide.py — render_guide + render_probability_page
+import os, math, datetime as dt
+from typing import List, Dict, Tuple, Optional
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
-import yfinance as yf
-from scipy.stats import skew as _scipy_skew, kurtosis as _scipy_kurt
+from config import GammaState, GammaRegime, FeedItem, SetupScore, CSS
+from utils import _to_1d, resample_ffill, rolling_pct
+from ui_components import plotly_dark, sec_hdr
+from data_loaders import load_macro
+from signals import compute_leading_stack
 
-from config import GammaState, GammaRegime, CSS
-from utils import _to_1d, zscore, resample_ffill, current_pct_rank
-from ui_components import plotly_dark
-from data_loaders import load_macro, get_gex_from_yfinance
-from gex_engine import (build_gamma_state, compute_gwas,
-                         compute_gex_term_structure, compute_flow_imbalance)
-from schwab_api import get_schwab_client, schwab_get_spot, schwab_get_options_chain
-from signals import compute_leading_stack, compute_1d_prob
-from probability import (compute_prob_composite, get_session_context,
-                          classify_macro_regime_abs, regime_transition_prob)
-from intel_monitor import (load_feeds, geo_shock_score, categorise_items,
-                            category_shock_score, _all_feeds_flat, INTEL_CATEGORIES)
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _sl(s, d=float("nan")):
-    try:
-        v = s.dropna()
-        return float(v.iloc[-1]) if len(v) else d
-    except Exception:
-        return d
-
-@st.cache_data(ttl=60)
-def _quotes() -> Dict:
-    out = {}
-    pairs = [("SPX","^GSPC"),("NDX","^NDX"),("VIX","^VIX"),("VIX3M","^VIX3M"),
-             ("VVIX","^VVIX"),("DXY","DX-Y.NYB"),("GLD","GLD"),("TLT","TLT"),
-             ("TNX","^TNX"),("IRX","^IRX"),("SPY","SPY"),("QQQ","QQQ"),
-             ("HYG","HYG"),("ES","ES=F"),("NQ","NQ=F")]
-    for k, sym in pairs:
-        try:
-            h = yf.Ticker(sym).history(period="5d")
-            if not h.empty:
-                out[k+"_last"] = float(h["Close"].iloc[-1])
-                out[k+"_prev"] = float(h["Close"].iloc[-2]) if len(h)>1 else out[k+"_last"]
-                out[k+"_pct"]  = (out[k+"_last"]/out[k+"_prev"]-1)*100
-        except Exception:
-            pass
-    return out
-
-def _vrp_full(vix: float, spy: pd.Series, idx) -> Dict:
-    sa   = _to_1d(spy).reindex(idx).ffill()
-    rets = sa.pct_change()
-    rv21 = rets.rolling(21, min_periods=10).std() * np.sqrt(252) * 100
-    vrp  = vix - rv21
-    val  = _sl(vrp); z = _sl(zscore(vrp)); pct = current_pct_rank(vrp, 252)
-    rv21v = _sl(rv21)
-    reg  = ("RICH" if val>2 else "CHEAP" if val<-1 else "FAIR") if np.isfinite(val) else "N/A"
-    return {"val":val,"z":z,"pct":float(pct),"regime":reg,"rv21":rv21v,"spread":val}
-
-def _vts(q: Dict) -> Dict:
-    v=q.get("VIX_last",float("nan")); v3=q.get("VIX3M_last",float("nan"))
-    ratio = v/v3 if (v3 and v3>0) else float("nan")
-    carry = (v3-v)/v*100 if (v and v>0 and np.isfinite(v3)) else float("nan")
-    shape = ("BACKWARDATION" if (np.isfinite(ratio) and ratio>1.05)
-             else "CONTANGO" if (np.isfinite(ratio) and ratio<0.95) else "MIXED")
-    return {"ratio":ratio,"carry":carry,"shape":shape}
-
-def _tail(q: Dict) -> Dict:
-    vvix=q.get("VVIX_last",float("nan")); vix=q.get("VIX_last",20.0)
-    ratio = vvix/vix if (np.isfinite(vvix) and vix>0) else float("nan")
-    reg   = ("ELEVATED" if (np.isfinite(ratio) and ratio>5.5)
-             else "MODERATE" if (np.isfinite(ratio) and ratio>4.5) else "LOW")
-    return {"vvix":vvix,"ratio":ratio,"regime":reg}
-
-def _retdist(spy: pd.Series, idx, spot: float) -> Dict:
-    sa   = _to_1d(spy).reindex(idx).ffill()
-    rets = sa.pct_change().dropna()
-    if len(rets)<30: return {}
-    ds = float(rets.rolling(21,min_periods=10).std().iloc[-1])*100
-    sk = float(_scipy_skew(rets.tail(252)))
-    ku = float(_scipy_kurt(rets.tail(252), fisher=True))
-    return {"daily_sigma":ds,"skew":sk,"kurtosis":ku}
-
-def _merton_fig(spot: float, vix: float, days=5, n=4000) -> go.Figure:
-    np.random.seed(42)
-    dt_s=1/252; sig=vix/100
-    lam,mj,sj=0.10,-0.015,0.025
-    paths=np.zeros((n,days+1)); paths[:,0]=spot
-    for t in range(1,days+1):
-        z=np.random.standard_normal(n); nj=np.random.poisson(lam*dt_s,n)
-        j=np.random.normal(mj,sj,n)*nj
-        paths[:,t]=paths[:,t-1]*np.exp((-0.5*sig**2)*dt_s+sig*np.sqrt(dt_s)*z+j)
-    lo=spot*0.93; hi=spot*1.07; lvls=np.linspace(lo,hi,24); bkt=(hi-lo)/24
-    Z=np.zeros((24,days))
-    for d in range(days):
-        f=paths[:,d+1]
-        for i,lv in enumerate(lvls):
-            Z[i,d]=np.mean((f>=lv)&(f<lv+bkt))*100
-    y_labels=[f"{lv:.0f}" for lv in lvls]
-    fig=go.Figure(go.Heatmap(z=Z,x=[f"Day {i+1}" for i in range(days)],
-        y=y_labels,colorscale="Viridis",showscale=True,
-        colorbar=dict(title="Prob%",thickness=12)))
-    # Categorical y-axis: add_hline fails. Use add_shape with paper coords instead.
-    closest_idx=int(np.argmin(np.abs(lvls-spot)))
-    y_paper=closest_idx/max(len(lvls)-1,1)
-    fig.add_shape(type="line",xref="paper",yref="paper",
-                  x0=0,x1=1,y0=y_paper,y1=y_paper,
-                  line=dict(color="white",width=1.5,dash="dash"))
-    fig.add_annotation(xref="paper",yref="paper",x=0.01,y=y_paper,
-                       text=f"Spot {spot:.0f}",showarrow=False,
-                       font=dict(color="white",size=10),
-                       xanchor="left",yanchor="bottom")
-    plotly_dark(fig,title="Probability Heatmap — Merton Jump-Diffusion (1-week)",height=420)
-    fig.update_layout(xaxis_title="Trading Day Forward",yaxis_title="Price Level")
-    return fig
-
-def _ivsurf_fig(vix: float, label: str) -> go.Figure:
-    ms=np.linspace(0.88,1.12,15); dtes=np.array([7,14,21,45,90,180])
-    Z=np.zeros((len(ms),len(dtes)))
-    for i,m in enumerate(ms):
-        for j,d in enumerate(dtes):
-            mn=m-1.0
-            Z[i,j]=max((vix/100-0.30*mn-0.002*d)*100,1.0)
-    fig=go.Figure(go.Surface(x=dtes,y=[f"{m*100:.0f}%" for m in ms],z=Z,
-        colorscale="RdYlGn_r",showscale=True,colorbar=dict(title="IV%",thickness=12),opacity=0.90))
-    plotly_dark(fig,title=f"IV Surface — {label} (Model)",height=380)
-    fig.update_layout(scene=dict(xaxis_title="DTE",yaxis_title="Moneyness",
-                                  zaxis_title="IV%",bgcolor="rgba(0,0,0,0)"))
-    return fig
-
-def _ivrv_fig(vix_s: pd.Series, spy: pd.Series, idx) -> go.Figure:
-    sa=_to_1d(spy).reindex(idx).ffill(); va=_to_1d(vix_s).reindex(idx).ffill()
-    rv21=(sa.pct_change().rolling(21,min_periods=10).std()*np.sqrt(252)*100)
-    vrp=(va-rv21).dropna(); dates=vrp.index[-252:]
-    fig=go.Figure()
-    fig.add_trace(go.Scatter(x=dates,y=va.reindex(dates),name="VIX",
-                             line=dict(color="#6366f1",width=1.8)))
-    fig.add_trace(go.Scatter(x=dates,y=rv21.reindex(dates),name="21D RV",
-                             line=dict(color="#10b981",width=1.8)))
-    vs=vrp.reindex(dates)
-    fig.add_trace(go.Bar(x=dates,y=vs,name="VRP",yaxis="y2",opacity=0.55,
-                         marker_color=["#10b981" if v>=0 else "#ef4444" for v in vs]))
-    plotly_dark(fig,title="IV vs Realized Volatility — 1 Year",height=340)
-    fig.update_layout(yaxis=dict(title="Vol (%)"),
-                      yaxis2=dict(title="VRP",overlaying="y",side="right",showgrid=False),
-                      legend=dict(orientation="h",y=1.02))
-    return fig
-
-def _rdist_fig(spy: pd.Series, idx, rd: Dict) -> go.Figure:
-    sa=_to_1d(spy).reindex(idx).ffill()
-    rets=sa.pct_change().dropna().tail(252)*100
-    sig=rd.get("daily_sigma",1.0)
-    fig=go.Figure()
-    fig.add_trace(go.Histogram(x=rets,nbinsx=60,name="Actual",
-                               marker_color="#6366f1",opacity=0.75,histnorm="probability density"))
-    xn=np.linspace(float(rets.min()),float(rets.max()),200)
-    yn=np.exp(-0.5*(xn/sig)**2)/(sig*np.sqrt(2*np.pi))
-    fig.add_trace(go.Scatter(x=xn,y=yn,name="Normal",
-                             line=dict(color="#f59e0b",width=1.8,dash="dot")))
-    for m,col in [(1,"#10b981"),(2,"#f59e0b")]:
-        for s in [-1,1]:
-            fig.add_vline(x=s*m*sig,line_dash="dash",line_color=col,line_width=1)
-    plotly_dark(fig,title="Return Distribution & Probability Bands (1Y)",height=320)
-    fig.update_layout(xaxis_title="Daily Return (%)",yaxis_title="Density")
-    return fig
-
-def _rec_prob(sahm: float, puts: float, hy: float) -> float:
-    return round(min(np.clip(sahm/0.5*60,0,60)+np.clip((hy-300)/700*25,0,25)+np.clip((100-puts)/100*15,0,15),99),1)
-
-def _composite(prob: dict, fear: float, vrp_val: float, gex: GammaRegime) -> int:
-    s=int(round((prob.get("bull_prob",50)-50)/12.5))
-    if fear>70: s-=2
-    elif fear>55: s-=1
-    elif fear<35: s+=1
-    if np.isfinite(vrp_val):
-        if vrp_val>3: s-=1
-        elif vrp_val<-2: s+=1
-    if gex==GammaRegime.STRONG_NEGATIVE: s-=2
-    elif gex==GammaRegime.NEGATIVE: s-=1
-    elif gex==GammaRegime.STRONG_POSITIVE: s+=1
-    return int(np.clip(s,-10,10))
-
-def _verdict(c: int, gex: GammaRegime) -> Tuple[str,str,str]:
-    neg=gex in (GammaRegime.NEGATIVE,GammaRegime.STRONG_NEGATIVE)
-    pos=gex in (GammaRegime.POSITIVE,GammaRegime.STRONG_POSITIVE)
-    if c<=-4: return "BEARISH","#ef4444","Multiple signals aligned bearish."
-    if c<=-2:
-        return (("BEARISH","#ef4444","Negative macro + negative gamma.") if neg
-                else ("LEANING BEARISH","#f97316","Modest bearish lean."))
-    if c<=1:
-        if neg: return "CAUTIOUS","#f59e0b","Neutral signals but negative gamma — tail risk elevated."
-        if pos: return "NEUTRAL / RANGE","#6366f1","Positive gamma → compression and pin."
-        return "NEUTRAL","#94a3b8","No strong conviction."
-    if c<=3: return "LEANING BULLISH","#10b981","Bullish lean. Credit and liquidity constructive."
-    return "BULLISH","#10b981","Broad bullish alignment."
-
-def _bands(spot: float, vix: float) -> Dict:
-    dv=vix/100/np.sqrt(252); wv=vix/100/np.sqrt(52)
-    return {k:round(v,2) for k,v in {
-        "d1lo":spot*(1-dv),"d1hi":spot*(1+dv),
-        "d2lo":spot*(1-2*dv),"d2hi":spot*(1+2*dv),
-        "w1lo":spot*(1-wv),"w1hi":spot*(1+wv),
-        "w2lo":spot*(1-2*wv),"w2hi":spot*(1+2*wv)}.items()}
-
-def _news_cats(cat_intel: dict) -> List[Dict]:
-    out=[]
-    for k,items in cat_intel.items():
-        if not items: continue
-        m=INTEL_CATEGORIES.get(k,{})
-        sh=category_shock_score(items)
-        out.append({"label":m.get("label",k),"icon":m.get("icon","📰"),
-                    "sentiment":round(-(sh-30)/70,4),"count":len(items)})
-    return sorted(out,key=lambda x:abs(x["sentiment"]),reverse=True)
-
-# ── HTML helpers ──────────────────────────────────────────────────────────────
-
-def _card(body,bg="rgba(255,255,255,0.03)",border="rgba(255,255,255,0.10)"):
-    return (f"<div style='background:{bg};border:1px solid {border};border-radius:12px;"
-            f"padding:16px 20px;margin-bottom:14px;'>{body}</div>")
-
-def _sh(n,t):
-    return (f"<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);"
-            f"letter-spacing:0.15em;text-transform:uppercase;margin-bottom:8px;'>{n}. {t}</div>")
-
-def _kv(label,value,color="rgba(255,255,255,0.85)"):
-    return (f"<div style='display:flex;justify-content:space-between;align-items:baseline;"
-            f"margin-bottom:3px;font-size:13px;'>"
-            f"<span style='color:rgba(255,255,255,0.50);'>{label}</span>"
-            f"<span style='font-family:monospace;font-weight:600;color:{color};'>{value}</span></div>")
-
-def _tk(sym,price,pct):
-    if not np.isfinite(price): return ""
-    pc=("#10b981" if pct>=0 else "#ef4444") if np.isfinite(pct) else "#94a3b8"
-    ps=(f"+{pct:.2f}%" if pct>=0 else f"{pct:.2f}%") if np.isfinite(pct) else ""
-    return (f"<div style='text-align:center;'>"
-            f"<div style='font-size:10px;color:rgba(255,255,255,0.4);'>{sym}</div>"
-            f"<div style='font-family:monospace;font-size:14px;font-weight:700;'>{price:,.2f}</div>"
-            f"<div style='font-size:11px;color:{pc};font-weight:600;'>{ps}</div></div>")
-
-def _pill(text,color="#6366f1"):
-    return (f"<span style='background:{color}22;color:{color};border:1px solid {color}44;"
-            f"border-radius:6px;padding:2px 8px;font-size:11px;font-weight:600;"
-            f"margin-right:4px;display:inline-block;'>{text}</span>")
-
-def _sig(e,t):
-    return f"<div style='font-size:12px;margin-bottom:3px;'>{e} {t}</div>"
-
-def _gl(term,defn):
-    return (f"<div style='margin-bottom:10px;'>"
-            f"<div style='font-size:13px;font-weight:700;color:rgba(255,255,255,0.9);margin-bottom:2px;'>{term}</div>"
-            f"<div style='font-size:12px;color:rgba(255,255,255,0.55);line-height:1.55;'>{defn}</div></div>")
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-def render_thesis_page():
+# ============================================================
+# PROBABILITY ENGINE PAGE (data-driven)
+# ============================================================
+def render_probability_page():
+    """Probability engine deep-dive: signal overview bar chart + rolling history."""
     st.markdown(CSS, unsafe_allow_html=True)
-    st.markdown("## 📋 Daily Thesis Briefing")
-    st.markdown(f"*{dt.datetime.now().strftime('%A, %B %d, %Y — %H:%M ET')}*  |  Not financial advice.")
+    st.markdown("## 📊 Probability Engine")
+    st.markdown("Per-signal percentile ranks and rolling history for all leading indicators.")
 
-    st.sidebar.markdown("### Thesis Controls")
-    start=st.sidebar.date_input("Data Start",dt.date.today()-dt.timedelta(days=730),key="th_start")
-    end=st.sidebar.date_input("Data End",dt.date.today(),key="th_end")
-    gex_sym=st.sidebar.text_input("GEX Symbol","SPY",key="th_gex").upper().strip()
-    show_ua=st.sidebar.toggle("Show ES/NQ levels",True,key="th_ua")
-    if st.sidebar.button("🔄 Refresh",use_container_width=True,key="th_ref"):
-        st.cache_data.clear(); st.rerun()
+    start = st.sidebar.date_input("Start", value=dt.date.today() - dt.timedelta(days=730), key="pb_start")
+    end   = st.sidebar.date_input("End",   value=dt.date.today(), key="pb_end")
+    idx   = pd.date_range(start, end, freq="D")
 
-    idx=pd.date_range(start,end,freq="D")
+    with st.spinner("Loading data..."):
+        raw = load_macro(start.isoformat(), end.isoformat())
+        def r(k): return resample_ffill(raw.get(k, pd.Series(dtype=float)), idx)
+        y2=r("DGS2"); y3m=r("DGS3MO"); y10=r("DGS10"); y30=r("DGS30")
+        m2=r("M2SL"); walcl=r("WALCL"); tga=r("WTREGEN"); rrp=r("RRPONTSYD")
+        copx=r("COPX"); gld=r("GLD"); hyg=r("HYG"); lqd=r("LQD")
+        dxy=r("UUP"); spy=r("SPY"); vix=r("VIX"); qqq=r("QQQ"); iwm=r("IWM")
+        claims=r("ICSA")
+        tips_10y=r("DFII10"); bank_reserves=r("WRBWFRBL")
+        bank_credit=r("TOTBKCR")
+        ism_no_raw = raw.get("AMTMNO", pd.Series(dtype=float))
+        ism_no = ism_no_raw if len(ism_no_raw.dropna()) > 4 else None
+        gdp_quarterly=r("GDPC1"); mmmf=r("WRMFSL")
+        unrate=r("UNRATE")
+        hy_spread_raw = raw.get("BAMLH0A0HYM2", pd.Series(dtype=float))
 
-    with st.spinner("Loading macro data…"):
-        raw=load_macro(start.isoformat(),end.isoformat())
-        def r(k): return resample_ffill(raw.get(k,pd.Series(dtype=float)),idx)
-        y3m=r("DGS3MO");y2=r("DGS2");y10=r("DGS10");y30=r("DGS30")
-        cpi=r("CPIAUCSL");core=r("CPILFESL");unrate=r("UNRATE")
-        walcl=r("WALCL");tga=r("WTREGEN");rrp=r("RRPONTSYD");m2=r("M2SL")
-        nfci=resample_ffill(raw.get("NFCI",pd.Series(dtype=float)),idx).fillna(0)
-        vix_s=r("VIX");spy=r("SPY");tlt=r("TLT");qqq=r("QQQ")
-        copx=r("COPX");gld=r("GLD");hyg=r("HYG");lqd=r("LQD");dxy=r("UUP");iwm=r("IWM")
-        tips=r("DFII10");bres=r("WRBWFRBL");bcred=r("TOTBKCR");gdp=r("GDPC1");mmmf=r("WRMFSL")
-        ism_r=raw.get("AMTMNO",pd.Series(dtype=float))
-        ism=ism_r if len(ism_r.dropna())>4 else None
-        sahm_r=raw.get("SAHM_RULE",pd.Series(dtype=float))
-        hy_r=raw.get("BAMLH0A0HYM2",pd.Series(dtype=float))
-        sahm=resample_ffill(sahm_r,idx) if len(sahm_r.dropna())>0 else None
-        hys=resample_ffill(hy_r,idx) if len(hy_r.dropna())>0 else None
+    net_liq    = (walcl - tga - rrp) / 1000.0
+    net_liq_4w = net_liq.diff(28)
+    bs_13w     = walcl.diff(91) / 1000.0
+    s_2s10s    = (y10 - y2) * 100
 
-    core_yoy=(core/core.shift(365)-1)*100
-    cpi_yoy=(cpi/cpi.shift(365)-1)*100
-    s2s10=(y10-y2)*100
-    net_liq=(walcl-tga-rrp)/1000
-    nl4w=net_liq.diff(28); bs13=walcl.diff(91)/1000
-    cyl=_sl(core_yoy,2.5); crl=_sl(s2s10,0.0)
-    macro_reg=classify_macro_regime_abs(cyl,crl)
-    gz=zscore(s2s10.fillna(0)); iz=zscore(core_yoy.fillna(cyl))
-    vz=zscore(vix_s.fillna(20)); nz=zscore(nfci.fillna(0))
-    inv=(s2s10<0).astype(int); lt=(nl4w<0).astype(int)
-    fear_raw=0.45*vz+0.35*nz+0.10*inv+0.10*lt
-    fear=float(((fear_raw.iloc[-1]+2)/4).clip(0,1)*100)
-    vl=_sl(vix_s,20.0); sahmv=_sl(sahm,0.0) if sahm is not None else 0.0
-    hyv=_sl(hys,300.0) if hys is not None else 300.0
-    ur=_sl(unrate,4.0); cyi=_sl(cpi_yoy,2.5); gzv=_sl(gz,0.0); izv=_sl(iz,0.0)
-    nl4wv=_sl(nl4w,0.0)
-    liq_lab="Expanding" if nl4wv>=0 else "Contracting"
-    y10_20=y10.diff(20); u3m=float(unrate.diff(90).iloc[-1]) if len(unrate)>90 else 0.0
-    warsh=((y10.diff(20)<0)&(bs13<0)).astype(int)
-    spydd=(spy/spy.rolling(126).max()-1).fillna(0)
-    tp=float(np.clip(45+35*float(spydd.iloc[-1]<=-0.07)+20*(fear>60),0,100))
-    fp=float(np.clip(55+25*float((y10_20.iloc[-1]<0)and(u3m>0))-10*float((cyl-3.0)>0)-15*float(warsh.iloc[-1]),0,100))
-    tgadd=(tga.diff(28)<0).astype(int); rrpd=(rrp<50).astype(int)
-    trp=float(np.clip(50+20*float(tgadd.iloc[-1])+15*float(rrpd.iloc[-1])+15*float(nl4w.iloc[-1]>=0),0,100))
-    threeP=float(np.clip(0.35*trp+0.35*fp+0.30*tp,0,100))
-    rec=_rec_prob(sahmv,threeP,hyv)
-    sr=_to_1d(spy).reindex(idx).ffill().pct_change().dropna()
-    tr2=_to_1d(tlt).reindex(idx).ffill().pct_change().reindex(sr.index).dropna()
-    stlc=round(float(sr.rolling(21).corr(tr2).dropna().iloc[-1]),3) if sr.dropna().size>21 else float("nan")
-    cpi_now=round(float(cpi.pct_change(21).dropna().iloc[-1])*100,3) if cpi.pct_change(21).dropna().size else float("nan")
-    rd=_retdist(spy,idx,0)
+    leading = compute_leading_stack(
+        y2, y3m, y10, y30, s_2s10s, vix, m2, claims,
+        copx, gld, hyg, lqd, dxy, spy, qqq, iwm,
+        net_liq, net_liq_4w, walcl, bs_13w, idx,
+        tips_10y=tips_10y, bank_reserves=bank_reserves,
+        bank_credit=bank_credit, ism_no=ism_no,
+        gdp_quarterly=gdp_quarterly, mmmf=mmmf,
 
-    with st.spinner("Fetching live quotes…"):
-        q=_quotes()
+    )
 
-    spx=q.get("SPX_last",_sl(spy)*10); ndx=q.get("NDX_last",_sl(qqq)*40)
-    es=q.get("ES_last",spx); nq=q.get("NQ_last",ndx)
-    dxyv=q.get("DXY_last",float("nan")); gldv=q.get("GLD_last",float("nan"))
-    tnxv=q.get("TNX_last",float("nan"))
-    tnxv=tnxv/10 if (np.isfinite(tnxv) and tnxv>20) else tnxv
-    irxv=q.get("IRX_last",float("nan"))
-    irxv=irxv/10 if (np.isfinite(irxv) and irxv>20) else irxv
-    s2s10v=(tnxv-irxv)*100 if (np.isfinite(tnxv) and np.isfinite(irxv)) else crl
-    vix_live=q.get("VIX_last",vl)
-    vrp=_vrp_full(vix_live,spy,idx)
-    vts=_vts(q); tail=_tail(q)
-    rd=_retdist(spy,idx,spx)
-    b=_bands(spx,vix_live)
+    SIGNAL_LABELS = {
+        "vix_ts_pct":           "VIX Term Structure (VIX/VIX3M slope)",
+        "corr_regime_pct":      "Correlation Stress Signal",
+        "breadth_pct":          "Market Breadth (IWM/QQQ momentum)",
+        "dxy_5d_pct":           "DXY 5D Momentum [5D]",
+        "hyg_lqd_pct":          "HYG/LQD Ratio [21D]",
+        "smallcap_pct":         "Small-Cap Leadership [21D]",
+        "liq_impulse_4w_pct":   "Net Liquidity 4W [21D]",
+        "ism_no_pct":           "ISM New Orders [21D]",
+        "curve_phase_pct":      "Curve Phase [63D]",
+        "copper_gold_pct":      "Copper/Gold 13W [63D]",
+        "credit_impulse_pct":   "Credit Impulse [63D]",
+        "real_rate_pct":        "Real Rate Regime [63D]",
+        "reserve_pct":          "Reserve Adequacy [63D]",
+        "m2_yoy_pct":           "M2 YoY Growth [63D]",
+        "liq_impulse_13w_pct":  "Net Liquidity 13W [63D]",
+    }
 
-    gex_spot=spx if gex_sym in ("SPY","SPX") else ndx
-    with st.spinner("Fetching options data…"):
-        client=get_schwab_client(); chain_df=None
-        if client:
-            chain_df=schwab_get_options_chain(client,gex_sym,spot=None)
-            if chain_df is not None and len(chain_df)>0:
-                gex_spot=schwab_get_spot(client,gex_sym) or gex_spot
-        if chain_df is None or len(chain_df)==0:
-            chain_df,gex_spot,_=get_gex_from_yfinance(gex_sym)
-        if chain_df is not None and gex_spot:
-            gex_st=build_gamma_state(chain_df,float(gex_spot),"live",max_dte=45)
-            gwas=compute_gwas(chain_df,float(gex_spot))
-            tstr=compute_gex_term_structure(chain_df,float(gex_spot))
-            fl=compute_flow_imbalance(chain_df,float(gex_spot))
-            net_gex=gex_st.total_gex; gex_score=int(np.clip(net_gex/1e9*10,-50,50))
-        else:
-            gex_st=GammaState(data_source="unavailable",timestamp=dt.datetime.now().strftime("%H:%M:%S"))
-            gwas=tstr=fl={}; net_gex=gex_score=0
+    pcts = [(label, leading.get(key)) for key, label in SIGNAL_LABELS.items()]
+    # Only keep numeric values that can be plotted as percentile bars (0-100 range)
+    pcts = [(label, float(val)) for label, val in pcts
+            if val is not None and isinstance(val, (int, float))
+            and not __import__("math").isnan(float(val))
+            and 0.0 <= float(val) <= 100.0]
 
-    flip=gex_st.gamma_flip or gex_spot
-    upper=gex_st.key_resistance[0] if gex_st.key_resistance else gex_spot*1.03
-    lower=gex_st.key_support[0] if gex_st.key_support else gex_spot*0.97
-    gex_reg=gex_st.regime.value if hasattr(gex_st.regime,"value") else str(gex_st.regime)
-    gex_rc=("#ef4444" if "NEGATIVE" in gex_reg.upper()
-            else "#10b981" if "POSITIVE" in gex_reg.upper() else "#f59e0b")
-    gwas_a=gwas.get("gwas_above") if gwas else None
-    gwas_b=gwas.get("gwas_below") if gwas else None
-    dur=tstr.get("durability","N/A").upper() if tstr else "N/A"
-    frag=tstr.get("fragility_ratio",0.5)*100 if tstr else 50.0
-    pcr=fl.get("pc_ratio",1.0) if fl else 1.0
-    fb=fl.get("flow_bias","neutral") if fl else "neutral"
+    if not pcts:
+        st.warning("No signal data available yet. Check data sources.")
+        return
 
-    with st.spinner("Computing signals…"):
-        leading=compute_leading_stack(
-            y2,y3m,y10,y30,s2s10,vix_s,m2,pd.Series(dtype=float),
-            copx,gld,hyg,lqd,dxy,spy,qqq,iwm,net_liq,nl4w,walcl,bs13,idx,
-            tips_10y=tips,bank_reserves=bres,bank_credit=bcred,ism_no=ism,gdp_quarterly=gdp,mmmf=mmmf)
-        meta=regime_transition_prob(macro_reg,core_yoy,s2s10)
-        nc=float(current_pct_rank(-_to_1d(nfci).reindex(idx).ffill(),252))
-        lc=float(50.0+np.sign(nl4wv)*20)
-    with st.spinner("Loading feeds…"):
-        try:
-            rss=load_feeds(tuple(_all_feeds_flat().items()),60)
-            geo,_=geo_shock_score(rss); cat_intel=categorise_items(rss)
-        except Exception:
-            geo=0.0; cat_intel={k:[] for k in INTEL_CATEGORIES}
-    prob=compute_prob_composite(leading,fear,geo,meta["p_change_20d"],gex_st,nfci_coincident=nc,liq_dir_coincident=lc)
-    p1d=compute_1d_prob(gex_state=gex_st,spot=float(gex_spot),vix_level=vix_live,
-        vix_series=vix_s,spy_series=spy,hyg_series=hyg,lqd_series=lqd,dxy_series=dxy,
-        s_2s10s=s2s10,net_liq_4w=nl4w,nfci_z=nz,fear_score=fear,
-        session=get_session_context(),idx=idx,sahm_rule=sahm,hy_spread=hys)
+    def _bar_colour(v):
+        try: v = float(v)
+        except (TypeError, ValueError): return "#6b7280"
+        if v > 65:   return "#10b981"
+        elif v > 55: return "#34d399"
+        elif v > 45: return "#f59e0b"
+        elif v > 35: return "#f97316"
+        else:        return "#ef4444"
 
-    comp=_composite(prob,fear,vrp["val"],gex_st.regime)
-    vrd,vc,ve=_verdict(comp,gex_st.regime)
-    news=_news_cats(cat_intel)
-    ua="NQ" if gex_sym in ("QQQ","NDX") else "ES"
-    um=40.0 if ua=="NQ" else 10.0
-    def _ua(p): return f"{p*um:,.0f}"
-    reg_col={"Goldilocks":"#10b981","Overheating":"#f59e0b","Stagflation":"#ef4444","Deflation":"#6366f1"}.get(macro_reg,"#94a3b8")
-    fl2="ELEVATED" if fear>60 else "MODERATE" if fear>40 else "LOW"
-    fc="#ef4444" if fear>60 else "#f59e0b" if fear>40 else "#10b981"
+    colours = [_bar_colour(v) for _, v in pcts]
+    fig_p = go.Figure(go.Bar(
+        x=[v for _, v in pcts], y=[l for l, _ in pcts],
+        orientation="h", marker_color=colours,
+        text=[f"{v:.0f}th" for _, v in pcts], textposition="outside",
+    ))
+    fig_p.add_vline(x=50, line_dash="dot", line_color="rgba(255,255,255,0.25)")
+    fig_p.add_vline(x=80, line_dash="dot", line_color="rgba(16,185,129,0.30)")
+    fig_p.add_vline(x=20, line_dash="dot", line_color="rgba(239,68,68,0.30)")
+    fig_p.update_layout(xaxis=dict(range=[0, 115]))
+    st.plotly_chart(
+        plotly_dark(fig_p, "Leading Signals — Historical Percentile (50=Neutral · 80=Top Quintile)", 520),
+        use_container_width=True
+    )
 
-    # ── 1. MARKET REGIME ──────────────────────────────────────────────────
-    hdr=(f"<div style='display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px;'>"
-         +_pill(f"Market Regime: {macro_reg}",reg_col)
-         +_pill(f"Fear Level: {fl2} ({fear:.2f})",fc)
-         +_pill(f"Liquidity: {liq_lab} (${abs(nl4wv):.0f}B)","#10b981" if nl4wv>=0 else "#ef4444")
-         +_pill(f"Recession P(6m): {rec:.1f}%","#ef4444" if rec>50 else "#f59e0b" if rec>30 else "#10b981")
-         +"</div>")
-    strip=("<div style='display:grid;grid-template-columns:repeat(9,1fr);gap:6px;'>"
-           +_tk("SPX",spx,q.get("SPX_pct",float("nan")))
-           +_tk("NDX",ndx,q.get("NDX_pct",float("nan")))
-           +_tk("VIX",vix_live,q.get("VIX_pct",float("nan")))
-           +_tk("ES",es,q.get("ES_pct",float("nan")))
-           +_tk("NQ",nq,q.get("NQ_pct",float("nan")))
-           +_tk("DXY",dxyv,q.get("DXY_pct",float("nan")))
-           +_tk("10Y",tnxv,float("nan"))
-           +_tk("2s10s",s2s10v,float("nan"))
-           +_tk("GLD",gldv,q.get("GLD_pct",float("nan")))
-           +"</div>")
-    st.markdown(_card(_sh(1,"MARKET REGIME")+hdr+strip),unsafe_allow_html=True)
+    col_a, col_b, col_c = st.columns(3)
+    col_a.metric("Real Rate Regime", leading.get("real_rate_regime","N/A"),
+                 f"{leading.get('real_rate_level',float('nan')):.2f}%" if not (leading.get('real_rate_level',float('nan')) != leading.get('real_rate_level',float('nan'))) else "N/A")
+    col_b.metric("Reserve Adequacy", leading.get("reserve_regime","N/A"),
+                 f"${leading.get('reserve_level_bn',float('nan')):,.0f}B" if not (leading.get('reserve_level_bn',float('nan')) != leading.get('reserve_level_bn',float('nan'))) else "N/A")
+    col_c.metric("ISM New Orders", leading.get("ism_quadrant","Unknown"),
+                 f"{leading.get('ism_level',float('nan')):.1f}" if not (leading.get('ism_level',float('nan')) != leading.get('ism_level',float('nan'))) else "N/A")
 
-    # ── 2. VOLATILITY REGIME ──────────────────────────────────────────────
-    vc2=("#ef4444" if vrp["regime"]=="CHEAP" else "#10b981" if vrp["regime"]=="RICH" else "#94a3b8")
-    tc=("#ef4444" if vts["shape"]=="BACKWARDATION" else "#10b981" if vts["shape"]=="CONTANGO" else "#f59e0b")
-    trc=("#ef4444" if tail["regime"]=="ELEVATED" else "#f59e0b" if tail["regime"]=="MODERATE" else "#10b981")
-    vol=(  _sh(2,"VOLATILITY REGIME")
-         +"<div style='display:grid;grid-template-columns:1fr 1fr;gap:6px 32px;'><div>"
-         +"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>VRP</div>"
-         +_kv("Value",f"{vrp['val']:+.4f}" if np.isfinite(vrp['val']) else "N/A",vc2)
-         +_kv("Z-Score",f"{vrp['z']:.2f}" if np.isfinite(vrp['z']) else "N/A")
-         +_kv("Pct",f"{vrp['pct']:.0f}%" if np.isfinite(vrp['pct']) else "N/A")
-         +_kv("Regime",vrp["regime"],vc2)
-         +"<div style='margin-top:8px;font-size:10px;color:rgba(255,255,255,0.4);letter-spacing:0.1em;'>TERM STRUCTURE</div>"
-         +_kv("Shape",vts["shape"],tc)
-         +_kv("VIX/VIX3M",f"{vts['ratio']:.3f}" if np.isfinite(vts.get('ratio',float('nan'))) else "N/A")
-         +_kv("Carry",f"{vts['carry']:.2f}%" if np.isfinite(vts.get('carry',float('nan'))) else "N/A")
-         +"<div style='margin-top:8px;font-size:10px;color:rgba(255,255,255,0.4);letter-spacing:0.1em;'>TAIL RISK</div>"
-         +_kv("VVIX",f"{tail['vvix']:.1f}" if np.isfinite(tail['vvix']) else "N/A")
-         +_kv("VVIX/VIX",f"{tail['ratio']:.2f}" if np.isfinite(tail['ratio']) else "N/A",trc)
-         +_kv("Regime",tail["regime"],trc)
-         +"</div><div>"
-         +"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>IV vs RV</div>"
-         +_kv("VIX (IV)",f"{vix_live:.2f}")
-         +_kv("21D RV",f"{vrp['rv21']:.2f}%" if np.isfinite(vrp['rv21']) else "N/A")
-         +_kv("VRP Spread",f"{vrp['spread']:+.2f}" if np.isfinite(vrp['spread']) else "N/A",vc2)
-         +"<div style='margin-top:8px;font-size:10px;color:rgba(255,255,255,0.4);letter-spacing:0.1em;'>ATM IV</div>"
-         +_kv("SPX ATM IV",f"{vix_live:.1f}%")
-         +_kv("NDX ATM IV",f"{vix_live*0.88:.1f}%")
-         +"</div></div>")
-    st.markdown(_card(vol),unsafe_allow_html=True)
+    st.markdown("---")
+    st.markdown("### Rolling Percentile History")
+    spy_r = spy.reindex(idx).ffill()
+    series_map = {
+        "VIX Term Structure [5D]":    vix.reindex(idx).ffill() / (spy_r.pct_change().rolling(63,min_periods=20).std()*np.sqrt(252)*100).replace(0,np.nan),
+        "DXY 5D Momentum [5D]":       -dxy.reindex(idx).ffill().pct_change(5)*100,
+        "HYG/LQD Ratio [21D]":        hyg.reindex(idx).ffill()/lqd.reindex(idx).ffill().replace(0,np.nan),
+        "Small-Cap Leadership [21D]":  iwm.reindex(idx).ffill()/spy_r.replace(0,np.nan),
+        "Net Liquidity 4W [21D]":      net_liq_4w,
+        "ISM New Orders [21D]":        resample_ffill(raw.get("AMTMNO", pd.Series(dtype=float)), idx),
+        "Curve Phase [63D]":           s_2s10s,
+        "Copper/Gold 13W [63D]":       copx.reindex(idx).ffill()/gld.reindex(idx).ffill().replace(0,np.nan),
+        "Credit Impulse [63D]":        m2.diff(91)/m2.shift(91)*100,
+        "Real Rate Regime [63D]":      r("DFII10"),
+        "Reserve Adequacy [63D]":      r("WRBWFRBL"),
+        "M2 YoY Growth [63D]":         (m2/m2.shift(365)-1)*100,
+        "Net Liquidity 13W [63D]":     net_liq.diff(91),
+    }
 
-    # ── 3. GEX & DEALER POSITIONING ───────────────────────────────────────
-    if "NEGATIVE" in gex_reg.upper():
-        narr=f"Negative dealer flow ({gex_score:+d}): Dealers short gamma — amplifying moves. Expect trending/volatile behavior."
-    elif "POSITIVE" in gex_reg.upper():
-        narr=f"Positive dealer flow ({gex_score:+d}): Dealers long gamma — suppressing moves. Expect mean-reversion."
-    else:
-        narr=f"Neutral dealer positioning ({gex_score:+d}): Near gamma flip — binary risk, reduce size."
+    available = [l for l, _ in pcts if l in series_map]
+    if available:
+        choice = st.selectbox("Signal", available)
+        s_plot = series_map.get(choice, s_2s10s)
+        pct_s  = rolling_pct(s_plot.dropna(), 252)
+        fig1 = go.Figure(go.Scatter(x=s_plot.index, y=s_plot.values, mode="lines",
+                                     line=dict(color="#3b82f6", width=1.5)))
+        st.plotly_chart(plotly_dark(fig1, choice, 240), use_container_width=True)
+        fig2 = go.Figure(go.Scatter(x=pct_s.index, y=pct_s.values, mode="lines",
+                                     line=dict(color="#8b5cf6"), fill="tozeroy",
+                                     fillcolor="rgba(139,92,246,0.08)"))
+        fig2.add_hline(y=50, line_dash="dot", line_color="rgba(255,255,255,0.2)")
+        fig2.add_hline(y=80, line_dash="dot", line_color="rgba(16,185,129,0.3)")
+        fig2.add_hline(y=20, line_dash="dot", line_color="rgba(239,68,68,0.3)")
+        st.plotly_chart(plotly_dark(fig2, f"{choice} — Rolling 252D Percentile Rank", 200),
+                        use_container_width=True)
+        st.caption("Percentile rank: trailing 252-day window, current value only.")
 
-    gleft=("<div>"
-           +f"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>GEX LEVELS ({gex_sym})</div>"
-           +_kv(f"{gex_sym} Spot",f"{float(gex_spot):.2f}","#fff")
-           +_kv("GEX Flip",f"{flip:.2f}","#f59e0b")
-           +_kv("GEX Upper",f"{upper:.2f}","#10b981")
-           +_kv("GEX Lower",f"{lower:.2f}","#ef4444")
-           +_kv("GWAS Above",f"{gwas_a:.2f}" if gwas_a else "N/A","#6366f1")
-           +_kv("GWAS Below",f"{gwas_b:.2f}" if gwas_b else "N/A","#6366f1")
-           +_kv("GEX Regime",gex_reg,gex_rc)
-           +"</div>")
-    gright=("<div>"
-            +"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>OPTIONS FLOW</div>"
-            +_kv("P/C Dollar Ratio",f"{pcr:.2f}","#ef4444" if pcr>1.3 else "#10b981" if pcr<0.8 else "#94a3b8")
-            +_kv("Flow Bias",fb.upper(),"#ef4444" if fb=="bearish" else "#10b981" if fb=="bullish" else "#94a3b8")
-            +_kv("GEX Duration",f"{dur} ({frag:.0f}% weekly)","#ef4444" if dur=="FRAGILE" else "#10b981")
-            +_kv("Net GEX",f"${gex_st.total_gex/1e9:.2f}B" if gex_st.total_gex else "N/A")
-            +_kv("Dist to Flip",f"{gex_st.distance_to_flip_pct:+.2f}%"))
-    if show_ua:
-        gright+=("<div style='margin-top:8px;border-top:1px solid rgba(255,255,255,0.08);padding-top:6px;'>"
-                 +f"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>{ua} EQUIVALENT</div>"
-                 +_kv(f"{ua} Spot",_ua(float(gex_spot)))
-                 +_kv(f"{ua} Flip",_ua(flip),"#f59e0b")
-                 +_kv(f"{ua} Upper",_ua(upper),"#10b981")
-                 +_kv(f"{ua} Lower",_ua(lower),"#ef4444")
-                 +"</div>")
-    gright+="</div>"
-    gex_body=(_sh(3,"GEX LEVELS & DEALER POSITIONING")
-              +"<div style='display:grid;grid-template-columns:1fr 1fr;gap:6px 32px;'>"
-              +gleft+gright+"</div>"
-              +f"<div style='margin-top:10px;border-top:1px solid rgba(255,255,255,0.08);padding-top:8px;"
-              +f"font-size:12px;color:rgba(255,255,255,0.65);font-style:italic;'>"
-              +f"<span style='color:{gex_rc};font-weight:700;'>{gex_reg}</span> — {narr}</div>")
-    st.markdown(_card(gex_body),unsafe_allow_html=True)
 
-    # ── 4. PROBABILITY HEATMAP ────────────────────────────────────────────
-    st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>4. PROBABILITY HEATMAP — MC Simulation</div>",unsafe_allow_html=True)
-    st.caption("1-week forward | Merton jump-diffusion | SPX")
-    st.plotly_chart(_merton_fig(spx,vix_live),use_container_width=True,key="th_hm")
+# ============================================================
+# GUIDE PAGE
+# ============================================================
+def render_guide():
+    st.markdown(CSS, unsafe_allow_html=True)
+    st.markdown("## 📖 Dashboard Guide")
+    st.markdown("*Every concept explained in depth — what it is, why it exists, how it is computed, and how it feeds into the model.*")
 
-    # ── 5 & 6. IV SURFACES ────────────────────────────────────────────────
-    c5,c6=st.columns(2)
-    with c5:
-        st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>5. IMPLIED VOL SURFACE — SPX</div>",unsafe_allow_html=True)
-        st.plotly_chart(_ivsurf_fig(vix_live,"SPX"),use_container_width=True,key="th_ivs_spx")
-    with c6:
-        st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>6. IMPLIED VOL SURFACE — NDX</div>",unsafe_allow_html=True)
-        st.plotly_chart(_ivsurf_fig(vix_live*0.92,"NDX"),use_container_width=True,key="th_ivs_ndx")
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+        "🏠 Overview",
+        "⚡ GEX Engine",
+        "🔬 Greeks Deep Dive",
+        "📊 Probability Engine",
+        "🌍 Intel Monitor",
+        "📋 Execution",
+        "⚠️ Risk Signals",
+        "🔧 Setup & Data",
+        "🔵 GEX → NQ/ES",
+    ])
 
-    # ── 7. IV vs RV ───────────────────────────────────────────────────────
-    st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>7. IMPLIED vs REALIZED VOLATILITY</div>",unsafe_allow_html=True)
-    st.plotly_chart(_ivrv_fig(vix_s,spy,idx),use_container_width=True,key="th_ivrv")
+    # ─────────────────────────────────────────────────────────
+    with tab1:
+        st.markdown("### What is this dashboard?")
+        st.markdown("""
+This is a **quantitative trading dashboard** that combines three distinct analytical pillars into one screen:
 
-    # ── 8. RETURN DISTRIBUTION ────────────────────────────────────────────
-    st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>8. RETURN DISTRIBUTION & PROBABILITY BANDS</div>",unsafe_allow_html=True)
-    if rd:
-        st.markdown(f"SPX Spot: `{spx:,.2f}` &nbsp;&nbsp; Daily σ: `{rd['daily_sigma']:.4f}%` &nbsp;&nbsp; Skew: `{rd['skew']:.4f}` &nbsp;&nbsp; Kurtosis: `{rd['kurtosis']:.4f}`")
-        st.plotly_chart(_rdist_fig(spy,idx,rd),use_container_width=True,key="th_rd")
+1. **WHERE** — Mechanical support and resistance from options dealer positioning (GEX)
+2. **WHY** — Macro backdrop and directional probability from 13 economic signals
+3. **WHEN** — Session context, setup scoring, and sizing rules that tell you whether conditions are good enough to act
 
-    # ── 9. MACRO REGIME & NEWS ────────────────────────────────────────────
-    nr=""
-    for cat in news[:6]:
-        s=cat["sentiment"]; col=("#10b981" if s>0.01 else "#ef4444" if s<-0.01 else "#94a3b8")
-        sign="+" if s>0 else ""
-        nr+=(f"<span style='font-size:11px;font-family:monospace;margin-right:10px;'>"
-             f"<span style='color:rgba(255,255,255,0.5);'>{cat['icon']} {cat['label'].split('&')[0].strip().lower()}</span>: "
-             f"<span style='color:{col};font-weight:600;'>{sign}{s:.4f}</span> "
-             f"<span style='color:rgba(255,255,255,0.3);'>({cat['count']} articles)</span></span>")
-    mac=(_sh(9,"MACRO REGIME & NEWS SENTIMENT")
-         +f"<div style='font-size:16px;font-weight:700;color:{reg_col};margin-bottom:8px;'>{macro_reg}</div>"
-         +"<div style='display:grid;grid-template-columns:1fr 1fr;gap:4px 32px;'><div>"
-         +_kv("Growth Z",f"{gzv:+.2f}","#10b981" if gzv>0 else "#ef4444")
-         +_kv("Inflation Z",f"{izv:+.2f}","#f59e0b" if izv>0.5 else "#94a3b8")
-         +_kv("CPI YoY",f"{cyi:.2f}%")
-         +_kv("CPI Nowcast",f"{cpi_now:+.3f}% MoM" if np.isfinite(cpi_now) else "N/A")
-         +"</div><div>"
-         +_kv("Unemployment",f"{ur:.1f}%")
-         +_kv("HY OAS",f"{hyv:.2f}","#ef4444" if hyv>450 else "#94a3b8")
-         +_kv("SPY-TLT Corr",f"{stlc:.3f}" if np.isfinite(stlc) else "N/A",
-              "#ef4444" if (np.isfinite(stlc) and stlc>0.2) else "#94a3b8")
-         +_kv("Sahm Rule",f"{sahmv:.3f}",
-              "#ef4444" if sahmv>=0.5 else "#f59e0b" if sahmv>=0.3 else "#10b981")
-         +"</div></div>"
-         +f"<div style='margin-top:10px;border-top:1px solid rgba(255,255,255,0.08);padding-top:8px;'>"
-         +"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:5px;letter-spacing:0.1em;'>NEWS SENTIMENT</div>"
-         +f"<div style='display:flex;flex-wrap:wrap;gap:4px;'>{nr}</div></div>")
-    st.markdown(_card(mac),unsafe_allow_html=True)
+The goal is not to predict the market. It is to trade **with the odds slightly in your favour**, know when conditions support a trade, and know when to sit on your hands.
 
-    # ── 10. THESIS VERDICT ────────────────────────────────────────────────
-    cc="#10b981" if comp>0 else "#ef4444" if comp<0 else "#94a3b8"
-    vp=np.isfinite(vrp["val"]) and vrp["val"]>0
-    vs2=f"{vrp['val']:+.4f}" if np.isfinite(vrp["val"]) else "N/A"
-    sigs=(_sig("✅" if vp else "⚠️",f"VRP {'positive' if vp else 'negative'} ({vs2})")
-          +_sig("⚠️" if fear>55 else "✅",f"Fear composite {fl2}")
-          +_sig("🔴" if rec>60 else "🟡" if rec>35 else "🟢",
-                f"Recession risk {'elevated' if rec>60 else 'moderate' if rec>35 else 'low'} ({rec:.1f}%)")
-          +_sig("🔴" if "NEGATIVE" in gex_reg.upper() else "🟢",f"GEX: {gex_reg}")
-          +_sig("📊",f"Dominant 1D: {p1d.get('dominant_signal','—')} ({p1d.get('dominant_dir','neutral')})"))
-    kls=(_kv("SPX Spot",f"{spx:,.2f}","#fff")
-         +_kv("GEX Flip",f"{flip:,.2f}","#f59e0b")
-         +_kv("GEX Upper",f"{upper:,.2f}","#10b981")
-         +_kv("GEX Lower",f"{lower:,.2f}","#ef4444")
-         +_kv("1σ Daily",f"{b['d1lo']:,.2f} — {b['d1hi']:,.2f}")
-         +_kv("2σ Daily",f"{b['d2lo']:,.2f} — {b['d2hi']:,.2f}")
-         +_kv("1σ Weekly",f"{b['w1lo']:,.2f} — {b['w1hi']:,.2f}")
-         +_kv("2σ Weekly",f"{b['w2lo']:,.2f} — {b['w2hi']:,.2f}"))
-    risks=[]
-    if fear>60: risks.append(("⚠️","Elevated fear composite — potential for sharp moves"))
-    if rec>50: risks.append(("🔴",f"Recession probability at {rec:.1f}% — monitor labor data"))
-    if np.isfinite(stlc) and stlc>0.2: risks.append(("⚠️","Positive stock-bond correlation — diversification impaired"))
-    if "NEGATIVE" in gex_reg.upper(): risks.append(("🔴","Negative gamma regime — dealer hedging amplifies moves. No fading."))
-    if dur=="FRAGILE": risks.append(("⚠️",f"GEX regime fragile — {frag:.0f}% of gamma ≤7 DTE. Levels expire by Friday."))
-    if leading.get("corr_regime") in ("STRESS","SYSTEMIC"): risks.append(("🔴",f"Cross-asset correlation: {leading.get('corr_regime')} — credit leading equity lower"))
-    if vts["shape"]=="BACKWARDATION": risks.append(("⚠️","VIX backwardation — near-term stress priced above medium-term"))
-    if not risks: risks.append(("✅","No major risk flags. Conditions broadly constructive."))
-    rr="".join(_sig(e,t) for e,t in risks)
-    vbd=(_sh(10,f"THESIS VERDICT: {vrd}")
-         +f"<div style='display:flex;align-items:baseline;gap:16px;margin-bottom:8px;'>"
-         +f"<div style='font-size:26px;font-weight:800;color:{vc};'>{vrd}</div>"
-         +f"<div style='font-size:13px;color:rgba(255,255,255,0.5);'>Composite Score: <span style='font-family:monospace;font-weight:700;color:{cc};'>{comp:+d}</span> / ±10</div>"
-         +f"<div style='font-size:12px;color:rgba(255,255,255,0.35);'>Date: {dt.date.today().strftime('%A, %B %d, %Y')}</div></div>"
-         +f"<div style='font-size:12px;color:rgba(255,255,255,0.55);margin-bottom:10px;font-style:italic;'>{ve}</div>"
-         +"<div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px 24px;'>"
-         +"<div><div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>SIGNAL BREAKDOWN</div>"+sigs+"</div>"
-         +"<div><div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>KEY LEVELS</div>"+kls+"</div>"
-         +"<div><div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>RISK FACTORS</div>"+rr+"</div>"
-         +"</div>")
-    st.markdown(_card(vbd,bg=f"{vc}08",border=f"{vc}30"),unsafe_allow_html=True)
+---
 
-    # ── 11-13. GLOSSARIES ─────────────────────────────────────────────────
-    g11,g12,g13=st.tabs(["📖 Glossary: Vol","📖 Glossary: Macro","📖 Glossary: Charts"])
-    with g11:
-        st.markdown(_card(
-            _sh(11,"GLOSSARY — WHAT EVERYTHING MEANS")
-            +_gl("VRP (Variance Risk Premium)",
-                 "Difference between implied vol (VIX) and realized vol. Positive VRP = options expensive vs actual moves. "
-                 "Traders sell vol when VRP is high. Negative VRP = market underpricing realized moves → buy protection.")
-            +_gl("GEX (Gamma Exposure)",
-                 "Total gamma held by options dealers. Positive GEX = dealers long gamma → buy dips, sell rips → suppresses vol. "
-                 "Negative GEX = dealers short gamma → amplify moves. GEX Flip = strike where dealer gamma flips sign.")
-            +_gl("VIX Term Structure",
-                 "Curve of implied vol across expirations. Contango (VIX3M > VIX) = normal. "
-                 "Backwardation (VIX > VIX3M) = near-term stress elevated, hedging demand high.")
-            +_gl("Tail Risk (VVIX/VIX)",
-                 "VVIX = vol of VIX (vol-of-vol). High ratio = market pricing sharp VIX spikes = crash insurance expensive. "
-                 "Ratio > 5.5 = elevated. < 4.5 = low.")),unsafe_allow_html=True)
-    with g12:
-        st.markdown(_card(
-            _sh(12,"GLOSSARY — MACRO & PROBABILITY")
-            +_gl("σ (Sigma / Standard Deviation)",
-                 "1σ ≈ 68% of expected moves, 2σ ≈ 95%, 3σ ≈ 99.7%. Daily σ of 1% → ±1% range 68% of the time.")
-            +_gl("Skewness & Kurtosis",
-                 "Skewness = asymmetry. Negative skew = more large down moves. "
-                 "High kurtosis = fat tails (extreme moves more common than normal distribution predicts).")
-            +_gl("Recession P(6m)",
-                 "Blends Sahm Rule, HY OAS, and Three Puts backstop. Sahm: 3M avg unemployment up 0.5% above 12M low = recession onset.")
-            +_gl("Net Liquidity",
-                 "Fed Balance Sheet minus TGA minus RRP. Expanding = risk asset tailwind. Contracting = headwind.")),unsafe_allow_html=True)
-    with g13:
-        st.markdown(_card(
-            _sh(13,"GLOSSARY — READING THE CHARTS")
-            +_gl("IV Surface","3D plot: implied vol across strikes (moneyness) and DTE. Steep put skew = downside protection expensive.")
-            +_gl("Probability Heatmap","Monte Carlo using Merton jump-diffusion. Shows probability of SPX reaching each price level over next week.")
-            +_gl("GEX Histogram","Gamma per strike. Green = positive (dealers stabilize). Red = negative (dealers amplify).")
-            +_gl("IV vs RV Chart","VIX overlaid with 21D realized vol. VRP spread: green = IV premium (sell vol), red = IV discount (buy protection).")
-            +_gl("Fear Composite","VIX z-score + NFCI + curve inversion + liquidity tightening. >60 = elevated fear.")),unsafe_allow_html=True)
+### The Three Pillars
 
-    st.markdown(
-        f"<div style='text-align:center;font-size:10px;color:rgba(255,255,255,0.2);margin-top:16px;'>"
-        f"Data: FRED · yfinance · Schwab API | Generated {dt.datetime.now().strftime('%H:%M ET')} | Not financial advice</div>",
-        unsafe_allow_html=True)
+#### Pillar 1 — GEX: Where the mechanical flows are
+
+When you buy an options contract, a dealer (market maker) sold it to you. That dealer is not speculating — they need to remain delta-neutral. So they buy or sell the underlying to hedge their exposure. This hedging creates **predictable, mechanical price flows** that are independent of anyone's opinion about fundamentals.
+
+**Positive GEX (above the gamma flip)**
+- Dealers are net long gamma: a price drop forces them to buy the underlying, a price rise forces them to sell it.
+- Their hedging *opposes* moves — it is a natural shock absorber.
+- Result: volatility is suppressed, large moves fade, options pin to strikes.
+
+**Negative GEX (below the gamma flip)**
+- Dealers are net short gamma: a price drop forces them to sell more, a price rise forces them to buy more.
+- Their hedging *amplifies* moves — there is no natural floor from dealer flows.
+- Result: cascades become possible, moves are self-reinforcing, trends extend further than fundamentals would suggest.
+
+The **gamma flip** is the price level where this switches. It is the most important structural level on the chart.
+
+#### Pillar 2 — Macro Probability Engine: Why the market should move
+
+Thirteen signals across three forward-looking time horizons (5-day, 21-day, 63-day) are measured as percentile ranks against their own history and blended into directional probability estimates. Each signal measures a genuinely different underlying economic factor — credit conditions, liquidity, growth, inflation, yield curve dynamics, and dollar strength.
+
+#### Pillar 3 — Execution Framework: When and how large
+
+Even with correct direction and correct structure, a trade still fails if the timing is wrong. The execution framework enforces session-based size multipliers, a pre-trade checklist, setup classification, and explicit failure mode monitoring. It prevents overtrading in thin conditions and sizes positions to the honest edge.
+
+---
+
+### How to Read the Main Dashboard
+
+**Session bar (top)**
+Shows the current session window (Globex / RTH Open / IB Forming / Morning / Midday / Afternoon / Close). The size multiplier is the key number — 0.0 means do not trade, 1.0 means full position size.
+
+**Probability row**
+Four cards: 1-Day, 5-Day, 21-Day, 63-Day. Each shows the bull probability (0-100%) and the associated Kelly fraction. Values above 60% are bullish-tilted, below 40% are bearish-tilted, 40-60% are noise.
+
+**GEX snapshot**
+The gamma flip level, the current GEX regime, and whether vanna/charm are aligned. This tells you the mechanical context for any move that occurs.
+
+**GEX chart (GEX Engine tab)**
+Bars by strike. Green = dealers long gamma here (stabilising / support / resistance). Red = dealers short gamma here (amplifying / fuel). The tallest bars are the most important levels. The yellow line is the flip.
+
+**Intel panel (right side)**
+Headlines scored and categorised by market relevance. Driver alerts fire when any signal changes materially between refreshes.
+""")
+
+    # ─────────────────────────────────────────────────────────
+    with tab2:
+        st.markdown("### GEX Engine — Full Explanation")
+        st.markdown("""
+#### What GEX measures
+
+GEX (Gamma Exposure) answers one question: **how much dollar hedging must dealers do for each 1% move in the underlying?**
+
+The formula per strike:
+```
+GEX = Gamma × Open Interest × Contract Size × Spot Price²
+
+Where:
+  Gamma        = rate of change of delta (from Black-Scholes)
+  Open Interest = number of open contracts at this strike
+  Contract Size = 100 shares (standard US options)
+  Spot Price²   = converts to dollar-gamma units ($)
+```
+
+**Sign convention (critical):**
+- Calls: dealers assume they sold calls → they are **short calls** → they are **long gamma** → their hedging opposes moves (stabilising) → sign = **positive**
+- Puts: dealers assume they sold puts → they are **short puts** → they are **short gamma** → their hedging amplifies moves (destabilising) → sign = **negative**
+- Net GEX at each strike = call GEX + put GEX
+
+A strike with net positive GEX means the call open interest is large enough to make dealers net buyers on dips and sellers on rallies at that level. A strike with net negative GEX does the opposite.
+
+#### The Gamma Flip (Vol Trigger)
+
+The flip is the price where the **sum of all net GEX across all strikes** transitions from negative to positive. It is found by aggregating GEX by strike and interpolating the zero-crossing.
+
+When all strikes are the same sign (heavy put skew is common in SPY), there is no zero-crossing in the literal sense. In this case the flip falls back to the **minimum-GEX strike** — the point of least dealer support, often called the vol trigger. This is still a meaningful level: it is where dealer gamma is weakest.
+
+**Distance from flip** is shown as a percentage. Within ±0.5% of the flip is the transition zone — regime is ambiguous and all GEX-based signals are compressed toward 50%.
+
+#### How Gamma Is Calculated: Black-Scholes vs Schwab Model
+
+**Without Schwab connected (yfinance data):**
+Gamma is computed analytically using the Black-Scholes formula:
+```
+d1 = [ln(S/K) + (r + σ²/2)·T] / (σ·√T)
+Gamma = N'(d1) / (S·σ·√T)
+
+Where:
+  S = spot price
+  K = strike price
+  T = time to expiration (years)
+  σ = implied volatility (from yfinance)
+  r = risk-free rate (5% assumed)
+  N'= standard normal PDF
+```
+This uses a flat IV approximation — one IV per contract, not a full vol surface. Adequate for the flip level and regime classification, but less accurate for the per-strike bar heights.
+
+**With Schwab connected:**
+Schwab's own market model computes gamma per contract from their full vol surface. This is the `schwab_gamma` field returned per contract. Where it is non-zero and finite, it replaces the BS-computed gamma. Where it is missing or zero, BS fills in the gap. Schwab's gamma accounts for skew, term structure, and microstructure effects that flat-vol BS misses — the flip level is more accurate intraday.
+
+#### The GEX Bar Chart
+
+Each bar represents a strike. Its height is the **sum of net GEX across all expiration dates** at that strike. The chart tells you:
+
+- **Tallest green bar**: the strongest stabilising level. Dealers will mechanically buy (from above) or sell (from below) most aggressively here.
+- **Tallest red bar**: the point of maximum destabilisation. A break through here is amplified by dealer flows.
+- **OTM anchors**: green bars more than 3% from spot — these define the structural range the market is expected to stay within under current dealer positioning.
+
+#### The 5 GEX-Based Setups
+
+| Setup | Regime required | Trigger | Mechanics |
+|-------|----------------|---------|-----------|
+| **1 — Gamma Support Bounce** | Positive (above flip) | Price touches a large positive-GEX strike from above | Dealers must buy as price falls to this level. Support is mechanical, not opinion. Wait for footprint absorption before entering long. |
+| **2 — Gamma Resistance Fade** | Positive (above flip) | Price reaches a large positive-GEX strike from below | Dealers must sell as price rises to this level. Resistance is mechanical. Slightly lower hit rate than Setup 1 because equities have a structural upward bias. |
+| **3 — Gamma Flip Breakout** | Neutral (within 0.75% of flip) | Price breaks through the flip and holds | Regime transition. Positive→Negative means dealer flows switch from opposing moves to amplifying them. The breakout can cascade. Needs initiative flow confirmation — no absorption = no trade. |
+| **4 — Exhaustion Reversal** | Negative (below flip), extended >2% | Volume climax + delta divergence on footprint | Rarest setup (lowest hit rate). In negative gamma, dealers amplify moves. This only reverses when exhaustion is genuine — large volume, price no longer moving down, delta flipping. 3:1 R:R minimum, 50% size only. |
+| **5 — 0DTE Gamma Pin** | Any (dominant strike present) | After 2pm ET, or OpEx morning 10:30-12pm | Large 0DTE (same-day expiry) open interest creates a gravitational pin. The strike acts like an attractor — price deviations fade back to it. Most potent in the final 90 minutes before expiry. |
+
+#### VEX, CEX and Vanna/Charm Alignment
+
+The engine also computes two secondary Greek exposures:
+
+**VEX (Vanna Exposure)**
+Vanna = how dealer delta changes when implied volatility changes.
+```
+Vanna = -N'(d1) × d2 / σ
+```
+- Positive VEX + IV rising → dealers buy → upward pressure
+- Positive VEX + IV falling → dealers sell → downward pressure
+- Negative VEX + IV rising → dealers sell → downward pressure (amplified by vol spike)
+
+This is why VIX spike days can cause cascading equity selling even without obvious fundamental catalysts — vanna flows force dealer sales as IV rises. Knowing the vanna sign tells you whether a volatility expansion is bullish or bearish for the underlying.
+
+**CEX (Charm Exposure)**
+Charm = how dealer delta changes as time passes (delta decay).
+```
+Charm = -N'(d1) × [2rT - d2·σ·√T] / [2T·σ·√T]
+```
+- Positive CEX near spot → as expiry approaches, dealers buy → upward drift
+- This is the mechanical basis for the OpEx pin trade and the post-market-open morning drift in positive gamma regimes
+
+**Vanna/Charm Alignment**
+When both vanna and charm are pointing the same direction near spot, the dealer hedging flows from two independent sources (vol changes and time decay) are reinforcing each other. This is a higher-conviction mechanical context. The dashboard shows this alignment status in the GEX panel.
+""")
+
+    # ─────────────────────────────────────────────────────────
+    with tab3:
+        st.markdown("### Options Greeks: A Complete Reference")
+        st.markdown("""
+This tab explains every Greek used in the engine from first principles. You do not need to memorise these. Understanding them conceptually tells you *why* the model behaves the way it does.
+
+---
+
+#### Delta (Δ)
+
+**What it is:** The rate of change of an option's price per $1 move in the underlying.
+- Call delta: 0 to 1. Deep in-the-money call ≈ 1.0 (moves dollar-for-dollar with stock). At-the-money call ≈ 0.5. Far OTM call ≈ 0.
+- Put delta: -1 to 0.
+
+**Why dealers care:** A dealer who sold you a call with delta 0.5 must own 50 shares of the underlying to hedge their exposure. If the stock rallies and the call becomes delta 0.7, they must buy 20 more shares. This buying is **automatic, mechanical, and forced** — it has nothing to do with their view on the stock.
+
+**In GEX context:** Delta hedging is the act of maintaining a delta-neutral position. Every GEX trade setup is ultimately about predicting where dealer delta-hedging flows will go.
+
+---
+
+#### Gamma (Γ)
+
+**What it is:** The rate of change of delta per $1 move in the underlying. Also: how fast the dealer must re-hedge.
+```
+Gamma = N'(d1) / (S × σ × √T)
+```
+- Gamma is highest for at-the-money options near expiration.
+- Gamma is low for deep in/out-of-the-money options and for options with long time to expiry.
+
+**Why it matters for GEX:** Gamma is the multiplier in the GEX formula. A strike with large open interest but low gamma contributes less to GEX than a strike with smaller OI but high gamma (typically near-term ATM strikes). This is why 0DTE options dominate the GEX chart even though they represent a small fraction of total notional OI.
+
+**Long vs short gamma:**
+- Long gamma: you profit from large moves in either direction. Dealers who sold you options are usually short gamma.
+- Short gamma: you profit from small moves (decay). Market makers earn the bid-ask spread but are exposed to large moves.
+
+The GEX sign convention: dealers are assumed to have sold options to the public → dealers are net short gamma overall → positive GEX requires sufficient call OI to overcome the natural short-gamma position.
+
+---
+
+#### Vanna (dΔ/dσ)
+
+**What it is:** How delta changes when implied volatility changes. Equivalently, how a dealer's hedge ratio must change when IV moves.
+```
+Vanna = -N'(d1) × d2 / σ
+```
+
+**Intuition:** An out-of-the-money option has low delta (say 0.15). If IV spikes, that OTM option now has a higher probability of expiring in-the-money, so its delta rises (say to 0.30). The dealer who sold that option must now buy more shares to re-hedge. If this is happening simultaneously across thousands of strikes, the forced buying (or selling) from vanna creates directional flows in the underlying.
+
+**Why the sign matters:**
+- Near-spot options with positive vanna: IV rising → dealer buys underlying (vanna supports rallies during vol spikes)
+- Near-spot options with negative vanna: IV rising → dealer sells underlying (vanna amplifies equity selloffs)
+
+Most equity markets in normal conditions have negative aggregate vanna near-spot — which is why VIX spikes correlate with equity declines beyond what fundamentals explain.
+
+---
+
+#### Charm (dΔ/dt)
+
+**What it is:** How delta changes as time passes. Also called delta decay.
+```
+Charm = -N'(d1) × [2rT - d2·σ·√T] / [2T·σ·√T]
+```
+
+**Intuition:** An option that is slightly in-the-money with 30 days to expiry has a certain delta. As time passes toward expiry, that option becomes more binary — it will either expire in-the-money (delta→1) or out-of-the-money (delta→0). As delta changes through time, dealers must adjust their hedge continuously.
+
+**Why it matters in practice:**
+- Near expiration (0DTE, WeeklyDTE), charm flows dominate intraday dealer hedging
+- Positive aggregate charm near spot → as the trading day progresses, dealers buy → creates an intraday upward drift
+- This is the mechanical basis for the well-documented "late morning drift" on OpEx Fridays
+
+**Vanna/Charm Alignment:** When both are pointing the same direction near spot, you have two independent dealer hedging flows (one from vol, one from time) reinforcing each other. This is the strongest version of a GEX-regime signal.
+
+---
+
+#### Implied Volatility (IV)
+
+**What it is:** The market's consensus forecast of future volatility, *implied* from the current options price. Not a prediction of direction — just magnitude.
+
+**How it's used in GEX:** IV is the σ input to all Greek calculations. Higher IV → lower gamma (for a given time to expiry). This means that in high-IV environments, the absolute GEX values are smaller — dealers need to re-hedge less per dollar move because their hedges are already less sensitive to price.
+
+**VIX vs per-strike IV:** VIX is the 30-day implied volatility of the S&P 500 index (from near-term options). Per-strike IV is specific to each contract. With yfinance, the engine uses per-contract IV. With Schwab, it uses the exact IV from Schwab's model per contract (more accurate, accounts for vol smile/skew).
+
+---
+
+#### The Black-Scholes Model
+
+All four Greeks above (delta, gamma, vanna, charm) are computed analytically from the Black-Scholes option pricing formula:
+```
+Call Price = S·N(d1) - K·e^(-rT)·N(d2)
+
+d1 = [ln(S/K) + (r + σ²/2)·T] / (σ·√T)
+d2 = d1 - σ·√T
+
+Where:
+  S  = current spot price
+  K  = option strike price
+  T  = time to expiry (in years; 1 day = 1/365)
+  σ  = implied volatility (annualised)
+  r  = risk-free rate (5% assumed)
+  N  = cumulative standard normal distribution
+  N' = standard normal probability density function
+```
+
+Black-Scholes assumes constant volatility across all strikes — a simplification. Real markets have a volatility smile (OTM puts have higher IV than ATM). Schwab's model corrects for this; the BS approximation used with yfinance data does not. For the purposes of identifying the flip level and key GEX nodes, the approximation is adequate.
+""")
+
+    # ─────────────────────────────────────────────────────────
+    with tab4:
+        st.markdown("### Probability Engine — Full Explanation")
+        st.markdown("""
+#### The Core Architecture
+
+The probability engine answers: *what are the odds of the market being higher in X days?*
+
+It does this with a **three-horizon bucket model**, keeping short-term and medium-term signals completely separate. This design choice is deliberate:
+
+- If you mix a 5-day signal (VIX term structure) with a 63-day signal (yield curve phase), the faster signal dominates in the short run but the slower signal is more predictive over time. Mixing them into a single score gives you a number that isn't optimal for either horizon.
+- Each bucket answers a different question. The 5-day bucket is for tactical positioning. The 63-day bucket is for swing positions.
+
+The four buckets and their weights in the composite:
+```
+Tactical    (5D)  : 10% weight — high-frequency, noisy
+Short-term  (21D) : 30% weight
+Medium-term (63D) : 40% weight — most predictive empirically
+Coincident  (now) : 20% weight — reality check, not leading
+```
+
+---
+
+#### How Each Signal Is Computed
+
+Every signal is converted to a **percentile rank**: where does today's reading sit relative to the past 252 trading days (approximately 1 year)?
+- 80th percentile = more bullish than 80% of the past year → bullish signal
+- 50th percentile = exactly at the median → neutral
+- 20th percentile = more bearish than 80% of the past year → bearish signal
+
+This normalisation has three advantages: (1) it is dimensionless — all signals are on the same 0-100 scale, (2) it is self-adjusting to the current regime — a reading of 300bp on the HY spread means something different in 2009 vs 2024, and (3) it makes the composite robust to outliers.
+
+---
+
+#### Tactical Bucket (5-Day Horizon)
+
+**VIX Term Structure**
+- Raw: VIX level ÷ 63-day realised volatility of SPY (annualised, %)
+- What it measures: the vol premium the market is paying for near-term insurance vs what has actually happened
+- High ratio (>1.3): fear is overpriced relative to recent history → contrarian bullish → high percentile rank → high score
+- Low ratio (<0.8): complacency → vol may mean-revert upward → bearish tail risk
+- In the 1-day model, this uses 5-day realised vol (more sensitive to recent events)
+
+**DXY 5-Day Momentum**
+- Raw: 5-day percentage change in UUP (dollar index ETF), sign-inverted
+- What it measures: the 5-day dollar trend, where a rising dollar is bearish for risk assets
+- Inverted because dollar strength = capital rotating out of risk assets
+- A falling dollar (negative DXY change) → high score (bullish)
+
+---
+
+#### Short-Term Bucket (21-Day Horizon)
+
+**HYG/LQD Ratio**
+- Raw: HYG price ÷ LQD price (ratio of high-yield to investment-grade bond ETFs)
+- What it measures: whether credit markets are embracing or avoiding risk
+- HYG rising faster than LQD = credit spreads tightening = risk-on → high score
+- HYG falling relative to LQD = credit stress building → low score
+- Critical: this leads equity stress by **days to weeks**. Credit markets see trouble before equity markets because institutional credit investors are generally better-informed than equity retail flow.
+
+**Small-Cap Leadership (IWM/SPY)**
+- Raw: IWM price ÷ SPY price
+- What it measures: breadth of the economic expansion
+- Small caps are more economically sensitive than mega-caps. They rely on domestic consumption, bank loans, and are exposed to higher interest rates.
+- IWM leading SPY = broad economic confidence. IWM lagging = markets hiding in mega-cap safety.
+- In a healthy bull market, small caps lead. In a defensive/late-cycle environment, they lag.
+
+**Net Liquidity 4-Week Impulse**
+- Raw: Change over 28 days of (Fed Balance Sheet − Treasury Cash Account − Reverse Repo Facility)
+  ```
+  Net Liquidity = WALCL - WTREGEN - RRPONTSYD  (all in $bn)
+  Net Liq 4W    = Net_Liq(today) - Net_Liq(28 days ago)
+  ```
+- What it measures: the 4-week change in how much "free" money is in the financial system
+- The Fed balance sheet is the source of base money. The TGA is a drain (Treasury holds cash at the Fed). RRP is a drain (dealers park cash at the Fed overnight instead of deploying it in markets). Net liquidity is what's left flowing through the financial system.
+- Expanding = supportive. Contracting = headwind. This is the single most mechanically direct link between Fed policy and market flows.
+
+**ISM New Orders**
+- Raw: AMTMNO series (Institute for Supply Management Manufacturing New Orders index)
+- What it measures: forward-looking manufacturing demand. Businesses place new orders before they produce and hire. This leads GDP by 3-6 months.
+- Above 50 = expansion. Below 50 = contraction. But the **direction** matters more than the level:
+  - Above 50 + rising: best (expanding and accelerating)
+  - Above 50 + falling: watch (expanding but slowing)
+  - Below 50 + rising: recovery signal (contracting but turning)
+  - Below 50 + falling: worst (contracting and accelerating)
+- Monthly data — carries forward between releases.
+
+---
+
+#### Medium-Term Bucket (63-Day Horizon)
+
+**Yield Curve Phase**
+- Raw: 2-year Treasury yield minus 10-year Treasury yield (2s10s spread, in basis points)
+- What it measures: not just the level of the curve, but its *rate of change* and *direction*. Four phases:
+
+| Phase | Description | Signal |
+|-------|-------------|--------|
+| Bull steepening | Both rates falling, long end falls faster | Most bullish — growth expectations recovering, recession fears fading |
+| Bear steepening | Short end falls faster than long end | Mixed — Fed cutting into weakness, long rates rising (inflation or fiscal concern) |
+| Bull flattening | Long end rallying (falling yields), short end stable | Risk-off — flight to safety, growth slowing |
+| Bear flattening | Short end rising faster | Late cycle — Fed tightening, policy error risk |
+
+An inverted curve (2Y > 10Y) signals that short-term funding costs more than long-term capital — banks stop lending profitably, credit creation slows. Every US recession since WWII was preceded by curve inversion.
+
+**Copper/Gold 13-Week Ratio**
+- Raw: COPX (copper miner ETF) price ÷ GLD (gold ETF) price over 13 weeks
+- What it measures: the growth/fear balance in global commodity markets
+- Copper is an industrial input — demand rises with economic activity. Gold is a fear asset — demand rises with uncertainty.
+- Copper/Gold rising = global growth confidence. Gold/Copper rising = global fear or growth doubt.
+- Historically leads global PMI by 2-3 months because copper buyers must plan industrial production in advance.
+
+**Credit Impulse**
+- Raw: (Change in bank credit over 91 days) ÷ (Bank credit 91 days ago) × 100
+  ```
+  Credit Impulse = (TOTBKCR - TOTBKCR.shift(91)) / TOTBKCR.shift(91) × 100
+  ```
+- What it measures: not the level of credit, not the growth rate, but the **acceleration** of credit creation
+- Academic basis: Biggs, Mayer, Pick (2010) — the Credit Impulse leads GDP and equity returns by ~6 months
+- Why acceleration matters: when banks suddenly lend more aggressively after a slow period, that new money enters the economy immediately and shows up in spending data 1-2 quarters later. The inflection is the signal, not the level.
+
+**Real Rate Regime**
+- Raw: DFII10 (10-year TIPS yield, daily from FRED)
+- What it measures: the inflation-adjusted (real) return on 10-year Treasuries
+- Real rates above 2.5%: punitive discount rate for equities. Cash earns more than enough to compensate for risk. Equity valuations compress. Growth stocks hit hardest.
+- Real rates 0-2%: neutral zone.
+- Real rates below 0% (financial repression): cash earns nothing real. Capital pushed into risk assets. Historically associated with strong equity and commodity performance.
+
+**Reserve Adequacy**
+- Raw: WRBWFRBL (excess reserves of depository institutions at the Federal Reserve, $bn)
+- What it measures: how much cushion is in the banking system's plumbing
+- Below ~$3 trillion: historically associated with funding stress. The September 2019 repo spike (overnight rates briefly hit 10%) occurred when reserves approached this level.
+- When reserves are low, banks hoard cash and reduce inter-bank lending → repo rates spike → funding costs rise across the system → credit tightens.
+
+**M2 YoY Growth**
+- Raw: (M2SL / M2SL.shift(365) - 1) × 100
+- What it measures: how fast the total money supply is growing year-over-year
+- More money in the system → more capital available to chase assets → supportive for equity prices
+- M2 growth leads equity returns by approximately 6-9 months empirically
+- Negative M2 YoY (quantitative tightening combined with weak bank lending) has preceded every major equity drawdown — 2000, 2008, and the 2022 bear market
+
+**Net Liquidity 13-Week Impulse**
+- Same construction as the 4-week version, but over 91 days
+- Captures slower-moving structural liquidity trends rather than week-to-week fluctuations
+
+---
+
+#### Coincident Conditions (Not Leading — A Reality Check)
+
+Three signals measure what is happening **right now**, not what is expected. These are not leading indicators. They are used as a 20%-weight reality check to prevent the model from being wildly wrong when current conditions are clearly stressed:
+
+1. **Fear score (VIX-based equity stress)**: a composite of VIX level, VIX term structure, and short-term price action. High fear compresses bullish signals.
+2. **NFCI (National Financial Conditions Index)**: the Federal Reserve's weekly measure of credit, risk, and leverage conditions in US financial markets. Above 0 = tighter than average. Below 0 = looser than average.
+3. **Net liquidity direction**: is the 4-week liquidity impulse currently positive (expanding) or negative (contracting)?
+
+These were deliberately chosen to be orthogonal — they measure genuinely different underlying things (equity vol surface, credit/funding conditions, central bank plumbing). Earlier versions of this bucket had 5+ signals that all contained yield-curve information, which effectively made the bucket triple-count one factor.
+
+---
+
+#### The 1-Day Model
+
+The 1-day model is architecturally separate from the 5/21/63-day models. It is built specifically around GEX mechanics.
+
+**Why GEX conditions the 1-day model:**
+
+GEX does not give a direction. But it tells you *how to interpret* the other signals:
+
+| GEX Regime | How to read momentum | Primary signal |
+|------------|---------------------|----------------|
+| Positive gamma | FADE momentum | Credit/dollar microstructure (what is flowing today) |
+| Negative gamma | FOLLOW momentum | SPY 5-day momentum (dealers amplify) |
+| Near flip | Compress toward 50% | All signals equally uncertain |
+
+The five factors:
+1. **VIX/RVol ratio** — Using 5-day realised vol (not 63-day). Very short horizon fear premium.
+2. **SPY 5D momentum** — Regime-conditioned: fade in positive gamma, follow in negative gamma.
+3. **Credit/dollar microstructure** — 1-day changes in HYG, LQD, and DXY. These are the fastest cross-asset signals and lead equity by minutes to hours intraday.
+4. **Curve inversion status** — Binary structural headwind/tailwind. An inverted curve is a persistent drag regardless of regime.
+5. **Net liquidity sign** — Sign and recent acceleration of the 4-week liquidity impulse.
+
+**Session compression:** Outside prime-time (10:30am–12pm ET), the 1-day signal is compressed toward 50%. GEX-based setups only work reliably in liquid conditions.
+
+**Honest accuracy ceiling:** Realistic 1-day AUC is 0.52–0.55. This is consistent with the academic literature. Anyone claiming >0.58 on daily equity direction is overfitting. The value is in *conditional positioning* — knowing when conditions are even slightly better, and sizing accordingly.
+
+---
+
+#### GEX Volatility Regime Adjustment
+
+GEX does not vote on direction in the composite model. It adjusts for expected volatility regime:
+
+- **Positive gamma regime**: compress the composite slightly toward 50. Moves are expected to be mean-reverting, so extreme readings are less likely to persist.
+- **Negative gamma regime**: expand the composite slightly away from 50. Moves are expected to be amplified, so directional signals carry more weight.
+
+This adjustment is capped at 8% of the distance to 50, scaled by regime stability. It is a second-order effect — the signal itself comes from the economic indicators, not from GEX.
+
+---
+
+#### Geo Shock Overlay
+
+The geo shock score (0-100) is computed separately from the Intel Monitor and applied as a drag on the bull probability:
+
+```
+geo_drag = (geo_shock / 100) × 15    # max 15 percentage-point compression
+```
+
+A geo shock of 50 compresses the bull probability by 7.5 percentage points. This reflects the fact that geopolitical risk events add uncertainty orthogonal to all economic signals — they can occur regardless of liquidity, credit, or curve conditions.
+
+---
+
+#### Regime Uncertainty Compression
+
+The regime transition probability (P(regime change in 20 days)) compresses the composite:
+```
+compressed = 50 + (raw - 50) × (1 - uncertainty × 0.45) - geo_drag
+```
+At 50% transition probability, the composite is compressed 22.5% toward 50 (plus geo drag). At 0% transition probability, no compression. This prevents high-conviction directional calls during periods of macro regime instability.
+""")
+
+    # ─────────────────────────────────────────────────────────
+    with tab5:
+        st.markdown("### Intel Monitor — Full Explanation")
+        st.markdown("""
+#### What it does
+
+The Intel Monitor scans **real-time news RSS feeds** from primary sources (Federal Reserve, BLS, BEA, Reuters, BBC, Al Jazeera, CNBC, FT) across 7 categories. Every 5 minutes, it re-fetches all feeds, scores each headline, and categorises it.
+
+---
+
+#### The 7 Categories
+
+**Fed & Monetary Policy**
+Tracks Federal Reserve statements, FOMC decisions, balance sheet operations, and regulatory policy. Sourced from the Fed's own press release feed, FOMC release feed, SEC, and White House.
+
+Why it matters: the Fed is the single largest driver of long-term equity valuations through its control of the risk-free rate and liquidity supply. A surprise hawkish statement overrides virtually all other signals.
+
+Key weighted terms: `rate cut +10`, `rate hike +10`, `balance sheet +8`, `QT +8`, `QE +8`, `SLR +9` (supplementary leverage ratio — affects how much capital banks must hold against Treasuries, which directly affects repo market liquidity)
+
+**Fiscal & Debt**
+Tracks Treasury operations, debt ceiling negotiations, budget legislation, and TGA (Treasury General Account) movements. Sourced from Treasury press releases, BEA, State Dept.
+
+Why it matters: the TGA drawdown mechanism is one of the primary sources of near-term liquidity injections into markets. When Treasury spends down its Fed cash account, those dollars flow into the banking system and show up in net liquidity within days. Debt ceiling crises constrain this mechanism and create bond supply disruptions.
+
+**Inflation & Labor**
+Tracks CPI, PCE, NFP, ISM, jobless claims. Sourced from BLS, BEA, CNBC Economy, FT.
+
+Why it matters: the Fed's reaction function depends entirely on the inflation/labor picture. High inflation with tight labor = Fed stays tight = higher real rates = equity headwind. Inflation breaking lower with rising unemployment = Fed can cut = rate tailwind.
+
+**Trade & Tariffs**
+Tracks tariff announcements, trade negotiations, sanctions, and export controls. Sourced from Reuters World, CNBC Trade.
+
+Why it matters: tariffs create supply-side inflation (harder for the Fed to cut), disrupt global supply chains (negative for global growth expectations), and reduce corporate earnings on import-exposed companies. Tariff news in this dashboard feeds into the geo shock component.
+
+**Geopolitical Risk**
+Tracks conflicts, military activity, sanctions, strategic chokepoints. Sourced from Reuters, BBC, Al Jazeera, RFE/RL, Sky News.
+
+Why it matters: the geo shock score from this category directly compresses the bull probability. See geo shock scoring below.
+
+**Markets & Liquidity**
+Tracks credit spreads, volatility events, repo market, M2 announcements. Sourced from Reuters Business, MarketWatch, Investopedia.
+
+Why it matters: credit market stress shows up in headlines before it shows up in economic data. An unexpected credit event (like a major default or repo spike) is a coincident stress signal that should immediately reduce risk.
+
+**AI & Tech Cycle**
+Tracks AI capex announcements, semiconductor policy, antitrust cases. Sourced from Reuters Tech.
+
+Why it matters: the current market is heavily concentrated in Mag-7 (Apple, Microsoft, Nvidia, Alphabet, Meta, Amazon, Tesla). A bubble score for this concentration feeds into the structural risk framework. AI-driven capex cycles affect both growth expectations and the sustainability of current valuations.
+
+---
+
+#### How Headlines Are Scored
+
+Each headline is scored using a **weighted keyword match** across all 7 categories. The headline and its source name are searched for each category's keyword list:
+
+```python
+score = sum(weights.get(kw, 3.0) for kw in category_keywords if kw in headline_text)
+```
+
+The headline is assigned to its **highest-scoring category**. If two categories score equally, the first in order wins. If no category scores above 0, the headline is discarded.
+
+Weights range from 3 (generic keyword) to 10 (critical term). Examples:
+- `rate cut = 10`, `rate hike = 10` — the highest priority signals
+- `debt ceiling = 10`, `shutdown = 9`, `SLR = 9` — near-critical
+- `inflation = 7`, `cpi = 10`, `pce = 10` — primary economic data
+- `tariff = 6`, `sanction = 7`, `blockade = 8` — escalating geopolitical terms
+
+---
+
+#### Geo Shock Scoring
+
+The geo shock score is calculated separately and uses a more sophisticated classifier than simple keyword matching:
+
+**Word-boundary matching:** The classifier uses regex word boundaries (`\\b` anchors) for short terms. This prevents `war` from matching `award`, `forward`, or `warrants`. Longer phrases are still substring-matched.
+
+**Exclusion phrases:** Checked first, before any keyword matching. Examples:
+- `"price war"` → not a conflict
+- `"nuclear energy"`, `"nuclear plant"` → not a weapons event
+- `"war on inflation"` → policy rhetoric, not conflict
+
+**Country baseline risk:** High-risk countries get a bonus multiplier on any matched headline:
+- Iran, Russia, North Korea, Yemen: high multiplier
+- Taiwan, China, Ukraine, Israel, Pakistan: medium-high
+- Others: standard
+
+**Strategic chokepoints:** 9 critical maritime/geographic locations (Strait of Hormuz, Malacca Strait, Taiwan Strait, Suez Canal, Bab-el-Mandeb, Black Sea, Panama Canal, South China Sea, Persian Gulf). A chokepoint only scores if a **disruption keyword** also appears in the same headline. "Suez Canal expansion" → 0. "Suez Canal blockade" → 12.
+
+**Temporal decay:** Headlines older than 6 hours decay in weight. Breaking news scores higher than a story that has been in the feed for a day.
+
+The final geo shock score is clipped to 0-100 and applied as a compression on the bull probability.
+
+---
+
+#### Driver Alerts
+
+Driver alerts fire whenever any tracked signal changes by more than its threshold between consecutive dashboard refreshes:
+
+| Signal | Threshold | What triggers it |
+|--------|-----------|-----------------|
+| Fear Score | ±8 points | VIX-based stress composite changed materially |
+| Bull Probability | ±8 points | Overall composite shifted significantly |
+| Three Puts Score | ±8 points | Fed/Treasury/Political put availability changed |
+| Liquidity Anxiety | ±10 points | Liquidity stress indicator moved |
+| Market Index | ±12 points | Broader market composite shifted |
+| Macro Regime | any change | Goldilocks/Overheating/Stagflation/Deflation classification flipped |
+| Risk Regime | any change | Overall risk classification changed |
+| GEX Regime | any change | Positive/Neutral/Negative gamma regime flipped |
+
+These are **state-change notifications** — they tell you something material moved, not just noise. When a driver alert fires, the specific value is shown alongside the direction of change.
+
+---
+
+#### Economic Calendar Integration
+
+The session context module maintains a hard-coded calendar of major scheduled events:
+- FOMC decision days (all meetings through 2026)
+- CPI release dates
+- NFP/jobs report dates
+- PCE release dates
+- GDP advance estimate dates
+
+On scheduled data days, the session size multiplier is automatically reduced:
+- FOMC day: ×0.5 (entire session is event-driven — GEX levels often break)
+- Other major data (CPI, NFP, PCE, GDP): ×0.75
+
+The intuition: on major data days, large macro surprises (3-sigma NFP, unexpected Fed language) override dealer hedging flows completely. GEX levels that have been reliable all week become irrelevant for hours. Reducing size on these days is not optional — it is baked into the framework.
+""")
+
+    # ─────────────────────────────────────────────────────────
+    with tab6:
+        st.markdown("### Execution Framework — Full Explanation")
+        st.markdown("""
+#### Session Windows and Size Multipliers
+
+The time of day is not a secondary consideration — it is a primary input to position sizing. GEX-based dealer hedging flows are only reliable when liquidity is high and bid-ask spreads are tight. In thin conditions, the same price levels exist but the flows that enforce them are absent.
+
+| Session | Time (ET) | Size multiplier | Rationale |
+|---------|-----------|----------------|-----------|
+| Globex (overnight) | Until 9:30am | **0.0×** | GEX data is end-of-day. Overnight moves are unrelated to dealer gamma flows. No setups. |
+| RTH Open | 9:30–9:45am | **0.0×** | Opening rotation is driven by overnight order imbalance, not gamma mechanics. Price often gaps through GEX levels without dealer response. |
+| IB Forming | 9:45–10:30am | **0.5×** | Initial Balance forming. Market is still discovering price. GEX levels can attract price but flow confirmation is noisy. Only trade with strong confirmation. |
+| **Morning (Prime Time)** | **10:30am–12pm** | **1.0×** | **Peak GEX reliability.** Options flow is actively updating, bid-ask spreads are tight, dealer hedging is most responsive. All 5 setups are valid here. |
+| Midday | 12–2pm | **0.35×** | Book is thin. Algorithmic programs fill the vacuum with low-information flow. False touches at GEX levels are common. Reduce size by 50%+. |
+| Afternoon | 2–3pm | **0.65×** | Liquidity returns as 0DTE gamma becomes more acute. Reassess 0DTE-specific setups. |
+| Close/MOC | 3–4pm | **0.25×** | Market-on-close (MOC) imbalances and index-rebalancing flows override GEX mechanics. Setup 5 (0DTE pin) is the only valid setup after 3:30pm. |
+| Post-RTH | After 4pm | **0.0×** | No gamma setups. Monitor only. |
+
+On FOMC days: multiply the base size multiplier by 0.5. On other major data days (CPI, NFP, PCE, GDP): multiply by 0.75.
+
+---
+
+#### The 5 Setup Scoring System
+
+Each setup is scored on five dimensions, each 0-1:
+
+| Dimension | What it measures |
+|-----------|-----------------|
+| **Gamma alignment** | How strongly the GEX regime supports this setup type |
+| **Orderflow confirmation** | Whether footprint/DOM shows absorption/initiative consistent with the setup |
+| **TPO context** | Whether the market profile structure supports the trade (prior value areas, single prints) |
+| **Level freshness** | How recently the GEX level was tested — fresh levels work better than crowded ones |
+| **Event risk** | Whether scheduled events could override the setup |
+
+Setup score = weighted average of these five dimensions. The dashboard shows estimated hit rates per setup:
+- Setup 1 (Gamma Bounce): ~55% historical
+- Setup 2 (Gamma Fade): ~52% (lower because of structural long bias)
+- Setup 3 (Flip Breakout): ~45% (confirmation is hard to get cleanly)
+- Setup 4 (Exhaustion Reversal): ~40% (rarest, lowest conviction)
+- Setup 5 (0DTE Pin): ~65% (highest, but only valid in a narrow time window)
+
+---
+
+#### Pre-Trade Checklist
+
+Before every trade, **all relevant boxes must be confirmed** or the trade does not exist:
+
+**Auto-verified from live data (the dashboard checks these):**
+1. ✅ GEX level identified from current session data
+2. ✅ Gamma regime confirmed (above or below flip, not within ±0.5%)
+3. ✅ Session size multiplier ≥ 0.5 (trading is active)
+7. ✅ Risk within VIX-adjusted limits (VIX >35 = 50% size, VIX 25-35 = 75% size)
+9. ✅ No FOMC/CPI/NFP within 2 hours
+10. ✅ Not in first 15 minutes (RTH open) or post-3:30pm (unless Setup 5)
+
+**Requires your judgment (cannot be automated):**
+4. ⬜ Orderflow confirmation: absorption print (Setup 1/2), initiative flow (Setup 3), or volume climax + delta divergence (Setup 4)
+5. ⬜ Setup classification: does this trade map to one of the 5 defined setups? If not, pass.
+6. ⬜ Stop defined at a structural level (GEX level invalidated, regime changed) before entry
+8. ⬜ R:R acceptable: ≥2:1 for Setups 1-3, ≥3:1 for Setup 4, ≥1.3:1 for Setup 5
+
+---
+
+#### The 8 Failure Modes
+
+These are the most common reasons GEX-based trades fail even when every check is green:
+
+**FM1 — Stale GEX Data**
+OI only updates once per day (post-close, from OCC). Intraday changes in positioning are not reflected. If a large institutional order has altered the OI structure since the previous close (e.g., a major roll), the bars on the chart are wrong. *Diagnostic: require 3 separate touches at the level before trusting it intraday.*
+
+**FM2 — Gamma Level Crowding**
+Round-number flip levels (500, 580, 600) that have been published by multiple GEX services (SpotGamma, GEXBot, etc.) attract heavy front-running. Retail and institutional traders all expect the level to hold — which creates congestion and stop-hunting rather than clean absorption. *Diagnostic: the dashboard flags flip levels at round numbers (÷5 == 0) with high regime stability.*
+
+**FM3 — Regime Transition Mid-Trade**
+A trade entered in positive gamma can find itself in negative gamma if the flip level breaks during the trade. Mean-reversion logic becomes invalid the moment price holds below the flip. *Diagnostic: monitor the flip distance continuously. If the flip is breached and held for 3+ bars, the thesis is invalidated.*
+
+**FM4 — Exogenous Shock Override**
+A 3-sigma macro event (unexpected Fed statement, surprise NFP, geopolitical escalation) creates information that overrides dealer hedging flows entirely. Dealers still mechanically hedge, but the underlying move is large enough that GEX levels become noise. *Rule: exit at market price. Do not defend GEX levels against macro flow.*
+
+**FM5 — Footprint Spoofing**
+A single large absorption print on the footprint chart may be manufactured — placed at the bid/ask to appear as absorption, then pulled before execution. *Rule: require 3+ consecutive bars of confirmed absorption before entering. One print is noise.*
+
+**FM6 — Correlation Regime Break**
+When bonds or FX are driving equity direction more than options mechanics — a common occurrence during major macro regime transitions — GEX levels stop working. The correlation between GEX flows and price action breaks down. *Diagnostic: VIX >25 or the correlation between SPY and TLT flipping positive are warning signs.*
+
+**FM7 — OpEx Regime Decay**
+Options that expire on a given OpEx day are removed from the system. The remaining open interest is from the next expiry cycle, and those contracts have lower gamma (longer time to expiry). GEX levels weaken after the dominant expiry. *Rule: treat all GEX levels as weaker for 1-2 days after monthly OpEx.*
+
+**FM8 — Delta-Hedging Timing Lag**
+Dealers do not hedge continuously. They hedge in batches when their delta exposure exceeds internal thresholds. A GEX level is a zone (±4-8 ticks), not a laser-precise price. *Rule: always use a buffer on stops placed at GEX levels. A stop at exactly 5800 against a 5800 GEX node will be run.*
+
+---
+
+#### Kelly Fraction and Position Sizing
+
+The Kelly criterion is the mathematically optimal fraction of capital to bet given a known edge and payoff ratio:
+```
+f* = (edge × payoff − loss_prob) / payoff
+
+Where:
+  edge      = P(win) - 0.5 (the true edge above coinflip)
+  payoff    = R:R ratio (how much you win vs how much you lose)
+  loss_prob = 1 - P(win)
+```
+
+Example: P(win) = 60%, payoff (R:R) = 2:1
+```
+f* = (0.60 × 2 − 0.40) / 2 = (1.20 - 0.40) / 2 = 0.40 = 40% of capital
+```
+
+The dashboard shows **half-Kelly** (35% for 1-day, 50% for 21-day and 63-day). Half-Kelly is standard professional practice because:
+1. The true edge is almost always overestimated
+2. Full Kelly with an overestimated edge causes catastrophic drawdowns
+3. Half-Kelly loses only ~25% of the theoretical maximum growth rate but eliminates blowup risk
+
+The final position size = Kelly fraction × session size multiplier × VIX adjustment:
+- VIX >35: ×0.5 (extremely high vol — option prices are expensive, ranges are wide)
+- VIX 25-35: ×0.75
+- VIX <25: ×1.0
+""")
+
+    # ─────────────────────────────────────────────────────────
+    with tab7:
+        st.markdown("### Structural Risk Signals — Full Explanation")
+        st.markdown("""
+These are regime gates, not directional trading signals. When triggered, they reduce the weight given to bullish signals across the entire model. They are the difference between a bull setup in a healthy environment and a bull setup in a stress environment.
+
+---
+
+#### Sahm Rule
+
+**Origin:** Developed by economist Claudia Sahm (2019), initially for automatic fiscal stabiliser design. Adopted by traders as a real-time recession onset indicator.
+
+**Formula:**
+```
+Sahm = (3-month average UNRATE) − (12-month minimum UNRATE)
+```
+
+**Why this formula works:** Unemployment rises slowly at first, then accelerates. A small increase from the cycle low is the early warning — it precedes the acceleration that everyone recognises as a recession. By the time unemployment is obviously elevated, the recession is already several months old.
+
+The 3-month average smooths out monthly noise. Comparing to the 12-month low anchors to the cycle peak of the labour market.
+
+**Historical reliability:** Every US recession since World War II has been preceded or accompanied by a Sahm reading ≥0.50. There have been no false positives at the 0.50 threshold in the post-WWII sample.
+
+**Thresholds and dashboard behaviour:**
+
+| Reading | Status | Dashboard effect |
+|---------|--------|-----------------|
+| < 0.10 | Normal | No adjustment |
+| 0.10 – 0.30 | Elevated | Monitor — early softening |
+| 0.30 – 0.50 | Watch zone | Mild compression of bullish signals |
+| **≥ 0.50** | **Triggered** | **Significant compression — base rate of bull market outcome is lower** |
+
+**Important nuance:** A triggered Sahm Rule does not mean sell everything immediately. Recessions unfold over 12-18 months and equity markets have historically rallied significantly *during* recessions (often pricing in the recovery). The Sahm trigger changes the *base rate assumption* — bull probability starts from a lower prior.
+
+---
+
+#### HY Spread (ICE BofA High Yield OAS)
+
+**What it is:** The Option-Adjusted Spread (OAS) on the ICE BofA High Yield bond index (FRED ticker: BAMLH0A0HYM2). This is the extra yield (in basis points) investors demand to hold speculative-grade (junk) corporate debt instead of equivalent Treasuries.
+
+**OAS vs raw spread:** OAS removes the value of embedded call options in bonds (which distort the raw spread). It is a cleaner measure of pure credit risk premium.
+
+**Why credit leads equity:**
+1. Institutional credit investors are generally better-informed than equity retail investors
+2. Corporate treasurers manage credit maturities actively — stress shows up in funding decisions before it shows up in earnings
+3. Credit defaults are existential events; equity drawdowns are not. Credit markets price tail risk faster.
+
+**Historical context:**
+
+| Level | Context | Regime implication |
+|-------|---------|-------------------|
+| < 300bp | Complacency | Tighter than historical average (~400bp). Potential for sharp widening. |
+| 300–450bp | Normal | Healthy credit conditions. Consistent with expansion. |
+| 450–600bp | Elevated | Risk appetite deteriorating. Credit tightening. |
+| **600–1000bp** | **Recession pricing** | Default risk rising. Consistent with late cycle or contraction. |
+| > 1000bp | Systemic stress | GFC-level. Many normal signals break down. |
+
+**The HYG/LQD signal vs the HY spread level:** These are different questions.
+- HYG/LQD momentum (in the probability model) asks: is credit risk appetite *improving or deteriorating* in the last 21 days?
+- HY spread level asks: where are we *absolutely* in the credit cycle?
+
+Both are needed. You can have a healthy HYG/LQD momentum reading while still being in a high-stress environment if spreads are at 700bp and slowly tightening.
+
+---
+
+#### Three Puts (Narrative Context Only)
+
+These are three structural backstops that can prevent or limit severe market declines. They are **not inputs to the probability model** (they share underlying data with signals already in the model — including them would double-count yield curve and unemployment data). They are shown as context for understanding the macro backdrop.
+
+**Fed Put**
+The Federal Reserve's implicit commitment to provide liquidity and cut rates if financial conditions become too tight or if the economy contracts severely.
+
+Score is high (Fed Put available) when:
+- 10-year yields are falling (bond market pricing rate cuts)
+- Unemployment is rising (cutting window is open — Fed mandate triggered)
+- Core CPI is below 3% (inflation doesn't constrain the Fed)
+
+Score is low (Fed Put constrained) when:
+- Core CPI > 3% — the Fed cannot cut without losing inflation credibility
+- This is the worst case: recession risk present but Fed is unable to respond
+
+**Treasury Put**
+The Treasury's ability to inject liquidity through TGA drawdowns and RRP drainage.
+
+- TGA drawdown: Treasury spending down its Fed cash account floods the banking system with dollars within days. Every billion drained from the TGA appears in net liquidity.
+- RRP drainage: When the Fed's reverse repo facility shrinks, money that was parked there (earning the RRP rate) moves into money market funds, repo markets, and eventually risk assets.
+- When both TGA and RRP are near zero, this mechanism is exhausted.
+
+Score reflects: how much runway remains in these liquidity-injection mechanisms.
+
+**Political/Trump Put**
+The market's expectation that significant political intervention (tariff pauses, pressure on the Fed, direct support measures) will occur to prevent sustained market declines.
+
+Score rises when:
+- Market is in the "intervention zone" (>7% off 6-month highs)
+- Fear is elevated (VIX elevated, sentiment negative)
+- Political actors face electoral incentives to support markets
+
+This is the most subjective of the three. It is narrative context, not a quantitative model.
+
+---
+
+#### NFCI (National Financial Conditions Index)
+
+**Source:** Federal Reserve Bank of Chicago, published weekly.
+
+**Construction:** NFCI is a composite of 105 financial variables across three sub-categories:
+- Risk (equity volatility, credit spreads, funding costs)
+- Credit (bank lending standards, credit growth, leverage)
+- Leverage (debt-to-income ratios, asset prices relative to trend)
+
+Each variable is measured in z-score terms relative to its own history.
+
+**Interpretation:**
+- NFCI = 0: financial conditions exactly at historical average
+- NFCI > 0: tighter than average (restrictive)
+- NFCI < 0: looser than average (accommodative)
+
+**Dashboard use:** NFCI is one of the three coincident condition signals. It is orthogonal to the equity-based fear score (NFCI measures credit/funding stress, not equity vol) and to the net liquidity direction (NFCI is a composite index, not a flow measure).
+
+---
+
+#### The Fear Score
+
+The fear score (0-100) is a VIX-based composite:
+- VIX absolute level (current vs historical)
+- VIX term structure (front/back ratio — fear premium)
+- Short-term SPY price action
+
+Fear > 70: high fear regime. The 1-day probability model caps the bull signal at a lower maximum. This reflects the empirical observation that in high-fear regimes, dealers are not supporting rallies — they are hedging their own book aggressively.
+
+Fear > 55 but ≤ 70: moderate stress. Mild signal dampening.
+""")
+
+    # ─────────────────────────────────────────────────────────
+    with tab8:
+        st.markdown("### Setup, Data Sources & Practical Notes")
+        st.markdown("""
+#### Data Sources and Update Frequency
+
+| Data | Source | FRED Ticker | Update frequency |
+|------|--------|------------|-----------------|
+| 2-Year Treasury yield | FRED | DGS2 | Daily |
+| 10-Year Treasury yield | FRED | DGS10 | Daily |
+| 30-Year Treasury yield | FRED | DGS30 | Daily |
+| 3-Month Treasury yield | FRED | DGS3MO | Daily |
+| 10-Year TIPS (real rate) | FRED | DFII10 | Daily |
+| M2 money supply | FRED | M2SL | Weekly |
+| Fed balance sheet | FRED | WALCL | Weekly |
+| Treasury cash (TGA) | FRED | WTREGEN | Weekly |
+| Reverse Repo (RRP) | FRED | RRPONTSYD | Daily |
+| Bank reserves | FRED | WRBWFRBL | Weekly |
+| Bank credit | FRED | TOTBKCR | Weekly |
+| HY Spread (OAS) | FRED | BAMLH0A0HYM2 | Daily |
+| ISM New Orders | FRED | AMTMNO | Monthly |
+| Unemployment rate | FRED | UNRATE | Monthly |
+| Initial jobless claims | FRED | ICSA | Weekly |
+| Money market funds | FRED | WRMFSL | Weekly |
+| GDP (real, chained) | FRED | GDPC1 | Quarterly |
+| NFCI | FRED | NFCI | Weekly |
+| Equity prices (SPY, QQQ, IWM, VIX, HYG, LQD, UUP, COPX, GLD) | yfinance | — | ~15min delayed |
+| Options chain (OI, IV) | yfinance | — | OI: post-close; IV: delayed |
+| Options chain (IV only) | Schwab API | — | Real-time (with auth) |
+| News headlines | RSS (Fed, BLS, BEA, Reuters, BBC, Al Jazeera, CNBC, FT) | — | 5-minute cache |
+
+---
+
+#### GEX Data Limitations (Critical to Understand)
+
+**Open Interest updates once per day.** The Options Clearing Corporation publishes OI data after market close — typically around 6:30am ET the following morning. During the trading day, every OI bar on the GEX chart reflects the previous night's positioning.
+
+This means:
+- The bar heights are static during the trading day
+- Large intraday flows (institutional rolls, new positions) are invisible until the next morning
+- The gamma flip level is based on yesterday's OI
+
+**With Schwab connected:**
+Schwab provides live implied volatility per contract. Since IV is an input to the gamma calculation (`Gamma = N'(d1) / (S × σ × √T)`), changing IV changes gamma even with fixed OI. The flip level therefore moves modestly intraday based on vol surface shifts. This makes the level more accurate — but it is still based on static OI.
+
+**Without Schwab:**
+Both OI and IV are end-of-day. The flip level is completely static until the next morning's OCC data.
+
+**Practical implication:** Always treat GEX levels as zones (±0.3%), not precise prices. Require multiple touches and footprint confirmation before trusting a level intraday. If a level fails cleanly (3+ bars holding below it), assume the OI structure has changed and the level is stale.
+
+---
+
+#### Schwab API Setup
+
+1. Go to developer.schwab.com and create an app (Trader API — Individual)
+2. Set the callback URL to exactly your Streamlit app URL (e.g., `https://your-app.streamlit.app/`)
+3. Add your App Key and App Secret to Streamlit secrets (see below)
+4. In the dashboard, navigate to the Schwab/TOS tab and click **Authorise**
+5. Complete the OAuth2 flow — log in with your Schwab credentials and approve the app
+6. The token is stored in Supabase and persists across Streamlit restarts
+
+With Schwab connected, the GEX chart shows real-time IV-adjusted gamma. Without it, the dashboard still functions — it uses yfinance IV, which is accurate enough for the flip level and regime classification.
+
+---
+
+#### Streamlit Secrets Configuration
+
+```toml
+# .streamlit/secrets.toml
+
+FRED_API_KEY         = "your_fred_api_key"          # from fred.stlouisfed.org/api
+SCHWAB_CLIENT_ID     = "your_schwab_app_key"         # from developer.schwab.com
+SCHWAB_CLIENT_SECRET = "your_schwab_secret"          # from developer.schwab.com
+SCHWAB_REDIRECT_URI  = "https://your-app.streamlit.app/"   # must match exactly
+
+# Supabase (for Schwab token persistence across restarts)
+SUPABASE_URL         = "https://xxxx.supabase.co"
+SUPABASE_KEY         = "sb_publishable_xxxx"         # use the anon/public key
+```
+
+Required Supabase table (create once in the SQL editor):
+```sql
+CREATE TABLE schwab_tokens (
+  id      TEXT PRIMARY KEY DEFAULT 'shared',
+  token   JSONB NOT NULL,
+  updated TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+---
+
+#### Caching and Refresh Behaviour
+
+| Data type | Cache TTL | Notes |
+|-----------|-----------|-------|
+| FRED macro data | 30 minutes | Infrequently updated — 30 min is appropriate |
+| yfinance options chain | 60 seconds | OI is static intraday; short cache is fine |
+| Schwab options chain | 60 seconds | IV is live; short cache captures intraday vol changes |
+| News feeds (RSS) | 5 minutes | Balances freshness against rate limits |
+| Schwab authentication | 5 minutes | Token refreshed automatically by schwab-py |
+
+The GEX Engine page has manual refresh controls in the sidebar (30s to 30min). Shorter refresh intervals are only meaningful with Schwab connected — yfinance IV doesn't update frequently enough to benefit from sub-60s refresh.
+
+---
+
+#### Performance Expectations
+
+Be honest about what this model can and cannot do:
+
+| Horizon | Realistic AUC | What drives it |
+|---------|--------------|----------------|
+| 1-Day direction | 0.52–0.55 | Near the theoretical ceiling for daily equity direction |
+| 5-Day direction | 0.54–0.57 | VIX term structure and DXY momentum have modest short-term predictive value |
+| 21-Day direction | 0.55–0.60 | Credit and liquidity signals have more time to resolve |
+| 63-Day direction | 0.58–0.64 | Macro signals are most predictive at this horizon |
+
+AUC of 0.55 means the model is right 55% of the time on its high-conviction calls, versus a 50% coin flip. That is a real edge — but it requires correct sizing (Kelly) and strict setup discipline to monetise. A 55% AUC model with poor sizing (too large) or poor selectivity (trading every signal) will still lose money.
+
+---
+
+#### Disclaimer
+
+This dashboard is for **educational and research purposes only**. It is not investment advice. Probability outputs, Kelly fractions, and setup scores are quantitative research tools to assist your own decision-making — they are not recommendations to buy or sell any security.
+
+All trading involves substantial risk of loss. Past performance of any signal, indicator, or model does not guarantee future results. The probability outputs reflect historical statistical relationships that may not persist. Macro regimes change. Model assumptions can be wrong. Position sizes derived from Kelly fractions assume edge estimates that are uncertain.
+
+Use this dashboard as one input among many. Always apply your own judgment. Always use stops.
+""")
+
+    with tab9:
+        st.markdown("### 🔵 Translating GEX Levels to NQ / ES Futures")
+        st.markdown("""
+The GEX Engine is built on **SPY and QQQ options** — the most liquid options markets in the world.
+But if you trade futures (ES, NQ, MES, MNQ), you need to convert those ETF-based levels into
+futures prices. This tab explains the mechanics, the conversion math, and how each GEX signal
+manifests differently in the futures tape.
+
+---
+
+### Why ETF Options Drive Futures Prices
+
+SPY and QQQ options represent the deepest options liquidity on the planet — far deeper than
+/ES or /NQ options. The dealer hedging flows from SPY/QQQ options therefore dominate the
+price action of the underlying index, which in turn forces futures to track.
+
+The direction of causality:
+```
+SPY/QQQ Options Dealers hedge → SPY/QQQ price moves → Index arbitrageurs → /ES and /NQ move
+```
+
+Futures lead intraday during low-volume periods (pre-market, overnight). ETF options lead
+during regular trading hours when dealer hedging dominates. Both converge at the index level
+via arbitrage — the premium/discount between futures and fair value is typically <0.1%.
+
+---
+
+### Converting SPY/QQQ GEX Levels to Futures Prices
+
+#### SPY → ES (/ES, MES)
+
+SPY tracks the S&P 500 at approximately **1/10th the index value**.
+
+```
+ES price ≈ SPY price × 10
+
+GEX strike (SPY) → ES level = SPY strike × 10
+```
+
+**Example:**
+- GEX flip level: SPY $542.00
+- ES equivalent:  5420
+- GWAS above:     SPY $547.50 → ES 5475
+- GWAS below:     SPY $538.00 → ES 5380
+
+**Multiplier note:** The ratio drifts slightly due to SPY's dividend treatment and fund expenses.
+The exact multiplier on any given day is: `SPY price / (S&P 500 index / 10)`. For practical
+intraday use, 10× is accurate to within 0.1%.
+
+---
+
+#### QQQ → NQ (/NQ, MNQ)
+
+QQQ tracks the Nasdaq-100 at approximately **1/40th the index value**.
+
+```
+NQ price ≈ QQQ price × 40
+
+GEX strike (QQQ) → NQ level = QQQ strike × 40
+```
+
+**Example:**
+- GEX flip level: QQQ $468.00
+- NQ equivalent:  18720
+- GWAS above:     QQQ $472.50 → NQ 18900
+- GWAS below:     QQQ $462.00 → NQ 18480
+
+**Multiplier note:** QQQ's ratio to NQ is less stable than SPY/ES because QQQ reinvests
+dividends differently. The exact multiplier: `QQQ price / (Nasdaq-100 index / 40)`. Use
+40× as a working approximation; verify against the live NQ futures quote.
+
+---
+
+### Tick Value and Dollar Impact
+
+Understanding how much a GEX level matters in dollar terms:
+
+| Instrument | Tick Size | Tick Value | 1 Point Value |
+|-----------|-----------|------------|---------------|
+| /ES (full) | 0.25 pts  | $12.50     | $50.00        |
+| MES (micro)| 0.25 pts  | $1.25      | $5.00         |
+| /NQ (full) | 0.25 pts  | $5.00      | $20.00        |
+| MNQ (micro)| 0.25 pts  | $0.50      | $2.00         |
+
+**GEX wall distance in dollars (/ES):**
+If the nearest GEX wall is 8 SPY points away (e.g., flip at 542, spot at 534):
+```
+8 SPY points × 10 = 80 ES points × $50/point = $4,000 per /ES contract
+```
+This is how much the market needs to travel before dealer hedging reverses regime.
+
+---
+
+### How Each GEX Signal Reads on the Futures Tape
+
+#### Gamma Flip Level → Key S/R in Futures
+
+The gamma flip translates directly to a key price level in ES/NQ. Above it, futures tend to
+be choppy and mean-reverting (positive gamma damping). Below it, futures exhibit trending,
+directional behaviour with less resistance to moves.
+
+**In the futures tape:**
+- **Above flip (positive gamma):** Expect 2–5 point ES pops to fade into resistance. Ranges compress.
+  Large orders get absorbed quickly. Bid-ask spread narrows. Good for fading extremes.
+- **Below flip (negative gamma):** Moves extend. Rally attempts fail quickly. Drops accelerate.
+  Market impact is higher — your stop needs to be wider or you accept more slippage.
+
+**Practical rule:** When ES is 10+ points below the flip, do not trade reversals. The mean-reversion
+logic that works in positive gamma breaks down. Trade with the trend or sit out.
+
+---
+
+#### GWAS → Intraday Gravity Centre in NQ/ES
+
+The gamma-weighted average strike (GWAS) translates to a *gravity zone* rather than a line.
+
+Convert GWAS to futures, then add a ±0.2% zone around it:
+```
+GWAS above (SPY $547.50) → ES 5475 → zone: 5464–5486
+GWAS below (SPY $538.00) → ES 5380 → zone: 5369–5391
+```
+
+**In the tape:**
+- ES/NQ will oscillate between these zones during positive gamma regimes
+- If price reaches GWAS above and stalls → high-probability short scalp back toward spot
+- If price reaches GWAS below and holds → high-probability long scalp back toward spot
+- If price **breaks through** GWAS zone cleanly → regime shift likely; previous zone becomes
+  new opposition
+
+---
+
+#### GEX Walls → Specific ES/NQ Levels
+
+Discrete GEX walls (largest absolute GEX strikes) convert to futures levels with this heuristic:
+
+**Zone sizing:**
+- Wall ≥ $500M GEX: treat as ±2 ES points zone (~0.04%)
+- Wall $200–500M GEX: treat as ±4 ES points zone
+- Wall <$200M GEX: treat as soft level only — single-bar confirmation required
+
+Large walls don't cause a binary rejection — they create **absorption zones** where the order flow
+thickens and moves slow. A 5-minute ES candle that wicks 3 points into a large wall and closes
+inside it is a textbook wall rejection. A close through the wall signals the wall has broken.
+
+---
+
+#### Vanna (VEX) → How IV Moves Affect ES/NQ Direction
+
+Vanna quantifies how much dealer delta changes when IV changes. In futures terms:
+
+**Positive vanna near spot:**
+- VIX rises (e.g., from 18 to 22) → dealers are forced to BUY futures to re-hedge
+- This buying floor under ES/NQ partially offsets the selloff
+- Result: ES drops less than you'd expect from VIX spike alone → do not chase shorts on IV spikes
+
+**Negative vanna near spot:**
+- VIX rises → dealers SELL futures to re-hedge
+- Their selling amplifies the selloff — momentum accelerates through lows
+- Result: ES drops more than VIX alone suggests → short-side momentum is legitimate, don't fade early
+
+**The vanna trade on NQ:**
+NQ is more vanna-sensitive than ES because Nasdaq options (QQQ) tend to carry higher IV and
+shorter-duration positioning. A VIX move that creates a 0.5% vanna flow in ES may create a
+1–1.5% flow in NQ. When the model shows negative vanna, NQ typically leads ES lower.
+
+---
+
+#### Charm (CEX) → Drift Throughout the Trading Session
+
+Charm is the time-decay component of dealer re-hedging. It creates a predictable directional
+drift during the session that is independent of news:
+
+**Positive charm near spot (typical in low-vol bull markets):**
+- As each hour passes, dealer deltas increase → they mechanically buy futures
+- Results in a persistent upward drift during the session, particularly 10:30–13:00 ET
+- ES/NQ tend to grind higher without obvious catalysts — this *is* the catalyst
+
+**Negative charm (elevated IV, put-heavy positioning):**
+- Time passing forces dealer selling → persistent downside drift during quiet periods
+- ES/NQ fade on low volume rallies, grinding lower even without news
+- Most visible on Tuesdays and Wednesdays (maximum charm decay mid-week)
+
+**EOD charm unwind:**
+The last 30 minutes of trading (15:30–16:00 ET) sees charm effects compound as 0DTE options
+approach expiry. If charm is positive, expect MOC buying pressure and ES/NQ closing near highs.
+If negative, expect MOC selling. This is mechanical, not sentiment — it happens regardless of
+what the news cycle is doing.
+
+---
+
+#### GEX Term Structure (Duration) → Position Sizing for NQ/ES Trades
+
+The fragility ratio (% of GEX in ≤7 DTE options) directly informs how long your levels stay valid:
+
+| Fragility | What it means for NQ/ES | Sizing implication |
+|-----------|--------------------------|-------------------|
+| >65% (fragile) | Gamma walls expire by Friday | Day-trade only. No overnight holds against GEX levels. Tighten stops |
+| 30–65% (mixed)  | Regime partially durable | Swing position OK but size down 30–50%. Re-evaluate post-expiry |
+| <30% (durable)  | Monthly gamma dominant | Full size. Levels valid 2–4 weeks. Can hold against intraday noise |
+
+**The weekly expiry problem:**
+Every Friday, large amounts of 0DTE and weekly gamma expire. The regime classification can
+flip violently at 16:00 ET Friday when open interest vanishes. Monday morning ES/NQ often open
+into a completely different gamma regime than Friday's close. **Always re-run the GEX engine
+Monday pre-open before placing trades based on Friday's levels.**
+
+---
+
+#### Flow Imbalance (P/C Ratio) → ES/NQ Tape Behaviour
+
+The put/call dollar premium ratio tells you what large players are buying right now:
+
+| P/C Ratio | ES/NQ implication |
+|-----------|-------------------|
+| >1.5 (heavy puts) | Institutional hedging in progress. Rallies get sold. NQ underperforms ES. ES grinding lower on low volume is a trap — do not buy the dip until ratio normalises |
+| 1.0–1.5 (elevated) | Moderate caution. Upside capped by hedge supply. Fade sharp ES/NQ rips. |
+| 0.8–1.0 (neutral)  | Balanced flow. Trade the technicals. GEX levels are cleaner. |
+| <0.8 (call heavy)  | Speculative call buying. ES/NQ can melt up on low volume. Vol compression risk. Do not short into call-heavy flow without a macro catalyst. |
+
+---
+
+### Quick Reference: GEX → NQ/ES Cheat Sheet
+
+```
+SPY GEX level × 10  = ES price
+QQQ GEX level × 40  = NQ price
+
+Positive gamma (above flip):
+  ES/NQ: fade moves to GWAS levels, expect mean-reversion, reduce size
+  Best setups: GWAS rejection, key node touch-and-reverse, charm drift trades
+
+Negative gamma (below flip):
+  ES/NQ: do not fade — momentum rules, adds to winners, wider stops
+  Best setups: trend continuation, GWAS breakdown, vanna-amplified vol spike shorts
+
+Vanna positive + VIX rising:
+  → Mechanical buying floor under ES/NQ. Buy the dip. Scale in.
+  → NQ often outperforms ES on vanna-supported moves.
+
+Vanna negative + VIX rising:
+  → Mechanical selling in ES/NQ. Do NOT buy the dip early.
+  → NQ leads lower. Wait for VIX to peak before fading the move.
+
+Charm positive (time passing):
+  → ES/NQ grind higher into close. Sell the open weakness, buy the close strength.
+
+Charm negative (time passing):
+  → ES/NQ fade into close. Sell morning rips. Do not hold longs into 15:00 ET.
+
+Fragile regime (>65% weekly gamma):
+  → All levels expire Friday. Day-trade only. No swing positions against GEX walls.
+
+Durable regime (<30% weekly gamma):
+  → ES/NQ levels reliable 2–4 weeks. Full size. Hold against intraday noise.
+```
+""")

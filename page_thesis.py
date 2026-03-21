@@ -1137,6 +1137,22 @@ def render_thesis_page():
         epu=resample_ffill(epu_r,idx) if len(epu_r.dropna())>0 else None
         icsa_r=raw.get("ICSA",pd.Series(dtype=float))
         icsa=resample_ffill(icsa_r,idx) if len(icsa_r.dropna())>0 else None
+        # ── Additional metrics from the macro framework ────────────────────
+        # Job Market: NFP (PAYEMS MoM change in thousands)
+        nfp_r   = raw.get("PAYEMS", pd.Series(dtype=float))
+        nfp_s   = resample_ffill(nfp_r, idx) if len(nfp_r.dropna()) > 0 else None
+        # Inflation: PPI MoM
+        ppi_r   = raw.get("PPIACO", pd.Series(dtype=float))
+        ppi_s   = resample_ffill(ppi_r, idx) if len(ppi_r.dropna()) > 0 else None
+        # Economic Activity: ISM Non-Manufacturing (NMI)
+        ism_nm_r = raw.get("NMFCI", pd.Series(dtype=float))
+        ism_nm   = resample_ffill(ism_nm_r, idx) if len(ism_nm_r.dropna()) > 0 else None
+        # Economic Activity: Chicago PMI
+        chi_pmi_r = raw.get("CHPMINDX", pd.Series(dtype=float))
+        chi_pmi   = resample_ffill(chi_pmi_r, idx) if len(chi_pmi_r.dropna()) > 0 else None
+        # Economic Activity: Consumer Confidence (UMich)
+        conf_r  = raw.get("UMCSENT", pd.Series(dtype=float))
+        conf_s  = resample_ffill(conf_r, idx) if len(conf_r.dropna()) > 0 else None
 
     core_yoy=(core/core.shift(365)-1)*100
     cpi_yoy=(cpi/cpi.shift(365)-1)*100
@@ -1144,6 +1160,7 @@ def render_thesis_page():
     net_liq=(walcl-tga-rrp)/1000
     nl4w=net_liq.diff(28); bs13=walcl.diff(91)/1000
     cyl=_sl(core_yoy,2.5); crl=_sl(s2s10,0.0)
+    gz=zscore(s2s10.fillna(0)); iz=zscore(core_yoy.fillna(cyl))
 
     # ── Macro regime — local classification ───────────────────────────────
     # classify_macro_regime_abs in probability.py uses thresholds calibrated
@@ -1192,8 +1209,6 @@ def render_thesis_page():
             macro_reg = _ext_reg
     except Exception:
         pass
-    gz=zscore(s2s10.fillna(0)); iz=zscore(core_yoy.fillna(cyl))
-
     _hys_filled = (hys.fillna(hys.dropna().mean())
                    if hys is not None and hys.dropna().size > 0
                    else pd.Series(3.0, index=idx))
@@ -1261,6 +1276,76 @@ def render_thesis_page():
     _cpi_raw = raw.get("CPIAUCSL", pd.Series(dtype=float)).dropna()
     cpi_now = round(float(_cpi_raw.pct_change(1).dropna().iloc[-1]) * 100, 3) if len(_cpi_raw) > 1 else float("nan")
     rd=_retdist(spy,idx,0)
+
+    # ── Macro framework metric scalars & Fed signal ratings ───────────────
+    # Thresholds from the uploaded framework image.
+    # Fed signal: "Expansionary" (green), "Neutral" (yellow), "Contractionary" (red)
+    # Each returns (value_str, signal_str, signal_color)
+
+    def _fed_sig(val, high_is_exp: bool, hi_thresh, lo_thresh, fmt=".1f"):
+        """Classify a metric into Fed action signal using image thresholds.
+        high_is_exp=True  → high value → Expansionary (e.g. unemployment high = Fed cuts)
+        high_is_exp=False → high value → Contractionary (e.g. CPI high = Fed hikes)
+        """
+        if not np.isfinite(val):
+            return "N/A", "N/A", "#94a3b8"
+        vs = f"{val:{fmt}}"
+        if high_is_exp:
+            if val > hi_thresh:   return vs, "Expansionary",    "#10b981"
+            elif val >= lo_thresh: return vs, "Neutral",         "#f59e0b"
+            else:                  return vs, "Contractionary",  "#ef4444"
+        else:
+            if val > hi_thresh:   return vs, "Contractionary",  "#ef4444"
+            elif val >= lo_thresh: return vs, "Neutral",         "#f59e0b"
+            else:                  return vs, "Expansionary",    "#10b981"
+
+    # Unemployment Rate — High: >5.5% (Exp), Normal: 4–5.5%, Low: <4% (Con)
+    _ur_v, _ur_sig, _ur_col = _fed_sig(ur, True, 5.5, 4.0, ".1f")
+
+    # Initial Jobless Claims — High: >350k (Exp), Normal: 250-350k, Low: <250k (Con)
+    _icsa_v = _sl(icsa, float("nan")) if icsa is not None else float("nan")
+    _icsa_v_k = _icsa_v / 1000 if np.isfinite(_icsa_v) else float("nan")  # display in thousands
+    _icsa_vs, _icsa_sig, _icsa_col = _fed_sig(_icsa_v_k, True, 350, 250, ".0f")
+    _icsa_vs = f"{_icsa_v_k:.0f}k" if np.isfinite(_icsa_v_k) else "N/A"
+
+    # Nonfarm Payrolls MoM change (thousands) — High: >250k (Con), Normal: 50-250k, Low: <50k (Exp)
+    _nfp_v = float(nfp_s.dropna().diff(1).dropna().iloc[-1]) if (nfp_s is not None and nfp_s.dropna().size > 1) else float("nan")
+    _nfp_vs, _nfp_sig, _nfp_col = _fed_sig(_nfp_v, False, 250, 50, ".0f")
+    _nfp_vs = f"{_nfp_v:+.0f}k" if np.isfinite(_nfp_v) else "N/A"
+
+    # CPI YoY — High: >2% (Con), Normal: ~2%, Low: <2% (Exp)
+    _cpi_vs, _cpi_sig, _cpi_col = _fed_sig(cyi, False, 2.5, 1.5, ".2f")
+    _cpi_vs = f"{cyi:.2f}%"
+
+    # Core CPI YoY — High: >2% (Con), Normal: ~2%, Low: <2% (Exp)
+    _ccpi_v = _sl(core_yoy, float("nan"))
+    _ccpi_vs, _ccpi_sig, _ccpi_col = _fed_sig(_ccpi_v, False, 2.5, 1.5, ".2f")
+    _ccpi_vs = f"{_ccpi_v:.2f}%" if np.isfinite(_ccpi_v) else "N/A"
+
+    # PPI MoM — High: >0.2% (Con), Normal: 0–0.2%, Low: <0% (Exp)
+    _ppi_mom = float(ppi_s.dropna().pct_change(1).dropna().iloc[-1] * 100) if (ppi_s is not None and ppi_s.dropna().size > 1) else float("nan")
+    _ppi_vs, _ppi_sig, _ppi_col = _fed_sig(_ppi_mom, False, 0.2, 0.0, "+.2f")
+    _ppi_vs = f"{_ppi_mom:+.2f}%" if np.isfinite(_ppi_mom) else "N/A"
+
+    # ISM Manufacturing PMI — High: >55 (Con), Normal: 50-55, Low: <50 (Exp)
+    _ism_mfg_v = _sl(ism, float("nan")) if ism is not None else float("nan")
+    _ism_vs, _ism_sig, _ism_col = _fed_sig(_ism_mfg_v, False, 55, 50, ".1f")
+    _ism_vs = f"{_ism_mfg_v:.1f}" if np.isfinite(_ism_mfg_v) else "N/A"
+
+    # ISM Non-Manufacturing PMI — High: >55 (Con), Normal: 50-55, Low: <50 (Exp)
+    _ism_nm_v = _sl(ism_nm, float("nan")) if ism_nm is not None else float("nan")
+    _ism_nm_vs, _ism_nm_sig, _ism_nm_col = _fed_sig(_ism_nm_v, False, 55, 50, ".1f")
+    _ism_nm_vs = f"{_ism_nm_v:.1f}" if np.isfinite(_ism_nm_v) else "N/A"
+
+    # Chicago PMI — High: >55 (Con), Normal: 50-55, Low: <50 (Exp)
+    _chi_v = _sl(chi_pmi, float("nan")) if chi_pmi is not None else float("nan")
+    _chi_vs, _chi_sig, _chi_col = _fed_sig(_chi_v, False, 55, 50, ".1f")
+    _chi_vs = f"{_chi_v:.1f}" if np.isfinite(_chi_v) else "N/A"
+
+    # Consumer Confidence (UMich) — High: >120 (Con), Normal: 100-120, Low: <100 (Exp)
+    _conf_v = _sl(conf_s, float("nan")) if conf_s is not None else float("nan")
+    _conf_vs, _conf_sig, _conf_col = _fed_sig(_conf_v, False, 120, 100, ".1f")
+    _conf_vs = f"{_conf_v:.1f}" if np.isfinite(_conf_v) else "N/A"
 
     with st.spinner("Fetching live quotes…"):
         q=_quotes()
@@ -1544,25 +1629,82 @@ def render_thesis_page():
              f"<span style='color:rgba(255,255,255,0.5);'>{cat['icon']} {cat['label'].split('&')[0].strip().lower()}</span>: "
              f"<span style='color:{col};font-weight:600;'>{sign}{s:.4f}</span> "
              f"<span style='color:rgba(255,255,255,0.3);'>({cat['count']} articles)</span></span>")
-    mac=(_sh(9,"MACRO REGIME & NEWS SENTIMENT")
-         +f"<div style='font-size:16px;font-weight:700;color:{reg_col};margin-bottom:8px;'>{macro_reg}</div>"
-         +"<div style='display:grid;grid-template-columns:1fr 1fr;gap:4px 32px;'><div>"
-         +_kv("Growth Z",f"{gzv:+.2f}","#10b981" if gzv>0 else "#ef4444")
-         +_kv("Inflation Z",f"{izv:+.2f}","#f59e0b" if izv>0.5 else "#94a3b8")
-         +_kv("CPI YoY",f"{cyi:.2f}%")
-         +_kv("CPI Nowcast",f"{cpi_now:+.3f}% MoM" if np.isfinite(cpi_now) else "N/A")
-         +"</div><div>"
-         +_kv("Unemployment",f"{ur:.1f}%")
-         +_kv("HY OAS",f"{hyv:.0f}bp","#ef4444" if hyv>450 else "#f59e0b" if hyv>350 else "#94a3b8")
-         +_kv("SPY-TLT Corr",f"{stlc:.3f}" if np.isfinite(stlc) else "N/A",
-              "#ef4444" if (np.isfinite(stlc) and stlc>0.2) else "#94a3b8")
-         +_kv("Sahm Rule",f"{sahmv:.3f}",
-              "#ef4444" if sahmv>=0.5 else "#f59e0b" if sahmv>=0.3 else "#10b981")
-         +"</div></div>"
-         +f"<div style='margin-top:10px;border-top:1px solid rgba(255,255,255,0.08);padding-top:8px;'>"
-         +"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:5px;letter-spacing:0.1em;'>NEWS SENTIMENT</div>"
-         +f"<div style='display:flex;flex-wrap:wrap;gap:4px;'>{nr}</div></div>")
-    st.markdown(_card(mac),unsafe_allow_html=True)
+
+    def _mrow(metric, value, signal, sig_col, threshold_hint=""):
+        """Single metric row: name | value | Fed signal | threshold hint."""
+        return (
+            f"<div style='display:grid;grid-template-columns:2fr 1.2fr 1.5fr 2fr;"
+            f"gap:0 8px;align-items:center;padding:4px 0;"
+            f"border-bottom:1px solid rgba(255,255,255,0.04);font-size:12px;'>"
+            f"<span style='color:rgba(255,255,255,0.55);'>{metric}</span>"
+            f"<span style='font-family:monospace;font-weight:700;color:rgba(255,255,255,0.9);'>{value}</span>"
+            f"<span style='font-weight:600;color:{sig_col};'>{signal}</span>"
+            f"<span style='color:rgba(255,255,255,0.28);font-size:10px;'>{threshold_hint}</span>"
+            f"</div>"
+        )
+
+    def _mcat(label):
+        """Category sub-header."""
+        return (f"<div style='font-size:10px;font-weight:700;letter-spacing:0.12em;"
+                f"color:rgba(255,255,255,0.35);text-transform:uppercase;"
+                f"padding:8px 0 4px;margin-top:4px;'>{label}</div>")
+
+    def _mcol_hdr():
+        return (
+            f"<div style='display:grid;grid-template-columns:2fr 1.2fr 1.5fr 2fr;"
+            f"gap:0 8px;padding:0 0 6px;border-bottom:1px solid rgba(255,255,255,0.10);'>"
+            f"<span style='font-size:10px;color:rgba(255,255,255,0.3);letter-spacing:0.1em;'>METRIC</span>"
+            f"<span style='font-size:10px;color:rgba(255,255,255,0.3);letter-spacing:0.1em;'>VALUE</span>"
+            f"<span style='font-size:10px;color:rgba(255,255,255,0.3);letter-spacing:0.1em;'>FED ACTION</span>"
+            f"<span style='font-size:10px;color:rgba(255,255,255,0.3);letter-spacing:0.1em;'>THRESHOLDS</span>"
+            f"</div>"
+        )
+
+    macro_body = (
+        _sh(9, "MACRO REGIME & ECONOMIC INDICATORS")
+        + f"<div style='font-size:18px;font-weight:800;color:{reg_col};margin-bottom:12px;'>"
+        + f"{macro_reg} &nbsp;<span style='font-size:12px;font-weight:400;color:rgba(255,255,255,0.4);'>"
+        + f"Growth Z: {gzv:+.2f}  ·  Inflation Z: {izv:+.2f}</span></div>"
+        + "<div style='display:grid;grid-template-columns:1fr 1fr;gap:0 32px;'>"
+
+        # ── Left column: Job Market + Inflation ──────────────────────────
+        + "<div>"
+        + _mcol_hdr()
+        + _mcat("📊 Job Market")
+        + _mrow("Unemployment Rate",     _ur_v+"%",  _ur_sig,    _ur_col,    ">5.5% Exp · 4–5.5% Neu · <4% Con")
+        + _mrow("Initial Jobless Claims", _icsa_vs,  _icsa_sig,  _icsa_col,  ">350k Exp · 250–350k Neu · <250k Con")
+        + _mrow("Nonfarm Payrolls",       _nfp_vs,   _nfp_sig,   _nfp_col,   ">250k Con · 50–250k Neu · <50k Exp")
+        + _mcat("📈 Inflation")
+        + _mrow("CPI (YoY)",             _cpi_vs,    _cpi_sig,   _cpi_col,   ">2% Con · ~2% Neu · <2% Exp")
+        + _mrow("Core CPI (YoY)",        _ccpi_vs,   _ccpi_sig,  _ccpi_col,  ">2% Con · ~2% Neu · <2% Exp")
+        + _mrow("PPI (MoM)",             _ppi_vs,    _ppi_sig,   _ppi_col,   ">0.2% Con · 0–0.2% Neu · <0% Exp")
+        + "</div>"
+
+        # ── Right column: Economic Activities ────────────────────────────
+        + "<div>"
+        + _mcol_hdr()
+        + _mcat("🏭 Economic Activities")
+        + _mrow("ISM Manufacturing PMI",     _ism_vs,    _ism_sig,    _ism_col,    ">55 Con · 50–55 Neu · <50 Exp")
+        + _mrow("ISM Non-Manufacturing PMI", _ism_nm_vs, _ism_nm_sig, _ism_nm_col, ">55 Con · 50–55 Neu · <50 Exp")
+        + _mrow("Chicago PMI",               _chi_vs,    _chi_sig,    _chi_col,    ">55 Con · 50–55 Neu · <50 Exp")
+        + _mrow("Consumer Confidence",       _conf_vs,   _conf_sig,   _conf_col,   ">120 Con · 100–120 Neu · <100 Exp")
+
+        # ── Supporting macro context ──────────────────────────────────────
+        + _mcat("📉 Credit & Labor Context")
+        + _kv("HY OAS",    f"{hyv:.0f}bp",  "#ef4444" if hyv>450 else "#f59e0b" if hyv>350 else "#94a3b8")
+        + _kv("Sahm Rule", f"{sahmv:.3f}",  "#ef4444" if sahmv>=0.5 else "#f59e0b" if sahmv>=0.3 else "#10b981")
+        + _kv("SPY-TLT Corr", f"{stlc:.3f}" if np.isfinite(stlc) else "N/A",
+               "#ef4444" if (np.isfinite(stlc) and stlc>0.2) else "#94a3b8")
+        + _kv("CPI Nowcast", f"{cpi_now:+.3f}% MoM" if np.isfinite(cpi_now) else "N/A")
+        + "</div>"
+        + "</div>"
+
+        # ── News sentiment strip ──────────────────────────────────────────
+        + f"<div style='margin-top:12px;border-top:1px solid rgba(255,255,255,0.08);padding-top:8px;'>"
+        + "<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:5px;letter-spacing:0.1em;'>NEWS SENTIMENT</div>"
+        + f"<div style='display:flex;flex-wrap:wrap;gap:4px;'>{nr}</div></div>"
+    )
+    st.markdown(_card(macro_body), unsafe_allow_html=True)
 
     # ── 10. THESIS VERDICT ────────────────────────────────────────────────
     cc="#10b981" if comp>0 else "#ef4444" if comp<0 else "#94a3b8"

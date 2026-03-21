@@ -444,16 +444,6 @@ def _ivsurf_from_chain(chain_df, spot: float, label: str,
                         vix: float, vts_shape: str) -> go.Figure:
     """
     Build IV surface from actual options chain data using scattered 2D interpolation.
-
-    The chain has sparse discrete data (few expiry buckets × few strikes), so a
-    simple pivot → fillna approach creates jagged spikes. Instead we:
-      1. Extract (moneyness, DTE, IV) scatter points from the raw chain
-      2. Interpolate onto a smooth dense grid using scipy.interpolate.griddata
-         with cubic method (falls back to linear if too few points)
-      3. Clip outliers and smooth with a 2D gaussian filter to remove edge artifacts
-
-    If chain_df is unavailable, shows a clearly-labelled placeholder — never a
-    fake parametric surface.
     """
     if chain_df is None or len(chain_df) == 0:
         fig = go.Figure()
@@ -488,14 +478,10 @@ def _ivsurf_from_chain(chain_df, spot: float, label: str,
         df["dte"] = (df["expiry_T"] * 365).clip(lower=1)
         df["moneyness"] = df["strike"] / spot
 
-        # Filter to near-term tradeable range and valid IV
-        # ── Change 1 & 2: tighter moneyness (0.93–1.15) and short DTE (≤10,
-        #    fallback to ≤21 if fewer than 4 points survive the initial cut) ──
         df = df[(df["moneyness"] >= 0.93) & (df["moneyness"] <= 1.15)]
         _dte_limit = 10
         df = df[(df["dte"] >= 1) & (df["dte"] <= _dte_limit)]
         if len(df) < 4:
-            # fallback: widen DTE window to 21 days
             _dte_limit = 21
             df = chain_df.copy()
             df["dte"] = (df["expiry_T"] * 365).clip(lower=1)
@@ -503,36 +489,29 @@ def _ivsurf_from_chain(chain_df, spot: float, label: str,
             df = df[(df["moneyness"] >= 0.93) & (df["moneyness"] <= 1.15)]
             df = df[(df["dte"] >= 1) & (df["dte"] <= _dte_limit)]
 
-        df = df[(df["iv"] > 0.005) & (df["iv"] < 2.0)]   # tightened: >200% IV is bad data
+        df = df[(df["iv"] > 0.005) & (df["iv"] < 2.0)]
 
-        # Remove extreme outliers: IV > 3× median is almost certainly bad data
         iv_med = df["iv"].median()
         df = df[(df["iv"] >= iv_med * 0.25) & (df["iv"] < iv_med * 3.0)]
 
         if len(df) < 6:
             raise ValueError(f"Only {len(df)} valid chain points — insufficient for surface")
 
-        # Compute ATM IV estimate from raw data BEFORE griddata (used for clipping)
         _atm_mask = df["moneyness"].between(0.98, 1.02)
         atm_iv_est = float(df[_atm_mask]["iv"].mean() * 100) if _atm_mask.sum() > 0 else vix
         if not np.isfinite(atm_iv_est) or atm_iv_est <= 0:
             atm_iv_est = vix
-        # Hard clip bounds: IV must be in [2%, 120%] and within 3× ATM
         hard_lo = max(2.0,  atm_iv_est * 0.40)
         hard_hi = min(120.0, atm_iv_est * 3.0)
 
-        # Scatter points in (DTE, moneyness) space
         pts_dte = df["dte"].values.astype(float)
         pts_m   = df["moneyness"].values.astype(float)
         pts_iv  = np.clip(df["iv"].values.astype(float) * 100, hard_lo, hard_hi)
 
-        # ── Change 3: dense output grid capped at 10 DTE, 16 cells ──────
         dte_grid = np.linspace(max(pts_dte.min(), 1.0), min(pts_dte.max(), 10.0), 16)
-        m_grid   = np.linspace(pts_m.min(),   pts_m.max(),   30)
+        m_grid   = np.linspace(pts_m.min(), pts_m.max(), 30)
         DTE, MON = np.meshgrid(dte_grid, m_grid)
 
-        # Use linear interpolation — cubic produces wild extrapolated values
-        # outside the convex hull of sparse option chain data points
         method = "linear" if len(df) >= 8 else "nearest"
         Z = griddata(
             points=np.column_stack([pts_dte, pts_m]),
@@ -542,7 +521,6 @@ def _ivsurf_from_chain(chain_df, spot: float, label: str,
             fill_value=np.nan,
         ).reshape(DTE.shape)
 
-        # Fill any NaN edges with nearest-neighbour
         nan_mask = ~np.isfinite(Z)
         if nan_mask.any():
             Z_nn = griddata(
@@ -553,32 +531,21 @@ def _ivsurf_from_chain(chain_df, spot: float, label: str,
             ).reshape(DTE.shape)
             Z[nan_mask] = Z_nn[nan_mask]
 
-        # Hard clip BEFORE smoothing — prevents any interpolation artefact from
-        # propagating into the smoothed surface (the main cause of the 400% spikes
-        # and -300% troughs seen with cubic interpolation on short-dated chains)
         Z = np.clip(Z, hard_lo, hard_hi)
-
-        # ── Change 8: sigma=1.2 Gaussian smooth + re-clip after ──────────
         Z = gaussian_filter(Z, sigma=1.2)
         Z = np.clip(Z, hard_lo, hard_hi)
 
-        # ── Skew & term structure metrics from raw data ───────────────────
         def _avg(mask): return float(df[mask]["iv"].mean() * 100) if mask.sum() > 0 else float("nan")
         puts_25d  = _avg((df["moneyness"].between(0.93, 0.97)) & (df["dte"].between(15, 45)))
         calls_25d = _avg((df["moneyness"].between(1.03, 1.07)) & (df["dte"].between(15, 45)))
         skew_25d  = puts_25d - calls_25d
         front_atm = _avg((df["moneyness"].between(0.985, 1.015)) & (df["dte"] <= 10))
         back_atm  = _avg((df["moneyness"].between(0.985, 1.015)) & (df["dte"].between(25, 70)))
-        skew_str  = f"25Δ Skew: {skew_25d:+.1f}pts" if (np.isfinite(puts_25d) and np.isfinite(calls_25d)) else "skew: n/a"
-        ts_str    = f"TS: {front_atm:.1f}% → {back_atm:.1f}%" if (np.isfinite(front_atm) and np.isfinite(back_atm)) else "TS: n/a"
-        regime_note = {"BACKWARDATION": "⚠️ Backwardation", "CONTANGO": "✓ Contango", "MIXED": "~ Mixed"}.get(vts_shape, "")
-        n_points = len(df)
 
         fig = go.Figure(go.Surface(
             x=dte_grid,
-            y=m_grid * 100,   # display as moneyness %
+            y=m_grid * 100,
             z=Z,
-            # ── Change 4: plasma-inspired colorscale ─────────────────────
             colorscale=[
                 [0.00, "#0d0221"],
                 [0.20, "#5c1a8a"],
@@ -590,15 +557,11 @@ def _ivsurf_from_chain(chain_df, spot: float, label: str,
             showscale=True,
             colorbar=dict(title="IV%", thickness=14, len=0.75),
             opacity=0.95,
-            # ── Change 5: disable contour floor projection ───────────────
-            contours=dict(
-                z=dict(show=False),
-            ),
+            contours=dict(z=dict(show=False)),
             lighting=dict(ambient=0.7, diffuse=0.8, roughness=0.5, specular=0.3),
             lightposition=dict(x=100, y=200, z=0),
         ))
 
-        # ── Change 7: updated title with spot + ATM IV ───────────────────
         plotly_dark(fig, title=f"SPX Implied Volatility Surface | Spot: {spot:,.2f} | ATM IV: {atm_iv_est:.1f}%", height=460)
         fig.update_layout(
             scene=dict(
@@ -609,7 +572,6 @@ def _ivsurf_from_chain(chain_df, spot: float, label: str,
                 zaxis=dict(title="IV%", backgroundcolor="rgba(0,0,0,0)",
                            gridcolor="rgba(255,255,255,0.08)", showbackground=True),
                 bgcolor="rgba(0,0,0,0)",
-                # ── Change 6: updated camera angle ───────────────────────
                 camera=dict(eye=dict(x=-1.8, y=-1.5, z=0.8)),
             ),
             margin=dict(l=0, r=0, t=50, b=0),
@@ -646,13 +608,11 @@ def _ivrv_fig(vix_s: pd.Series, spy: pd.Series, idx) -> go.Figure:
         subplot_titles=["", "Variance Risk Premium Spread (VIX - 21d RV)"],
     )
 
-    # ── Top panel: VIX + RV lines + RV range band ────────────────────────
     rv5_d  = rv5.reindex(dates)
     rv63_d = rv63.reindex(dates)
     rv21_d = rv21.reindex(dates)
     va_d   = va.reindex(dates)
 
-    # RV range band (5d–63d)
     fig.add_trace(go.Scatter(
         x=list(dates) + list(dates[::-1]),
         y=list(rv5_d.fillna(method="ffill")) + list(rv63_d.fillna(method="ffill")[::-1]),
@@ -671,7 +631,6 @@ def _ivrv_fig(vix_s: pd.Series, spy: pd.Series, idx) -> go.Figure:
         line=dict(color="#06b6d4", width=2),
     ), row=1, col=1)
 
-    # ── Bottom panel: VRP bars ────────────────────────────────────────────
     vrp_d = vrp.reindex(dates)
     colors = ["#10b981" if v >= 0 else "#ef4444" for v in vrp_d.fillna(0)]
     fig.add_trace(go.Bar(
@@ -681,7 +640,6 @@ def _ivrv_fig(vix_s: pd.Series, spy: pd.Series, idx) -> go.Figure:
     ), row=2, col=1)
     fig.add_hline(y=0, line_color="rgba(255,255,255,0.3)", line_width=1, row=2, col=1)
 
-    # Dummy traces for legend
     fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers",
         marker=dict(color="#10b981", size=8, symbol="square"),
         name="IV > RV (premium)"), row=2, col=1)
@@ -703,7 +661,7 @@ def _ivrv_fig(vix_s: pd.Series, spy: pd.Series, idx) -> go.Figure:
 def _rdist_fig(spy: pd.Series, idx, rd: Dict, spot: float = float("nan")) -> go.Figure:
     from plotly.subplots import make_subplots
     sa   = _to_1d(spy).reindex(idx).ffill()
-    rets = sa.pct_change().dropna().tail(504) * 100   # 2Y ≈ 504 trading days
+    rets = sa.pct_change().dropna().tail(504) * 100
     mu   = rd.get("daily_mu",  float(rets.mean()))
     sig  = rd.get("daily_sigma", 1.0)
     skw  = rd.get("skew", 0.0)
@@ -716,7 +674,6 @@ def _rdist_fig(spy: pd.Series, idx, rd: Dict, spot: float = float("nan")) -> go.
         horizontal_spacing=0.06,
     )
 
-    # ── Histogram ─────────────────────────────────────────────────────────
     fig.add_trace(go.Histogram(
         x=rets, nbinsx=80, name="Actual",
         marker_color="#6366f1", opacity=0.75, histnorm="probability density",
@@ -729,19 +686,15 @@ def _rdist_fig(spy: pd.Series, idx, rd: Dict, spot: float = float("nan")) -> go.
         line=dict(color="#f59e0b", width=2),
     ), row=1, col=1)
 
-    # Mean line
     fig.add_vline(x=mu, line_color="#06b6d4", line_width=1.5,
                   annotation_text=f"Mean: {mu:.3f}%", annotation_font_size=10,
                   row=1, col=1)
 
-    # σ bands
     for m, col_s in [(1, "#10b981"), (2, "#f59e0b"), (3, "#ef4444")]:
         for s in [-1, 1]:
             fig.add_vline(x=s * m * sig + mu, line_dash="dash",
                           line_color=col_s, line_width=1, row=1, col=1)
 
-    # ── Stats panel (right col — invisible axes, monospace annotations) ──
-    # 1-day probability bands
     d1_lo68 = round(spot * (1 + (mu - sig)   / 100), 2) if np.isfinite(spot) else float("nan")
     d1_hi68 = round(spot * (1 + (mu + sig)   / 100), 2) if np.isfinite(spot) else float("nan")
     d1_lo95 = round(spot * (1 + (mu - 2*sig) / 100), 2) if np.isfinite(spot) else float("nan")
@@ -808,18 +761,12 @@ def _rdist_fig(spy: pd.Series, idx, rd: Dict, spot: float = float("nan")) -> go.
             x=0.02, y=1.0 - i * y_step,
             text=text,
             showarrow=False,
-            font=dict(
-                family="monospace",
-                size=11 if is_header else 10,
-                color=color,
-            ),
+            font=dict(family="monospace", size=11 if is_header else 10, color=color),
             xanchor="left", yanchor="top",
         )
 
-    # Hide right axes
     fig.update_xaxes(visible=False, row=1, col=2)
     fig.update_yaxes(visible=False, row=1, col=2)
-    # Add border box for stats panel
     fig.add_shape(type="rect", xref="x2 domain", yref="y2 domain",
                   x0=0, y0=0, x1=1, y1=1,
                   line=dict(color="rgba(255,255,255,0.15)", width=1),
@@ -838,79 +785,32 @@ def _rdist_fig(spy: pd.Series, idx, rd: Dict, spot: float = float("nan")) -> go.
 
 def _recession_stress(sahm: float, hy: float, s2s10_bp: float,
                       icsa_4w_chg: float, vix: float) -> dict:
-    """
-    Recession Stress Index — a composite indicator, NOT a calibrated probability.
-
-    Uses a simple probit-style score combining:
-      1. Sahm Rule (0–0.5+ scale, most direct recession onset signal)
-      2. HY OAS (credit stress, historical recession threshold ~500bp)
-      3. Yield curve (2s10s inversion depth and duration proxy)
-      4. Initial jobless claims 4-week % change (ICSA — weekly, leads UNRATE)
-      5. VIX level (financial conditions proxy)
-
-    These factors are standardized and combined with weights derived from
-    the empirical literature on recession leading indicators:
-      - Sahm Rule: 35% (most reliable real-time signal, Sahm 2019)
-      - HY OAS:    25% (credit leads equity and employment)
-      - Yield curve:20% (classic Estrella-Mishkin probit)
-      - ICSA 4W Δ: 12% (initial jobless claims — weekly frequency, genuinely
-                        orthogonal to Sahm which uses monthly UNRATE averages)
-      - VIX:        8% (financial conditions proxy)
-
-    Output is mapped to [0, 99] via a logistic function to avoid the
-    false precision of a "probability" label.
-
-    Call this a Stress Index, not a recession probability.
-    """
     from scipy.special import expit as _sigmoid
 
-    # Each component → z-score relative to recession/non-recession historical ranges
-    # Sahm: 0=clear, 0.3=warning, 0.5=triggered (historical recession onset)
-    sahm_z = np.clip(sahm / 0.4, 0, 1)  # normalise: 0.4 = historical trigger midpoint
+    sahm_z  = np.clip(sahm / 0.4, 0, 1)
+    hy_z    = np.clip((hy - 300) / 700, 0, 1)
+    curve_z = np.clip((-s2s10_bp - 0) / 150, 0, 1)
+    icsa_z  = np.clip(icsa_4w_chg / 0.20, 0, 1)
+    vix_z   = np.clip((vix - 15) / 35, 0, 1)
 
-    # HY OAS: 300=normal, 500=stress, 800=crisis, 1200=systemic
-    hy_z = np.clip((hy - 300) / 700, 0, 1)
-
-    # Yield curve: inversion (negative 2s10s) is bearish
-    # -150bp = deep inversion (strong recession signal), +50bp = normal
-    curve_z = np.clip((-s2s10_bp - 0) / 150, 0, 1)  # 0 at flat, 1 at -150bp
-
-    # ICSA 4-week % change: genuinely orthogonal to Sahm Rule.
-    # Sahm uses monthly UNRATE 3M avg vs 12M min — a lagging stock measure.
-    # ICSA is weekly flow data that leads payrolls and UNRATE by 4–8 weeks.
-    # 0% = stable, +10% = deteriorating, +20% = recession-onset pace.
-    # Normalise: 20% 4-week rise historically coincides with recession onset.
-    icsa_z = np.clip(icsa_4w_chg / 0.20, 0, 1)
-
-    # VIX: 15=normal, 25=elevated, 40=crisis
-    vix_z = np.clip((vix - 15) / 35, 0, 1)
-
-    # Weighted composite
     raw = (0.35 * sahm_z + 0.25 * hy_z + 0.20 * curve_z
            + 0.12 * icsa_z + 0.08 * vix_z)
 
-    # Map to 0-99 via logistic (avoids false precision near 0 and 100)
-    # Calibrate so raw=0 → ~5%, raw=0.5 → ~50%, raw=1.0 → ~95%
     score = float(_sigmoid((raw - 0.5) * 8) * 100)
     score = round(np.clip(score, 1, 99), 1)
 
-    # Regime label based on Sahm + HY combination (hardest to fake)
-    if sahm >= 0.50 or hy > 600:
-        label = "ELEVATED"
-    elif sahm >= 0.30 or hy > 420:
-        label = "MODERATE"
-    else:
-        label = "LOW"
+    if sahm >= 0.50 or hy > 600:   label = "ELEVATED"
+    elif sahm >= 0.30 or hy > 420: label = "MODERATE"
+    else:                           label = "LOW"
 
     return {
-        "score": score,
-        "label": label,
+        "score": score, "label": label,
         "components": {
-            "sahm_contribution":  round(0.35 * sahm_z  * 100, 1),
-            "hy_contribution":    round(0.25 * hy_z    * 100, 1),
-            "curve_contribution": round(0.20 * curve_z * 100, 1),
-            "icsa_4w_contribution": round(0.12 * icsa_z * 100, 1),
-            "vix_contribution":   round(0.08 * vix_z   * 100, 1),
+            "sahm_contribution":    round(0.35 * sahm_z  * 100, 1),
+            "hy_contribution":      round(0.25 * hy_z    * 100, 1),
+            "curve_contribution":   round(0.20 * curve_z * 100, 1),
+            "icsa_4w_contribution": round(0.12 * icsa_z  * 100, 1),
+            "vix_contribution":     round(0.08 * vix_z   * 100, 1),
         },
         "note": (
             "Recession Stress Index — NOT a calibrated probability. "
@@ -920,43 +820,19 @@ def _recession_stress(sahm: float, hy: float, s2s10_bp: float,
     }
 
 def _composite(prob: dict, vrp_val: float) -> int:
-    """
-    Signed ±10 composite score built from four non-overlapping signal buckets.
-
-    Inputs chosen to avoid double-counting:
-      - tactical_prob  (5D):  VIX term structure + DXY momentum
-      - short_prob    (21D):  HYG/LQD credit, small-cap leadership, liquidity impulse
-      - medium_prob   (63D):  Yield curve phase, copper/gold, credit impulse, real rates
-      - VRP:                  Variance risk premium — orthogonal to all three buckets above
-
-    Deliberately excluded:
-      - bull_prob: already blends fear (via coincident_conditions) and GEX adjustment
-        internally inside compute_prob_composite. Using it here would double-count
-        both signals.
-      - fear_score: enters via coincident_conditions → bull_prob → already in medium/short
-      - GEX regime: already applied as gex_adjustment inside compute_prob_composite
-
-    Scoring: each bucket mapped from [0,100] → [-2.5, +2.5] points.
-    VRP adds ±0.5 as a tiebreaker.
-    Total range: ±10.5, clipped to ±10.
-    """
     def _bucket_score(p: float) -> float:
-        """Map 0-100 probability to [-2.5, +2.5] score, linear through 50."""
-        return (p - 50.0) / 20.0  # 50→0, 70→+1, 30→-1, 90→+2, 10→-2
+        return (p - 50.0) / 20.0
 
     tactical = prob.get("tactical_prob", 50.0)
     short    = prob.get("short_prob",    50.0)
     medium   = prob.get("medium_prob",   50.0)
 
-    # Equal-weight the three horizon buckets (no cross-horizon blending bias)
     s = _bucket_score(tactical) + _bucket_score(short) + _bucket_score(medium)
 
-    # VRP is genuinely orthogonal: options pricing premium above/below realised vol
-    # Not in any signal bucket. Adds ±0.5 as a tiebreaker only.
     if np.isfinite(vrp_val):
-        if vrp_val > 4:    s -= 0.5   # IV much > RV = fear premium = mild bearish
+        if vrp_val > 4:    s -= 0.5
         elif vrp_val > 2:  s -= 0.25
-        elif vrp_val < -2: s += 0.25  # IV below RV = complacency or trending
+        elif vrp_val < -2: s += 0.25
         elif vrp_val < -4: s += 0.5
 
     return int(np.clip(round(s), -10, 10))
@@ -1033,19 +909,8 @@ def _gl(term,defn):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-
 def _gex_histogram(chain_df, spot: float, flip: float,
                    max_dte: int = 45, height: int = 360) -> go.Figure:
-    """
-    GEX bar chart derived directly from the live options chain.
-    Pulls net GEX per strike from compute_gex_from_chain (same engine as
-    the GEX Engine page) so the bars are identical to what you see there.
-
-    Green = positive GEX (dealers long gamma, stabilising).
-    Red    = negative GEX (dealers short gamma, amplifying).
-    Yellow dashed = gamma flip level.
-    White dotted  = current spot.
-    """
     _C_POS  = "#10b981"
     _C_NEG  = "#ef4444"
     _C_FLIP = "#f59e0b"
@@ -1062,13 +927,11 @@ def _gex_histogram(chain_df, spot: float, flip: float,
 
         gex_chain = compute_gex_from_chain(near_chain, spot)
 
-        # Aggregate net GEX by strike across all expirations
         agg = (gex_chain.groupby("strike")["net_gex"]
                         .sum()
                         .reset_index()
                         .sort_values("strike"))
 
-        # Filter to ±10% around spot for readability
         lo, hi = spot * 0.90, spot * 1.10
         agg = agg[(agg["strike"] >= lo) & (agg["strike"] <= hi)]
 
@@ -1076,9 +939,8 @@ def _gex_histogram(chain_df, spot: float, flip: float,
             raise ValueError("No strikes in ±10% range")
 
         strikes = agg["strike"].tolist()
-        vals_m  = (agg["net_gex"] / 1e6).tolist()   # $ millions
+        vals_m  = (agg["net_gex"] / 1e6).tolist()
 
-        # Auto-scale to $B if large
         max_abs = max(abs(v) for v in vals_m)
         if max_abs >= 5000:
             vals_display = [v / 1000 for v in vals_m]
@@ -1090,18 +952,12 @@ def _gex_histogram(chain_df, spot: float, flip: float,
         colors = [_C_POS if v > 0 else _C_NEG for v in vals_display]
 
         fig = go.Figure(go.Bar(
-            x=strikes,
-            y=vals_display,
-            marker_color=colors,
-            marker_line_width=0,
-            opacity=0.88,
-            name="Net GEX",
+            x=strikes, y=vals_display,
+            marker_color=colors, marker_line_width=0,
+            opacity=0.88, name="Net GEX",
         ))
 
-        # Zero line
         fig.add_hline(y=0, line_color="rgba(255,255,255,0.30)", line_width=1)
-
-        # Spot line
         fig.add_vline(
             x=spot, line_dash="dot",
             line_color="rgba(255,255,255,0.75)", line_width=1.5,
@@ -1111,7 +967,6 @@ def _gex_histogram(chain_df, spot: float, flip: float,
             annotation_position="top right",
         )
 
-        # Gamma flip line
         if flip and lo < flip < hi:
             fig.add_vline(
                 x=flip, line_dash="dash",
@@ -1122,13 +977,11 @@ def _gex_histogram(chain_df, spot: float, flip: float,
                 annotation_position="top left",
             )
 
-        # Centre x-axis on spot
         x_pad = max(abs(hi - spot), abs(spot - lo)) * 1.05
         fig.update_layout(
             xaxis=dict(range=[spot - x_pad, spot + x_pad], title="Strike"),
             yaxis_title=f"Net GEX ({unit})",
-            bargap=0.12,
-            showlegend=False,
+            bargap=0.12, showlegend=False,
         )
         plotly_dark(fig, title=f"GEX Histogram — {unit} per Strike (≤{max_dte} DTE)", height=height)
         return fig
@@ -1168,10 +1021,13 @@ def render_thesis_page():
         ism=ism_r if len(ism_r.dropna())>4 else None
         sahm_r=raw.get("SAHM_RULE",pd.Series(dtype=float))
         hy_r=raw.get("BAMLH0A0HYM2",pd.Series(dtype=float))
+        epu_r=raw.get("USEPUINDXD",pd.Series(dtype=float))
         sahm=resample_ffill(sahm_r,idx) if len(sahm_r.dropna())>0 else None
         hys=resample_ffill(hy_r,idx) if len(hy_r.dropna())>0 else None
+        epu=resample_ffill(epu_r,idx) if len(epu_r.dropna())>0 else None
         icsa_r=raw.get("ICSA",pd.Series(dtype=float))
         icsa=resample_ffill(icsa_r,idx) if len(icsa_r.dropna())>0 else None
+
     core_yoy=(core/core.shift(365)-1)*100
     cpi_yoy=(cpi/cpi.shift(365)-1)*100
     s2s10=(y10-y2)*100
@@ -1181,10 +1037,37 @@ def render_thesis_page():
     macro_reg=classify_macro_regime_abs(cyl,crl)
     gz=zscore(s2s10.fillna(0)); iz=zscore(core_yoy.fillna(cyl))
     vz=zscore(vix_s.fillna(20)); nz=zscore(nfci.fillna(0))
-    inv=(s2s10<0).astype(int); lt=(nl4w<0).astype(int)
-    fear_raw=0.45*vz+0.35*nz+0.10*inv+0.10*lt
-    fear=float(((fear_raw.iloc[-1]+2)/4).clip(0,1)*100)   # 0-100 for dashboard/signals compat
-    fear_z=float(fear_raw.iloc[-1])                        # raw z-score for thesis display
+
+    # ── HY OAS z-score ────────────────────────────────────────────────────
+    # hys is in FRED percent units (3.20 = 320bp). z-score is unit-agnostic
+    # so we do NOT multiply by 100 here — that's only done for display (hyv).
+    _hys_filled = (hys.fillna(hys.dropna().mean())
+                   if hys is not None and hys.dropna().size > 0
+                   else pd.Series(3.0, index=idx))
+    hyz = zscore(_hys_filled)
+
+    # ── EPU z-score ───────────────────────────────────────────────────────
+    # Baker-Bloom-Davis daily index. ~100 = calm, 200-400 = policy shock.
+    # Falls back to a flat neutral series if FRED data unavailable.
+    _epu_filled = (epu.fillna(epu.dropna().mean())
+                   if epu is not None and epu.dropna().size > 0
+                   else pd.Series(100.0, index=idx))
+    epuz = zscore(_epu_filled)
+
+    # ── 4-component fear composite ────────────────────────────────────────
+    # VIX   35% — real-time implied vol, most responsive to intraday stress
+    # HY OAS 25% — credit stress, leads equity drawdowns by 2-6 weeks
+    # NFCI  25% — broad financial conditions (funding, risk, leverage)
+    # EPU   15% — economic policy uncertainty (somewhat lagging vs the others)
+    # All components are z-scored so each contributes in std-dev units,
+    # not raw level units (prevents HY OAS ~300bp dominating VIX ~20).
+    fear_raw = 0.35*vz + 0.25*hyz + 0.25*nz + 0.15*epuz
+
+    # Map to 0-100 via logistic for downstream signal consumers.
+    # Sigmoid centred at 0: score=50 at neutral, ~73 at +1σ, ~27 at -1σ.
+    fear = float((1.0 / (1.0 + np.exp(-fear_raw.iloc[-1]))).clip(0, 1) * 100)
+    fear_z = float(fear_raw.iloc[-1])   # raw σ — displayed as "+1.23σ"
+
     vl=_sl(vix_s,20.0); sahmv=_sl(sahm,0.0) if sahm is not None else 0.0
     # BAMLH0A0HYM2 from FRED is in percent (3.20 = 320bp). Multiply by 100
     # to convert to basis points before any comparisons or display.
@@ -1193,14 +1076,12 @@ def render_thesis_page():
     nl4wv=_sl(nl4w,0.0)
     liq_lab="Expanding" if nl4wv>=0 else "Contracting"
     y10_20=y10.diff(20)
-    # ICSA 4-week % change: weekly, leads UNRATE, orthogonal to Sahm Rule.
-    # Replaces the old u3m (UNRATE 90-day diff) which was redundant with Sahm.
     if icsa is not None and icsa.dropna().size > 28:
         _icsa_clean = icsa.dropna()
         icsa_4w_chg = float(_icsa_clean.pct_change(28).dropna().iloc[-1])
     else:
         icsa_4w_chg = 0.0
-    u3m = icsa_4w_chg  # keep u3m alias for fp formula below (unrate direction proxy)
+    u3m = icsa_4w_chg
     warsh=((y10.diff(20)<0)&(bs13<0)).astype(int)
     spydd=(spy/spy.rolling(126).max()-1).fillna(0)
     tp=float(np.clip(45+35*float(spydd.iloc[-1]<=-0.07)+20*(fear_z>1.0),0,100))
@@ -1208,18 +1089,12 @@ def render_thesis_page():
     tgadd=(tga.diff(28)<0).astype(int); rrpd=(rrp<50).astype(int)
     trp=float(np.clip(50+20*float(tgadd.iloc[-1])+15*float(rrpd.iloc[-1])+15*float(nl4w.iloc[-1]>=0),0,100))
     threeP=float(np.clip(0.35*trp+0.35*fp+0.30*tp,0,100))
-    # Recession Stress Index — regime-calibrated stress score, NOT a calibrated probability
-    # Using pre-quotes yield curve (crl) and pre-quotes VIX (vl); updated after quotes below
     _stress = _recession_stress(sahmv, hyv, crl, icsa_4w_chg, vl)
     rec     = _stress["score"]
     rec_lbl = _stress["label"]
     sr=_to_1d(spy).reindex(idx).ffill().pct_change().dropna()
     tr2=_to_1d(tlt).reindex(idx).ffill().pct_change().reindex(sr.index).dropna()
     stlc=round(float(sr.rolling(21).corr(tr2).dropna().iloc[-1]),3) if sr.dropna().size>21 else float("nan")
-    # CPI MoM: use raw monthly FRED series (pct_change(1) = month-over-month).
-    # Do NOT use the daily-ffilled `cpi` series — pct_change(21) on a ffilled
-    # monthly series returns 0 on almost every day because the value is flat
-    # between FRED releases. The raw series has one observation per month.
     _cpi_raw = raw.get("CPIAUCSL", pd.Series(dtype=float)).dropna()
     cpi_now = round(float(_cpi_raw.pct_change(1).dropna().iloc[-1]) * 100, 3) if len(_cpi_raw) > 1 else float("nan")
     rd=_retdist(spy,idx,0)
@@ -1236,7 +1111,7 @@ def render_thesis_page():
     irxv=irxv/10 if (np.isfinite(irxv) and irxv>20) else irxv
     s2s10v=(tnxv-irxv)*100 if (np.isfinite(tnxv) and np.isfinite(irxv)) else crl
     vix_live=q.get("VIX_last",vl)
-    vxn_live=q.get("VXN_last", vix_live * 1.10)  # VXN ~10% higher than VIX historically
+    vxn_live=q.get("VXN_last", vix_live * 1.10)
     vrp=_vrp_full(vix_live,spy,idx)
     vts=_vts(q); tail=_tail(q)
     rd=_retdist(spy,idx,spx)
@@ -1257,7 +1132,6 @@ def render_thesis_page():
             tstr=compute_gex_term_structure(chain_df,float(gex_spot))
             fl=compute_flow_imbalance(chain_df,float(gex_spot))
             net_gex=gex_st.total_gex; gex_score=int(np.clip(net_gex/1e9*10,-50,50))
-            # ATM IV from chain: strikes within ±1% of spot, averaged across expirations
             _atm_m = chain_df["strike"].between(float(gex_spot)*0.99, float(gex_spot)*1.01)
             _atm_v = chain_df[_atm_m]["iv"].dropna()
             atm_iv_chain = float(_atm_v.mean() * 100) if len(_atm_v) > 0 else None
@@ -1269,7 +1143,7 @@ def render_thesis_page():
     upper=gex_st.key_resistance[0] if gex_st.key_resistance else gex_spot*1.03
     lower=gex_st.key_support[0] if gex_st.key_support else gex_spot*0.97
     gex_reg=gex_st.regime.value if hasattr(gex_st.regime,"value") else str(gex_st.regime)
-    gex_op_label=REGIME_OPERATIONAL_LABEL.get(gex_st.regime, gex_reg)  # e.g. DEALERS_SELL_RALLIES
+    gex_op_label=REGIME_OPERATIONAL_LABEL.get(gex_st.regime, gex_reg)
     gex_rc=("#ef4444" if "NEGATIVE" in gex_reg.upper() or "SELL" in gex_op_label
             else "#10b981" if "POSITIVE" in gex_reg.upper() or "BUY" in gex_op_label else "#f59e0b")
     gwas_a=gwas.get("gwas_above") if gwas else None
@@ -1373,7 +1247,6 @@ def render_thesis_page():
     else:
         narr=f"Neutral dealer positioning ({gex_score:+d}): Near gamma flip — binary risk, reduce size."
 
-    # Section 3: show both ETF and SPX-equivalent levels
     _g3_mult = 10.0 if gex_sym in ("SPY",) else 40.0 if gex_sym in ("QQQ",) else 1.0
     _g3_label = "SPX" if gex_sym in ("SPY","SPX") else "NDX" if gex_sym in ("QQQ","NDX") else gex_sym
     gleft=("<div>"
@@ -1437,8 +1310,6 @@ def render_thesis_page():
         st.plotly_chart(_ivsurf_from_chain(chain_df if "chain_df" in dir() else None, float(gex_spot), "SPX", vix_live, vts.get("shape","MIXED")), use_container_width=True, key="th_ivs_spx")
     with c6:
         st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>6. IMPLIED VOL SURFACE — NDX</div>",unsafe_allow_html=True)
-        # Only pass the chain if it's actually NDX/QQQ data — do NOT fake NDX
-        # surface by scaling SPY/SPX chain with a kludge multiplier.
         _ndx_chain = (chain_df if ("chain_df" in dir() and chain_df is not None
                                    and gex_sym in ("QQQ", "NDX", "^NDX"))
                       else None)
@@ -1491,7 +1362,6 @@ def render_thesis_page():
           +_sig("⚠️" if fear_z>0.5 else "✅",f"Fear composite {fl2} ({fear_z:+.2f}σ)")
           +_sig("🔴" if rec>60 else "🟡" if rec>35 else "🟢",
                 f"Recession risk {'elevated' if rec>60 else 'moderate' if rec>35 else 'low'} ({rec:.1f}%)"))
-    # Convert GEX levels to SPX scale for display (GEX symbol may be SPY=1/10 SPX)
     _kls_mult = 10.0 if gex_sym in ("SPY","SPX") else 40.0 if gex_sym in ("QQQ","NDX") else 1.0
     _flip_disp  = flip  * _kls_mult if gex_sym in ("SPY","QQQ") else flip
     _upper_disp = upper * _kls_mult if gex_sym in ("SPY","QQQ") else upper
@@ -1563,7 +1433,10 @@ def render_thesis_page():
             +_gl("Probability Heatmap","GBM Monte Carlo (n=6,000). Shows probability of SPX/NDX reaching each price level over the next 5 trading days. VIX/VXN implied vol inputs. Includes terminal distribution, scenario bands, and tail probability summary.")
             +_gl("GEX Histogram","Gamma per strike. Green = positive (dealers stabilize). Red = negative (dealers amplify).")
             +_gl("IV vs RV Chart","VIX overlaid with 21D realized vol. VRP spread: green = IV premium (sell vol), red = IV discount (buy protection).")
-            +_gl("Fear Composite","VIX z-score + NFCI + curve inversion + liquidity tightening. Reported as σ from mean. >+1.0σ = elevated fear. <−1.0σ = complacency.")),unsafe_allow_html=True)
+            +_gl("Fear Composite",
+                 "4-component z-score index: VIX (35%) + HY OAS (25%) + NFCI (25%) + EPU (15%). "
+                 "All components z-scored over a 1-year rolling window so each contributes in standard-deviation units. "
+                 ">+1.0σ = elevated fear. <−1.0σ = complacency. Mapped to 0–100 via logistic for signal use.")),unsafe_allow_html=True)
 
     st.markdown(
         f"<div style='text-align:center;font-size:10px;color:rgba(255,255,255,0.2);margin-top:16px;'>"

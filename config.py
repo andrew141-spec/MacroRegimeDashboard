@@ -322,6 +322,16 @@ class GammaRegime(Enum):
     NEGATIVE        = "NEGATIVE"
     STRONG_NEGATIVE = "STRONG −"
 
+# Operational labels: what dealers are actually doing in each regime.
+# Used for trader-facing display instead of the abstract +/- labels.
+REGIME_OPERATIONAL_LABEL = {
+    GammaRegime.STRONG_POSITIVE: "STRONG_BUY_DIPS",
+    GammaRegime.POSITIVE:        "DEALERS_BUY_DIPS",
+    GammaRegime.NEUTRAL:         "NEAR_FLIP",
+    GammaRegime.NEGATIVE:        "DEALERS_SELL_RALLIES",
+    GammaRegime.STRONG_NEGATIVE: "STRONG_SELL_RALLIES",
+}
+
 REGIME_COLORS = {
     GammaRegime.STRONG_POSITIVE: "var(--green)",
     GammaRegime.POSITIVE:        "var(--teal)",

@@ -886,76 +886,101 @@ def _recession_stress(sahm: float, hy: float, s2s10_bp: float,
 def _composite(prob: dict, vrp_val: float,
                leading: dict = None, gex_regime: "GammaRegime | None" = None,
                vts_shape: str = "MIXED") -> int:
+    """
+    Composite directional score −10 to +10.
+
+    Design philosophy:
+      - The PROBABILITY SIGNAL (tactical/short/medium buckets) is the primary
+        driver. It should dominate the score when there is genuine directional
+        conviction (prob >> 50% or << 50%).
+      - Structural overlays (stress flags, GEX regime, VRP) are TILTS — they
+        shift the score by ±0.5 to ±1.5 total, not enough to override a clear
+        probability signal but enough to matter when signals are mixed.
+      - compute_prob_composite() compresses toward 50 when uncertain. On a
+        typical mixed-signal day it outputs 48–55%. The scoring must translate
+        this into a readable −2 to +2 range before overlays, not ±0.1.
+
+    Scaling:
+      _bucket_score at p=55  → (55-50)/8 = 0.625
+      _bucket_score at p=60  → (60-50)/8 = 1.25
+      _bucket_score at p=70  → (70-50)/8 = 2.5
+      Weighted sum of three buckets all at 60% → ~1.25 (before overlays)
+      Weighted sum of three buckets all at 70% → ~2.5 (before overlays)
+      Max theoretical (all buckets at 100%) → (50/8) = 6.25
+      Overlays add/subtract ≤ 2.0 total → final range stays within ±8
+    """
 
     def _bucket_score(p: float) -> float:
-        # 50→0, 62→+1, 74→+2, 38→-1, 26→-2
-        return (p - 50.0) / 12.0
+        # Divisor 8: 55%→+0.6, 60%→+1.25, 65%→+1.9, 70%→+2.5
+        return (p - 50.0) / 8.0
 
     tactical = prob.get("tactical_prob", 50.0)
     short    = prob.get("short_prob",    50.0)
     medium   = prob.get("medium_prob",   50.0)
 
-    # Weighted bucket sum — medium-term weighted more heavily.
-    # ×3 scale so the full ±50pt probability range → roughly ±12.5 before clipping.
-    # Each bucket max = ±(50/12)×3 = ±12.5, weighted sum max ≈ ±12.5
+    # Weighted sum — medium-term signal carries more weight (less noise)
     s = (0.25 * _bucket_score(tactical) +
          0.35 * _bucket_score(short) +
-         0.40 * _bucket_score(medium)) * 3.0
+         0.40 * _bucket_score(medium))
 
-    # VRP tilt — small additive adjustment only
+    # ── VRP tilt (±0.3 max) ───────────────────────────────────────────────
+    # Positive VRP = options expensive vs realized vol → slight bearish tilt
+    # for directional longs (vol crush risk, complacency signal)
     if np.isfinite(vrp_val):
-        if vrp_val > 4:    s -= 0.4
-        elif vrp_val > 2:  s -= 0.2
-        elif vrp_val < -2: s += 0.2
-        elif vrp_val < -4: s += 0.4
+        if vrp_val > 4:    s -= 0.3
+        elif vrp_val > 2:  s -= 0.15
+        elif vrp_val < -2: s += 0.15
+        elif vrp_val < -4: s += 0.3
 
-    # ── Structural risk overlay — ADDITIVE penalty, not hard override ─────
-    # Previous code used min(s, -2.0) which hard-floored the score to -2
-    # whenever 2+ stress flags fired simultaneously, regardless of what the
-    # probability signals were actually saying. This caused the composite to
-    # get stuck at -2 → -3 (after GEX amplification) every day that VTS was
-    # in backwardation + any other flag was active — which is a lot of days.
-    #
-    # Fix: each active stress flag contributes a fixed additive penalty (-0.8)
-    # so the composite still reflects the probability signal underneath, just
-    # tilted bearish by the structural environment. Multiple flags stack but
-    # the final clip to ±10 still applies.
+    # ── Structural stress flags (−0.4 each, max −1.6 total) ──────────────
+    # Each flag is a meaningful regime signal but should not overwhelm the
+    # probability buckets. Four flags firing = −1.6, still within ±2 overlay
+    # budget so a bullish probability signal can partially offset.
     if leading is not None:
         sahm_triggered = leading.get("sahm_triggered",  False)
         hy_stress      = leading.get("hy_stress_gate",  False)
         corr_systemic  = leading.get("corr_regime", "NORMAL") == "SYSTEMIC"
         vts_backw      = vts_shape == "BACKWARDATION"
         stress_count   = sum([sahm_triggered, hy_stress, corr_systemic, vts_backw])
-        # Each flag subtracts 0.8; 4 flags = -3.2 maximum structural drag
-        s -= stress_count * 0.8
+        s -= stress_count * 0.4
 
-    # ── GEX asymmetric tilt — additive, not multiplicative ───────────────
-    # Previous code used s *= 1.4 / 0.6 / 1.2. Multiplicative amplification
-    # on an already-adjusted score caused compounding: -2 × 1.4 = -2.8 → -3.
-    # Additive is cleaner: neg-gamma environment adds a fixed bearish tilt
-    # regardless of the magnitude of s.
+    # ── GEX regime tilt (±0.5 max) ───────────────────────────────────────
+    # Neg-gamma: dealers amplify directional moves → bearish tilt (tail risk)
+    # Pos-gamma: dealers suppress moves → mild bullish tilt (range/pin)
     if gex_regime is not None:
         neg_gamma = gex_regime in (GammaRegime.NEGATIVE, GammaRegime.STRONG_NEGATIVE)
         pos_gamma = gex_regime in (GammaRegime.POSITIVE, GammaRegime.STRONG_POSITIVE)
         if neg_gamma:
-            s -= 0.8   # neg-gamma: dealers amplify moves, tail risk elevated
+            s -= 0.5
         elif pos_gamma:
-            s += 0.4   # pos-gamma: mild mean-reversion tailwind
+            s += 0.3
 
     return int(np.clip(round(s), -10, 10))
 
 def _verdict(c: int, gex: GammaRegime) -> Tuple[str,str,str]:
+    """
+    Map composite score to verdict label.
+
+    With the recalibrated _composite (divisor=8, no ×3 multiplier):
+      Typical neutral day (probs ~50%): s ≈ 0 ± overlays → −2 to +1
+      Mild conviction (probs ~58%):     s ≈ ±1 + overlays
+      Strong conviction (probs ~70%):   s ≈ ±2.5 + overlays
+      Max theoretical:                  s ≈ ±8
+
+    Thresholds scaled accordingly — BEARISH requires genuine bearish
+    probability signal OR strong probability signal + structural stress.
+    """
     neg=gex in (GammaRegime.NEGATIVE,GammaRegime.STRONG_NEGATIVE)
     pos=gex in (GammaRegime.POSITIVE,GammaRegime.STRONG_POSITIVE)
-    if c<=-4: return "BEARISH","#ef4444","Multiple signals aligned bearish."
+    if c<=-3: return "BEARISH","#ef4444","Multiple signals aligned bearish."
     if c<=-2:
         return (("BEARISH","#ef4444","Negative macro + negative gamma.") if neg
                 else ("LEANING BEARISH","#f97316","Modest bearish lean."))
-    if c<=1:
+    if c<=0:
         if neg: return "CAUTIOUS","#f59e0b","Neutral signals but negative gamma — tail risk elevated."
         if pos: return "NEUTRAL / RANGE","#6366f1","Positive gamma → compression and pin."
         return "NEUTRAL","#94a3b8","No strong conviction."
-    if c<=3: return "LEANING BULLISH","#10b981","Bullish lean. Credit and liquidity constructive."
+    if c<=2: return "LEANING BULLISH","#10b981","Bullish lean. Credit and liquidity constructive."
     return "BULLISH","#10b981","Broad bullish alignment."
 
 def _bands(spot: float, vix: float) -> Dict:

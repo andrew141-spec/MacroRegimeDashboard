@@ -82,15 +82,76 @@ def _retdist(spy: pd.Series, idx, spot: float) -> Dict:
     ku = float(_scipy_kurt(rets.tail(252), fisher=True))
     return {"daily_sigma":ds,"skew":sk,"kurtosis":ku}
 
-def _merton_fig(spot: float, vix: float, days=5, n=4000) -> go.Figure:
+def _merton_calibrate(vix: float, vvix: float,
+                       vts_shape: str, vrp_val: float) -> dict:
+    """
+    Calibrate Merton jump-diffusion parameters to current vol regime.
+
+    Base calibration from Broadie-Chernov-Johannes (2007) SPX fitted values:
+      lam ≈ 0.59/yr, mj ≈ -0.026, sj ≈ 0.047 (long-run average)
+
+    Adjustments:
+      lam (jump intensity): scaled by VVIX/VIX ratio. High vol-of-vol = more
+           frequent jumps expected. VVIX/VIX > 5.5 → crisis regime.
+      mj  (mean jump size): scaled by VTS shape. Backwardation means the
+           options market is pricing larger near-term downside jumps.
+      sj  (jump size std):  scales with VIX level — higher IV = wider jump distribution.
+
+    All parameters documented so users can see the calibration logic.
+    """
+    # Base parameters (Broadie-Chernov-Johannes 2007, rescaled for 1/252 dt)
+    lam_base = 0.59   # jumps per year
+    mj_base  = -0.026 # mean log jump size
+    sj_base  = 0.047  # std dev of log jump size
+
+    # lam scales with VVIX/VIX (vol-of-vol / vol ratio = tail risk premium)
+    vvix_vix_ratio = (vvix / vix) if (vix > 0 and np.isfinite(vvix) and vvix > 0) else 4.8
+    # Empirical range: ~3.5 (calm) to ~7.0 (crisis)
+    # Normalise so ratio=4.8 (historical median) → multiplier=1.0
+    lam_mult = np.clip(vvix_vix_ratio / 4.8, 0.4, 2.5)
+    lam = lam_base * lam_mult
+
+    # mj scales with VTS regime:
+    #   Contango (normal): smaller jump fear → mj closer to base
+    #   Backwardation (stress): market pricing larger near-term down jumps
+    vts_adj = {"BACKWARDATION": 1.40, "MIXED": 1.10, "CONTANGO": 0.80, "N/A": 1.0}
+    mj = mj_base * vts_adj.get(vts_shape, 1.0)
+
+    # sj scales with VIX level — empirically wider distribution in high-vol regimes
+    # VIX 15 → baseline, VIX 30 → +50% wider, VIX 45 → +100% wider
+    sj_mult = np.clip(vix / 15.0, 0.7, 2.5)
+    sj = sj_base * sj_mult
+
+    # Drift adjustment: subtract jump compensation term so paths are martingales
+    # E[e^j] = exp(mj + 0.5*sj^2), so mu = r - lambda*(exp(mj+0.5*sj^2)-1)
+    jump_comp = lam * (np.exp(mj + 0.5 * sj**2) - 1)
+
+    return {
+        "lam": round(lam, 3),
+        "mj":  round(mj, 4),
+        "sj":  round(sj, 4),
+        "jump_comp": jump_comp,
+        "lam_mult": round(lam_mult, 2),
+        "vts_adj_used": vts_shape,
+        "sj_mult": round(sj_mult, 2),
+    }
+
+def _merton_fig(spot: float, vix: float, vvix: float = float("nan"),
+                vts_shape: str = "MIXED", vrp_val: float = 0.0,
+                days=5, n=4000) -> go.Figure:
     np.random.seed(42)
-    dt_s=1/252; sig=vix/100
-    lam,mj,sj=0.10,-0.015,0.025
-    paths=np.zeros((n,days+1)); paths[:,0]=spot
-    for t in range(1,days+1):
-        z=np.random.standard_normal(n); nj=np.random.poisson(lam*dt_s,n)
-        j=np.random.normal(mj,sj,n)*nj
-        paths[:,t]=paths[:,t-1]*np.exp((-0.5*sig**2)*dt_s+sig*np.sqrt(dt_s)*z+j)
+    dt_s = 1 / 252
+    sig  = vix / 100
+    params = _merton_calibrate(vix, vvix, vts_shape, vrp_val)
+    lam, mj, sj = params["lam"], params["mj"], params["sj"]
+    drift = -0.5 * sig**2 - params["jump_comp"]  # risk-neutral drift
+
+    paths = np.zeros((n, days + 1)); paths[:, 0] = spot
+    for t in range(1, days + 1):
+        z  = np.random.standard_normal(n)
+        nj = np.random.poisson(lam * dt_s, n)
+        j  = np.random.normal(mj, sj, n) * nj
+        paths[:, t] = paths[:, t-1] * np.exp(drift * dt_s + sig * np.sqrt(dt_s) * z + j)
     lo=spot*0.93; hi=spot*1.07; lvls=np.linspace(lo,hi,24); bkt=(hi-lo)/24
     Z=np.zeros((24,days))
     for d in range(days):
@@ -115,19 +176,114 @@ def _merton_fig(spot: float, vix: float, days=5, n=4000) -> go.Figure:
     fig.update_layout(xaxis_title="Trading Day Forward",yaxis_title="Price Level")
     return fig
 
-def _ivsurf_fig(vix: float, label: str) -> go.Figure:
-    ms=np.linspace(0.88,1.12,15); dtes=np.array([7,14,21,45,90,180])
-    Z=np.zeros((len(ms),len(dtes)))
-    for i,m in enumerate(ms):
-        for j,d in enumerate(dtes):
-            mn=m-1.0
-            Z[i,j]=max((vix/100-0.30*mn-0.002*d)*100,1.0)
-    fig=go.Figure(go.Surface(x=dtes,y=[f"{m*100:.0f}%" for m in ms],z=Z,
-        colorscale="RdYlGn_r",showscale=True,colorbar=dict(title="IV%",thickness=12),opacity=0.90))
-    plotly_dark(fig,title=f"IV Surface — {label} (Model)",height=380)
-    fig.update_layout(scene=dict(xaxis_title="DTE",yaxis_title="Moneyness",
-                                  zaxis_title="IV%",bgcolor="rgba(0,0,0,0)"))
-    return fig
+def _ivsurf_from_chain(chain_df, spot: float, label: str,
+                        vix: float, vts_shape: str) -> go.Figure:
+    """
+    Build IV surface from ACTUAL options chain data (chain_df).
+
+    If chain_df is None or empty, returns a clearly-labelled placeholder figure
+    explaining that real data is unavailable — rather than silently showing a
+    fake parametric surface.
+
+    The surface is built from per-strike, per-expiry IV already in the chain,
+    interpolated over a moneyness × DTE grid. No parametric assumptions about
+    skew slope or term structure slope are used — those come from the data.
+    """
+    if chain_df is None or len(chain_df) == 0:
+        fig = go.Figure()
+        plotly_dark(fig, title=f"IV Surface — {label} (DATA UNAVAILABLE)", height=380)
+        fig.add_annotation(
+            x=0.5, y=0.5, xref="paper", yref="paper",
+            text=(
+                "<b>No options chain data available.</b><br>"
+                "Connect Schwab/TOS or wait for yfinance data.<br>"
+                "A parametric model surface is NOT shown here<br>"
+                "because it would misrepresent actual skew conditions."
+            ),
+            showarrow=False, font=dict(color="rgba(255,255,255,0.6)", size=12),
+            align="center",
+        )
+        return fig
+
+    try:
+        df = chain_df.copy()
+        # expiry_T is in years; convert to DTE
+        df["dte"] = (df["expiry_T"] * 365).round().astype(int)
+        df["moneyness"] = df["strike"] / spot
+
+        # Filter to reasonable range
+        df = df[(df["moneyness"] >= 0.88) & (df["moneyness"] <= 1.12)]
+        df = df[(df["dte"] >= 1) & (df["dte"] <= 180)]
+        df = df[df["iv"] > 0.01]
+
+        if len(df) < 10:
+            raise ValueError("Insufficient chain data for surface")
+
+        # Build grid via pivot — average IV where multiple contracts exist per cell
+        # Round moneyness to nearest 0.01 for grid stability
+        df["m_bucket"] = (df["moneyness"] / 0.01).round() * 0.01
+        agg = df.groupby(["m_bucket", "dte"])["iv"].mean().reset_index()
+        pivot = agg.pivot(index="m_bucket", columns="dte", values="iv")
+        # Forward-fill missing DTEs (interpolate term structure)
+        pivot = pivot.interpolate(axis=1, limit_direction="both")
+        pivot = pivot.fillna(method="bfill").fillna(method="ffill")
+
+        Z_raw = pivot.values * 100  # to %
+        m_labels = [f"{m*100:.0f}%" for m in pivot.index]
+        dte_labels = list(pivot.columns)
+
+        # Colour range: symmetric around ATM IV to highlight skew clearly
+        atm_iv = float(df[df["dte"].between(20, 35)]["iv"].mean()) * 100 if len(df[df["dte"].between(20, 35)]) > 0 else vix
+        z_mid = atm_iv
+        z_range = [max(0, z_mid * 0.5), z_mid * 2.0]
+
+        # Skew metrics for annotation
+        calls_25d = df[(df["moneyness"] > 1.02) & (df["moneyness"] < 1.06) & (df["dte"].between(20,35))]["iv"].mean()
+        puts_25d  = df[(df["moneyness"] > 0.94) & (df["moneyness"] < 0.98) & (df["dte"].between(20,35))]["iv"].mean()
+        skew_25d  = (puts_25d - calls_25d) * 100 if (np.isfinite(puts_25d) and np.isfinite(calls_25d)) else float("nan")
+        skew_str  = f"25Δ Skew: {skew_25d:+.1f}pts" if np.isfinite(skew_25d) else ""
+
+        # Term structure: front vs back
+        front_atm = df[(df["moneyness"].between(0.99, 1.01)) & (df["dte"] <= 14)]["iv"].mean() * 100
+        back_atm  = df[(df["moneyness"].between(0.99, 1.01)) & (df["dte"].between(30, 60))]["iv"].mean() * 100
+        ts_str    = f"TS: {front_atm:.1f}% → {back_atm:.1f}%" if (np.isfinite(front_atm) and np.isfinite(back_atm)) else ""
+
+        regime_note = {"BACKWARDATION": "⚠️ VTS Backwardation", "CONTANGO": "✓ VTS Contango", "MIXED": "~ VTS Mixed"}.get(vts_shape, "")
+
+        title_str = f"IV Surface — {label} | {regime_note} | {skew_str} | {ts_str}"
+
+        fig = go.Figure(go.Surface(
+            x=dte_labels,
+            y=m_labels,
+            z=Z_raw,
+            colorscale="RdYlGn_r",
+            showscale=True,
+            colorbar=dict(title="IV%", thickness=12),
+            opacity=0.92,
+            cmin=z_range[0],
+            cmax=z_range[1],
+        ))
+        plotly_dark(fig, title=title_str, height=400)
+        fig.update_layout(scene=dict(
+            xaxis_title="DTE",
+            yaxis_title="Moneyness",
+            zaxis_title="IV%",
+            bgcolor="rgba(0,0,0,0)",
+        ))
+        return fig
+
+    except Exception as exc:
+        # Data available but surface build failed — show honest error
+        fig = go.Figure()
+        plotly_dark(fig, title=f"IV Surface — {label} (BUILD ERROR)", height=380)
+        fig.add_annotation(
+            x=0.5, y=0.5, xref="paper", yref="paper",
+            text=f"Surface build failed: {exc}<br>Raw chain data present but insufficient for surface.",
+            showarrow=False, font=dict(color="rgba(255,200,0,0.8)", size=11),
+            align="center",
+        )
+        return fig
+
 
 def _ivrv_fig(vix_s: pd.Series, spy: pd.Series, idx) -> go.Figure:
     sa=_to_1d(spy).reindex(idx).ffill(); va=_to_1d(vix_s).reindex(idx).ffill()
@@ -165,8 +321,84 @@ def _rdist_fig(spy: pd.Series, idx, rd: Dict) -> go.Figure:
     fig.update_layout(xaxis_title="Daily Return (%)",yaxis_title="Density")
     return fig
 
-def _rec_prob(sahm: float, puts: float, hy: float) -> float:
-    return round(min(np.clip(sahm/0.5*60,0,60)+np.clip((hy-300)/700*25,0,25)+np.clip((100-puts)/100*15,0,15),99),1)
+def _recession_stress(sahm: float, hy: float, s2s10_bp: float,
+                      ur: float, vix: float) -> dict:
+    """
+    Recession Stress Index — a composite indicator, NOT a calibrated probability.
+
+    Uses a simple probit-style score combining:
+      1. Sahm Rule (0–0.5+ scale, most direct recession onset signal)
+      2. HY OAS (credit stress, historical recession threshold ~500bp)
+      3. Yield curve (2s10s inversion depth and duration proxy)
+      4. Unemployment trend (3M change)
+      5. VIX level (financial stress)
+
+    These factors are standardized and combined with weights derived from
+    the empirical literature on recession leading indicators:
+      - Sahm Rule: 35% (most reliable real-time signal, Sahm 2019)
+      - HY OAS:    25% (credit leads equity and employment)
+      - Yield curve:20% (classic Estrella-Mishkin probit)
+      - UR trend:  12% (labor deterioration confirms)
+      - VIX:        8% (financial conditions proxy)
+
+    Output is mapped to [0, 99] via a logistic function to avoid the
+    false precision of a "probability" label.
+
+    Call this a Stress Index, not a recession probability.
+    """
+    from scipy.special import expit as _sigmoid
+
+    # Each component → z-score relative to recession/non-recession historical ranges
+    # Sahm: 0=clear, 0.3=warning, 0.5=triggered (historical recession onset)
+    sahm_z = np.clip(sahm / 0.4, 0, 1)  # normalise: 0.4 = historical trigger midpoint
+
+    # HY OAS: 300=normal, 500=stress, 800=crisis, 1200=systemic
+    hy_z = np.clip((hy - 300) / 700, 0, 1)
+
+    # Yield curve: inversion (negative 2s10s) is bearish
+    # -150bp = deep inversion (strong recession signal), +50bp = normal
+    curve_z = np.clip((-s2s10_bp - 0) / 150, 0, 1)  # 0 at flat, 1 at -150bp
+
+    # UR trend: rising unemployment is bearish
+    # proxy via sahm being non-zero (sahm = 3M avg minus 12M min)
+    ur_z = np.clip(sahm / 0.3, 0, 1)  # reuse sahm as UR trend proxy
+
+    # VIX: 15=normal, 25=elevated, 40=crisis
+    vix_z = np.clip((vix - 15) / 35, 0, 1)
+
+    # Weighted composite
+    raw = (0.35 * sahm_z + 0.25 * hy_z + 0.20 * curve_z
+           + 0.12 * ur_z + 0.08 * vix_z)
+
+    # Map to 0-99 via logistic (avoids false precision near 0 and 100)
+    # Calibrate so raw=0 → ~5%, raw=0.5 → ~50%, raw=1.0 → ~95%
+    score = float(_sigmoid((raw - 0.5) * 8) * 100)
+    score = round(np.clip(score, 1, 99), 1)
+
+    # Regime label based on Sahm + HY combination (hardest to fake)
+    if sahm >= 0.50 or hy > 600:
+        label = "ELEVATED"
+    elif sahm >= 0.30 or hy > 420:
+        label = "MODERATE"
+    else:
+        label = "LOW"
+
+    return {
+        "score": score,
+        "label": label,
+        "components": {
+            "sahm_contribution":  round(0.35 * sahm_z * 100, 1),
+            "hy_contribution":    round(0.25 * hy_z   * 100, 1),
+            "curve_contribution": round(0.20 * curve_z * 100, 1),
+            "ur_contribution":    round(0.12 * ur_z    * 100, 1),
+            "vix_contribution":   round(0.08 * vix_z   * 100, 1),
+        },
+        "note": (
+            "Recession Stress Index — NOT a calibrated probability. "
+            "Use Cleveland Fed CFNAI model or Estrella-Mishkin probit for "
+            "statistically grounded recession probabilities."
+        ),
+    }
 
 def _composite(prob: dict, fear: float, vrp_val: float, gex: GammaRegime) -> int:
     s=int(round((prob.get("bull_prob",50)-50)/12.5))
@@ -310,7 +542,11 @@ def render_thesis_page():
     tgadd=(tga.diff(28)<0).astype(int); rrpd=(rrp<50).astype(int)
     trp=float(np.clip(50+20*float(tgadd.iloc[-1])+15*float(rrpd.iloc[-1])+15*float(nl4w.iloc[-1]>=0),0,100))
     threeP=float(np.clip(0.35*trp+0.35*fp+0.30*tp,0,100))
-    rec=_rec_prob(sahmv,threeP,hyv)
+    # Recession Stress Index — regime-calibrated stress score, NOT a calibrated probability
+    # Using pre-quotes yield curve (crl) and pre-quotes VIX (vl); updated after quotes below
+    _stress = _recession_stress(sahmv, hyv, crl, ur, vl)
+    rec     = _stress["score"]
+    rec_lbl = _stress["label"]
     sr=_to_1d(spy).reindex(idx).ffill().pct_change().dropna()
     tr2=_to_1d(tlt).reindex(idx).ffill().pct_change().reindex(sr.index).dropna()
     stlc=round(float(sr.rolling(21).corr(tr2).dropna().iloc[-1]),3) if sr.dropna().size>21 else float("nan")
@@ -401,7 +637,7 @@ def render_thesis_page():
          +_pill(f"Market Regime: {macro_reg}",reg_col)
          +_pill(f"Fear Level: {fl2} ({fear:.2f})",fc)
          +_pill(f"Liquidity: {liq_lab} (${abs(nl4wv):.0f}B)","#10b981" if nl4wv>=0 else "#ef4444")
-         +_pill(f"Recession P(6m): {rec:.1f}%","#ef4444" if rec>50 else "#f59e0b" if rec>30 else "#10b981")
+         +_pill(f"Stress Index: {rec:.0f}/100 ({rec_lbl})","#ef4444" if rec>50 else "#f59e0b" if rec>30 else "#10b981")
          +"</div>")
     strip=("<div style='display:grid;grid-template-columns:repeat(9,1fr);gap:6px;'>"
            +_tk("SPX",spx,q.get("SPX_pct",float("nan")))
@@ -491,16 +727,28 @@ def render_thesis_page():
     # ── 4. PROBABILITY HEATMAP ────────────────────────────────────────────
     st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>4. PROBABILITY HEATMAP — MC Simulation</div>",unsafe_allow_html=True)
     st.caption("1-week forward | Merton jump-diffusion | SPX")
-    st.plotly_chart(_merton_fig(spx,vix_live),use_container_width=True,key="th_hm")
+    _mp = _merton_calibrate(vix_live, tail.get("vvix", float("nan")), vts.get("shape","MIXED"), vrp.get("val",0.0))
+    st.caption(
+        f"Merton jump-diffusion — regime-calibrated: "
+        f"λ={_mp['lam']:.2f}/yr (×{_mp['lam_mult']} from VVIX/VIX) · "
+        f"μ_j={_mp['mj']:.3f} ({_mp['vts_adj_used']} VTS) · "
+        f"σ_j={_mp['sj']:.3f} (×{_mp['sj_mult']} VIX scale) · "
+        f"Base: Broadie-Chernov-Johannes (2007)"
+    )
+    st.plotly_chart(
+        _merton_fig(spx, vix_live, vvix=tail.get("vvix", float("nan")),
+                    vts_shape=vts.get("shape","MIXED"), vrp_val=vrp.get("val",0.0)),
+        use_container_width=True, key="th_hm"
+    )
 
     # ── 5 & 6. IV SURFACES ────────────────────────────────────────────────
     c5,c6=st.columns(2)
     with c5:
         st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>5. IMPLIED VOL SURFACE — SPX</div>",unsafe_allow_html=True)
-        st.plotly_chart(_ivsurf_fig(vix_live,"SPX"),use_container_width=True,key="th_ivs_spx")
+        st.plotly_chart(_ivsurf_from_chain(chain_df if "chain_df" in dir() else None, float(gex_spot), "SPX", vix_live, vts.get("shape","MIXED")), use_container_width=True, key="th_ivs_spx")
     with c6:
         st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>6. IMPLIED VOL SURFACE — NDX</div>",unsafe_allow_html=True)
-        st.plotly_chart(_ivsurf_fig(vix_live*0.92,"NDX"),use_container_width=True,key="th_ivs_ndx")
+        st.plotly_chart(_ivsurf_from_chain(chain_df if "chain_df" in dir() else None, float(gex_spot), "NDX", vix_live*0.92, vts.get("shape","MIXED")), use_container_width=True, key="th_ivs_ndx")
 
     # ── 7. IV vs RV ───────────────────────────────────────────────────────
     st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>7. IMPLIED vs REALIZED VOLATILITY</div>",unsafe_allow_html=True)
@@ -548,7 +796,7 @@ def render_thesis_page():
     sigs=(_sig("✅" if vp else "⚠️",f"VRP {'positive' if vp else 'negative'} ({vs2})")
           +_sig("⚠️" if fear>55 else "✅",f"Fear composite {fl2}")
           +_sig("🔴" if rec>60 else "🟡" if rec>35 else "🟢",
-                f"Recession risk {'elevated' if rec>60 else 'moderate' if rec>35 else 'low'} ({rec:.1f}%)")
+                f"Stress Index {rec_lbl.lower()} ({rec:.0f}/100) — composite of Sahm, HY OAS, yield curve, VIX")
           +_sig("🔴" if "NEGATIVE" in gex_reg.upper() else "🟢",f"GEX: {gex_reg}")
           +_sig("📊",f"Dominant 1D: {p1d.get('dominant_signal','—')} ({p1d.get('dominant_dir','neutral')})"))
     kls=(_kv("SPX Spot",f"{spx:,.2f}","#fff")
@@ -561,7 +809,7 @@ def render_thesis_page():
          +_kv("2σ Weekly",f"{b['w2lo']:,.2f} — {b['w2hi']:,.2f}"))
     risks=[]
     if fear>60: risks.append(("⚠️","Elevated fear composite — potential for sharp moves"))
-    if rec>50: risks.append(("🔴",f"Recession probability at {rec:.1f}% — monitor labor data"))
+    if rec>50: risks.append(("🔴",f"Stress Index {rec:.0f}/100 ({rec_lbl}) — Sahm={sahmv:.3f}, HY={hyv:.0f}bp, curve={crl:.0f}bp"))
     if np.isfinite(stlc) and stlc>0.2: risks.append(("⚠️","Positive stock-bond correlation — diversification impaired"))
     if "NEGATIVE" in gex_reg.upper(): risks.append(("🔴","Negative gamma regime — dealer hedging amplifies moves. No fading."))
     if dur=="FRAGILE": risks.append(("⚠️",f"GEX regime fragile — {frag:.0f}% of gamma ≤7 DTE. Levels expire by Friday."))

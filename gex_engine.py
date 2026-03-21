@@ -419,29 +419,41 @@ def compute_gex_term_structure(chain: pd.DataFrame, spot: float) -> dict:
 
 def compute_flow_imbalance(chain: pd.DataFrame, spot: float) -> dict:
     """
-    Put/Call Dollar Volume Imbalance.
+    Put/Call Dollar Premium Imbalance.
 
-    Volume = what's happening NOW. OI = yesterday's positions.
-    Dollar premium = volume × mid_price (or IV-approximated premium).
+    When call_volume / put_volume columns are present (populated from Schwab
+    totalVolume), computes volume-weighted premium — genuine intraday FLOW.
 
-    If 'volume' column present (Schwab intraday), uses it directly.
-    Falls back to OI as a proxy when volume is unavailable.
+    When volume columns are absent or all-zero, falls back to OI-weighted
+    premium.  That measures accumulated positional INVENTORY, not flow.
+    These are different signals and often diverge near expiry.  The
+    'using_volume' key makes the mode explicit so callers can label correctly.
 
     Returns:
-      put_dollar_vol   — total put dollar premium (volume × approx price)
+      put_dollar_vol   — total put dollar premium
       call_dollar_vol  — total call dollar premium
-      pc_ratio         — put / call dollar ratio (>1.2 = fear, <0.8 = greed)
+      pc_ratio         — put / call dollar ratio (>1.3 = fear, <0.77 = greed)
       flow_bias        — "bearish" / "bullish" / "neutral"
-      put_pct          — put share of total dollar flow
+      put_pct          — put share of total dollar premium
+      using_volume     — True if volume-based (flow), False if OI-based (inventory)
     """
     if chain is None or chain.empty:
         return {}
 
     df = chain.copy()
-    has_volume = "volume" in df.columns and df["volume"].notna().any() and (df["volume"] > 0).any()
 
-    # Approximate premium per contract: Black-Scholes call/put price
-    # (fast approximation using ATM IV for simplicity; good enough for ratio)
+    # Prefer per-side volume columns (call_volume / put_volume) from
+    # schwab_get_options_chain (totalVolume).  A single generic 'volume'
+    # column is not expected from Schwab which separates calls and puts.
+    has_call_vol = ("call_volume" in df.columns
+                    and df["call_volume"].notna().any()
+                    and (df["call_volume"] > 0).any())
+    has_put_vol  = ("put_volume"  in df.columns
+                    and df["put_volume"].notna().any()
+                    and (df["put_volume"] > 0).any())
+    has_volume   = has_call_vol and has_put_vol
+
+    # Approximate premium per contract via Black-Scholes mid-price.
     def _approx_premium(row, is_call):
         S, K, T, iv = spot, row["strike"], max(row.get("expiry_T", 0.01), 1/365), row.get("iv", 0.20)
         if T <= 0 or iv <= 0:
@@ -453,15 +465,22 @@ def compute_flow_imbalance(chain: pd.DataFrame, spot: float) -> dict:
         else:
             return float(K * math.exp(-0.05 * T) * scipy_norm.cdf(-d2) - S * scipy_norm.cdf(-d1))
 
-    # Use volume if available, else OI as proxy
-    flow_col = "volume" if has_volume else None
-
-    call_rows = df[df["call_oi"] > 0].copy() if not has_volume else df[df.get("call_volume", pd.Series(dtype=float)) > 0].copy()
-    put_rows  = df[df["put_oi"] > 0].copy()
-
-    # Simpler: use OI × premium as the dollar weight
-    call_premium = df.apply(lambda r: _approx_premium(r, True)  * (r.get("volume", r["call_oi"]) if has_volume else r["call_oi"]) * 100, axis=1).sum()
-    put_premium  = df.apply(lambda r: _approx_premium(r, False) * (r.get("volume", r["put_oi"])  if has_volume else r["put_oi"])  * 100, axis=1).sum()
+    if has_volume:
+        # Volume-weighted: genuine intraday flow
+        call_premium = df.apply(
+            lambda r: _approx_premium(r, True)  * float(r.get("call_volume", 0)) * 100,
+            axis=1).sum()
+        put_premium  = df.apply(
+            lambda r: _approx_premium(r, False) * float(r.get("put_volume",  0)) * 100,
+            axis=1).sum()
+    else:
+        # OI-weighted: positional inventory proxy (NOT flow)
+        call_premium = df.apply(
+            lambda r: _approx_premium(r, True)  * float(r.get("call_oi", 0)) * 100,
+            axis=1).sum()
+        put_premium  = df.apply(
+            lambda r: _approx_premium(r, False) * float(r.get("put_oi",  0)) * 100,
+            axis=1).sum()
 
     total = call_premium + put_premium
     pc_ratio = put_premium / call_premium if call_premium > 0 else 1.0

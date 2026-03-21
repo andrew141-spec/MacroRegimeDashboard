@@ -488,9 +488,21 @@ def _ivsurf_from_chain(chain_df, spot: float, label: str,
         df["dte"] = (df["expiry_T"] * 365).clip(lower=1)
         df["moneyness"] = df["strike"] / spot
 
-        # Filter to tradeable range and valid IV
-        df = df[(df["moneyness"] >= 0.88) & (df["moneyness"] <= 1.15)]
-        df = df[(df["dte"] >= 1) & (df["dte"] <= 10)]
+        # Filter to near-term tradeable range and valid IV
+        # ── Change 1 & 2: tighter moneyness (0.93–1.15) and short DTE (≤10,
+        #    fallback to ≤21 if fewer than 4 points survive the initial cut) ──
+        df = df[(df["moneyness"] >= 0.93) & (df["moneyness"] <= 1.15)]
+        _dte_limit = 10
+        df = df[(df["dte"] >= 1) & (df["dte"] <= _dte_limit)]
+        if len(df) < 4:
+            # fallback: widen DTE window to 21 days
+            _dte_limit = 21
+            df = chain_df.copy()
+            df["dte"] = (df["expiry_T"] * 365).clip(lower=1)
+            df["moneyness"] = df["strike"] / spot
+            df = df[(df["moneyness"] >= 0.93) & (df["moneyness"] <= 1.15)]
+            df = df[(df["dte"] >= 1) & (df["dte"] <= _dte_limit)]
+
         df = df[(df["iv"] > 0.005) & (df["iv"] < 2.0)]   # tightened: >200% IV is bad data
 
         # Remove extreme outliers: IV > 3× median is almost certainly bad data
@@ -514,9 +526,8 @@ def _ivsurf_from_chain(chain_df, spot: float, label: str,
         pts_m   = df["moneyness"].values.astype(float)
         pts_iv  = np.clip(df["iv"].values.astype(float) * 100, hard_lo, hard_hi)
 
-        # Dense output grid: 30 moneyness × 20 DTE cells
-        dte_max  = min(float(pts_dte.max()), 10.0)
-        dte_grid = np.linspace(max(float(pts_dte.min()), 1.0), dte_max, 16)
+        # ── Change 3: dense output grid capped at 10 DTE, 16 cells ──────
+        dte_grid = np.linspace(max(pts_dte.min(), 1.0), min(pts_dte.max(), 10.0), 16)
         m_grid   = np.linspace(pts_m.min(),   pts_m.max(),   30)
         DTE, MON = np.meshgrid(dte_grid, m_grid)
 
@@ -547,8 +558,9 @@ def _ivsurf_from_chain(chain_df, spot: float, label: str,
         # and -300% troughs seen with cubic interpolation on short-dated chains)
         Z = np.clip(Z, hard_lo, hard_hi)
 
-        # Gentle Gaussian smoothing to remove remaining interpolation ripple
-        Z = gaussian_filter(Z, sigma=1.0)
+        # ── Change 8: sigma=1.2 Gaussian smooth + re-clip after ──────────
+        Z = gaussian_filter(Z, sigma=1.2)
+        Z = np.clip(Z, hard_lo, hard_hi)
 
         # ── Skew & term structure metrics from raw data ───────────────────
         def _avg(mask): return float(df[mask]["iv"].mean() * 100) if mask.sum() > 0 else float("nan")
@@ -566,23 +578,28 @@ def _ivsurf_from_chain(chain_df, spot: float, label: str,
             x=dte_grid,
             y=m_grid * 100,   # display as moneyness %
             z=Z,
+            # ── Change 4: plasma-inspired colorscale ─────────────────────
             colorscale=[
-                [0.0,  "#1e3a5f"],   # deep blue   — low IV (cheap OTM calls)
-                [0.25, "#2563eb"],   # blue
-                [0.45, "#10b981"],   # green        — near ATM
-                [0.65, "#f59e0b"],   # amber
-                [0.85, "#ef4444"],   # red
-                [1.0,  "#7f1d1d"],   # dark red     — extreme OTM put skew
+                [0.00, "#0d0221"],
+                [0.20, "#5c1a8a"],
+                [0.45, "#c0392b"],
+                [0.70, "#e67e22"],
+                [0.85, "#f1c40f"],
+                [1.00, "#ffffcc"],
             ],
             showscale=True,
             colorbar=dict(title="IV%", thickness=14, len=0.75),
             opacity=0.95,
-            contours=dict(z=dict(show=False))
+            # ── Change 5: disable contour floor projection ───────────────
+            contours=dict(
+                z=dict(show=False),
+            ),
             lighting=dict(ambient=0.7, diffuse=0.8, roughness=0.5, specular=0.3),
             lightposition=dict(x=100, y=200, z=0),
         ))
 
-        plotly_dark(fig, title=f"IV Surface — {label}  |  {regime_note}  |  {skew_str}  |  {ts_str}  ({n_points} pts)", height=460)
+        # ── Change 7: updated title with spot + ATM IV ───────────────────
+        plotly_dark(fig, title=f"SPX Implied Volatility Surface | Spot: {spot:,.2f} | ATM IV: {atm_iv_est:.1f}%", height=460)
         fig.update_layout(
             scene=dict(
                 xaxis=dict(title="DTE", backgroundcolor="rgba(0,0,0,0)",
@@ -592,7 +609,8 @@ def _ivsurf_from_chain(chain_df, spot: float, label: str,
                 zaxis=dict(title="IV%", backgroundcolor="rgba(0,0,0,0)",
                            gridcolor="rgba(255,255,255,0.08)", showbackground=True),
                 bgcolor="rgba(0,0,0,0)",
-                camera=dict(eye=dict(x=1.6, y=-1.6, z=0.9)),  # better default angle
+                # ── Change 6: updated camera angle ───────────────────────
+                camera=dict(eye=dict(x=-1.8, y=-1.5, z=0.8)),
             ),
             margin=dict(l=0, r=0, t=50, b=0),
         )

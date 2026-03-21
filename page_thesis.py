@@ -12,7 +12,7 @@ from config import GammaState, GammaRegime, CSS
 from utils import _to_1d, zscore, resample_ffill, current_pct_rank
 from ui_components import plotly_dark
 from data_loaders import load_macro, get_gex_from_yfinance
-from gex_engine import (build_gamma_state, compute_gwas,
+from gex_engine import (build_gamma_state, compute_gwas, compute_gex_from_chain, compute_dealer_greeks,
                          compute_gex_term_structure, compute_flow_imbalance)
 from schwab_api import get_schwab_client, schwab_get_spot, schwab_get_options_chain
 from signals import compute_leading_stack, compute_1d_prob
@@ -366,7 +366,7 @@ def _rdist_fig(spy: pd.Series, idx, rd: Dict) -> go.Figure:
     return fig
 
 def _recession_stress(sahm: float, hy: float, s2s10_bp: float,
-                      ur: float, vix: float) -> dict:
+                      ur_3m_chg: float, vix: float) -> dict:
     """
     Recession Stress Index — a composite indicator, NOT a calibrated probability.
 
@@ -382,7 +382,7 @@ def _recession_stress(sahm: float, hy: float, s2s10_bp: float,
       - Sahm Rule: 35% (most reliable real-time signal, Sahm 2019)
       - HY OAS:    25% (credit leads equity and employment)
       - Yield curve:20% (classic Estrella-Mishkin probit)
-      - UR trend:  12% (labor deterioration confirms)
+      - UR 3M Δ:  12% (3-month unemployment change — independent from Sahm)
       - VIX:        8% (financial conditions proxy)
 
     Output is mapped to [0, 99] via a logistic function to avoid the
@@ -403,9 +403,11 @@ def _recession_stress(sahm: float, hy: float, s2s10_bp: float,
     # -150bp = deep inversion (strong recession signal), +50bp = normal
     curve_z = np.clip((-s2s10_bp - 0) / 150, 0, 1)  # 0 at flat, 1 at -150bp
 
-    # UR trend: rising unemployment is bearish
-    # proxy via sahm being non-zero (sahm = 3M avg minus 12M min)
-    ur_z = np.clip(sahm / 0.3, 0, 1)  # reuse sahm as UR trend proxy
+    # UR trend: 3-month change in unemployment rate.
+    # 0.0pp = stable, +0.3pp = deteriorating, +0.5pp = Sahm trigger territory.
+    # Normalise against the 0.5pp historical recession-onset threshold.
+    # ur_3m_chg is the actual 3M unemployment change passed in (not sahm).
+    ur_z = np.clip(ur_3m_chg / 0.4, 0, 1)  # 0=stable, 1=Sahm-level deterioration
 
     # VIX: 15=normal, 25=elevated, 40=crisis
     vix_z = np.clip((vix - 15) / 35, 0, 1)
@@ -434,7 +436,7 @@ def _recession_stress(sahm: float, hy: float, s2s10_bp: float,
             "sahm_contribution":  round(0.35 * sahm_z * 100, 1),
             "hy_contribution":    round(0.25 * hy_z   * 100, 1),
             "curve_contribution": round(0.20 * curve_z * 100, 1),
-            "ur_contribution":    round(0.12 * ur_z    * 100, 1),
+            "ur_3m_contribution": round(0.12 * ur_z    * 100, 1),
             "vix_contribution":   round(0.08 * vix_z   * 100, 1),
         },
         "note": (
@@ -444,18 +446,47 @@ def _recession_stress(sahm: float, hy: float, s2s10_bp: float,
         ),
     }
 
-def _composite(prob: dict, fear: float, vrp_val: float, gex: GammaRegime) -> int:
-    s=int(round((prob.get("bull_prob",50)-50)/12.5))
-    if fear>70: s-=2
-    elif fear>55: s-=1
-    elif fear<35: s+=1
+def _composite(prob: dict, vrp_val: float) -> int:
+    """
+    Signed ±10 composite score built from four non-overlapping signal buckets.
+
+    Inputs chosen to avoid double-counting:
+      - tactical_prob  (5D):  VIX term structure + DXY momentum
+      - short_prob    (21D):  HYG/LQD credit, small-cap leadership, liquidity impulse
+      - medium_prob   (63D):  Yield curve phase, copper/gold, credit impulse, real rates
+      - VRP:                  Variance risk premium — orthogonal to all three buckets above
+
+    Deliberately excluded:
+      - bull_prob: already blends fear (via coincident_conditions) and GEX adjustment
+        internally inside compute_prob_composite. Using it here would double-count
+        both signals.
+      - fear_score: enters via coincident_conditions → bull_prob → already in medium/short
+      - GEX regime: already applied as gex_adjustment inside compute_prob_composite
+
+    Scoring: each bucket mapped from [0,100] → [-2.5, +2.5] points.
+    VRP adds ±0.5 as a tiebreaker.
+    Total range: ±10.5, clipped to ±10.
+    """
+    def _bucket_score(p: float) -> float:
+        """Map 0-100 probability to [-2.5, +2.5] score, linear through 50."""
+        return (p - 50.0) / 20.0  # 50→0, 70→+1, 30→-1, 90→+2, 10→-2
+
+    tactical = prob.get("tactical_prob", 50.0)
+    short    = prob.get("short_prob",    50.0)
+    medium   = prob.get("medium_prob",   50.0)
+
+    # Equal-weight the three horizon buckets (no cross-horizon blending bias)
+    s = _bucket_score(tactical) + _bucket_score(short) + _bucket_score(medium)
+
+    # VRP is genuinely orthogonal: options pricing premium above/below realised vol
+    # Not in any signal bucket. Adds ±0.5 as a tiebreaker only.
     if np.isfinite(vrp_val):
-        if vrp_val>3: s-=1
-        elif vrp_val<-2: s+=1
-    if gex==GammaRegime.STRONG_NEGATIVE: s-=2
-    elif gex==GammaRegime.NEGATIVE: s-=1
-    elif gex==GammaRegime.STRONG_POSITIVE: s+=1
-    return int(np.clip(s,-10,10))
+        if vrp_val > 4:    s -= 0.5   # IV much > RV = fear premium = mild bearish
+        elif vrp_val > 2:  s -= 0.25
+        elif vrp_val < -2: s += 0.25  # IV below RV = complacency or trending
+        elif vrp_val < -4: s += 0.5
+
+    return int(np.clip(round(s), -10, 10))
 
 def _verdict(c: int, gex: GammaRegime) -> Tuple[str,str,str]:
     neg=gex in (GammaRegime.NEGATIVE,GammaRegime.STRONG_NEGATIVE)
@@ -529,6 +560,112 @@ def _gl(term,defn):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+
+def _gex_histogram(chain_df, spot: float, flip: float,
+                   max_dte: int = 45, height: int = 360) -> go.Figure:
+    """
+    GEX bar chart derived directly from the live options chain.
+    Pulls net GEX per strike from compute_gex_from_chain (same engine as
+    the GEX Engine page) so the bars are identical to what you see there.
+
+    Green = positive GEX (dealers long gamma, stabilising).
+    Red    = negative GEX (dealers short gamma, amplifying).
+    Yellow dashed = gamma flip level.
+    White dotted  = current spot.
+    """
+    _C_POS  = "#10b981"
+    _C_NEG  = "#ef4444"
+    _C_FLIP = "#f59e0b"
+
+    if chain_df is None or len(chain_df) == 0:
+        fig = go.Figure()
+        plotly_dark(fig, title="GEX Histogram (no chain data)", height=height)
+        return fig
+
+    try:
+        near_chain = chain_df[chain_df["expiry_T"] <= max_dte / 365.0].copy()
+        if near_chain.empty:
+            near_chain = chain_df.copy()
+
+        gex_chain = compute_gex_from_chain(near_chain, spot)
+
+        # Aggregate net GEX by strike across all expirations
+        agg = (gex_chain.groupby("strike")["net_gex"]
+                        .sum()
+                        .reset_index()
+                        .sort_values("strike"))
+
+        # Filter to ±10% around spot for readability
+        lo, hi = spot * 0.90, spot * 1.10
+        agg = agg[(agg["strike"] >= lo) & (agg["strike"] <= hi)]
+
+        if agg.empty:
+            raise ValueError("No strikes in ±10% range")
+
+        strikes = agg["strike"].tolist()
+        vals_m  = (agg["net_gex"] / 1e6).tolist()   # $ millions
+
+        # Auto-scale to $B if large
+        max_abs = max(abs(v) for v in vals_m)
+        if max_abs >= 5000:
+            vals_display = [v / 1000 for v in vals_m]
+            unit = "$B"
+        else:
+            vals_display = vals_m
+            unit = "$M"
+
+        colors = [_C_POS if v > 0 else _C_NEG for v in vals_display]
+
+        fig = go.Figure(go.Bar(
+            x=strikes,
+            y=vals_display,
+            marker_color=colors,
+            marker_line_width=0,
+            opacity=0.88,
+            name="Net GEX",
+        ))
+
+        # Zero line
+        fig.add_hline(y=0, line_color="rgba(255,255,255,0.30)", line_width=1)
+
+        # Spot line
+        fig.add_vline(
+            x=spot, line_dash="dot",
+            line_color="rgba(255,255,255,0.75)", line_width=1.5,
+            annotation_text=f"SPOT {spot:.0f}",
+            annotation_font_size=10,
+            annotation_font_color="rgba(255,255,255,0.85)",
+            annotation_position="top right",
+        )
+
+        # Gamma flip line
+        if flip and lo < flip < hi:
+            fig.add_vline(
+                x=flip, line_dash="dash",
+                line_color=_C_FLIP, line_width=1.5,
+                annotation_text=f"FLIP {flip:.0f}",
+                annotation_font_size=10,
+                annotation_font_color=_C_FLIP,
+                annotation_position="top left",
+            )
+
+        # Centre x-axis on spot
+        x_pad = max(abs(hi - spot), abs(spot - lo)) * 1.05
+        fig.update_layout(
+            xaxis=dict(range=[spot - x_pad, spot + x_pad], title="Strike"),
+            yaxis_title=f"Net GEX ({unit})",
+            bargap=0.12,
+            showlegend=False,
+        )
+        plotly_dark(fig, title=f"GEX Histogram — {unit} per Strike (≤{max_dte} DTE)", height=height)
+        return fig
+
+    except Exception as exc:
+        fig = go.Figure()
+        plotly_dark(fig, title=f"GEX Histogram (error: {exc})", height=height)
+        return fig
+
+
 def render_thesis_page():
     st.markdown(CSS, unsafe_allow_html=True)
     st.markdown("## 📋 Daily Thesis Briefing")
@@ -588,7 +725,7 @@ def render_thesis_page():
     threeP=float(np.clip(0.35*trp+0.35*fp+0.30*tp,0,100))
     # Recession Stress Index — regime-calibrated stress score, NOT a calibrated probability
     # Using pre-quotes yield curve (crl) and pre-quotes VIX (vl); updated after quotes below
-    _stress = _recession_stress(sahmv, hyv, crl, ur, vl)
+    _stress = _recession_stress(sahmv, hyv, crl, u3m, vl)
     rec     = _stress["score"]
     rec_lbl = _stress["label"]
     sr=_to_1d(spy).reindex(idx).ffill().pct_change().dropna()
@@ -629,9 +766,13 @@ def render_thesis_page():
             tstr=compute_gex_term_structure(chain_df,float(gex_spot))
             fl=compute_flow_imbalance(chain_df,float(gex_spot))
             net_gex=gex_st.total_gex; gex_score=int(np.clip(net_gex/1e9*10,-50,50))
+            # ATM IV from chain: strikes within ±1% of spot, averaged across expirations
+            _atm_m = chain_df["strike"].between(float(gex_spot)*0.99, float(gex_spot)*1.01)
+            _atm_v = chain_df[_atm_m]["iv"].dropna()
+            atm_iv_chain = float(_atm_v.mean() * 100) if len(_atm_v) > 0 else None
         else:
             gex_st=GammaState(data_source="unavailable",timestamp=dt.datetime.now().strftime("%H:%M:%S"))
-            gwas=tstr=fl={}; net_gex=gex_score=0
+            gwas=tstr=fl={}; net_gex=gex_score=0; atm_iv_chain=None
 
     flip=gex_st.gamma_flip or gex_spot
     upper=gex_st.key_resistance[0] if gex_st.key_resistance else gex_spot*1.03
@@ -666,7 +807,7 @@ def render_thesis_page():
         s_2s10s=s2s10,net_liq_4w=nl4w,nfci_z=nz,fear_score=fear,
         session=get_session_context(),idx=idx,sahm_rule=sahm,hy_spread=hys)
 
-    comp=_composite(prob,fear,vrp["val"],gex_st.regime)
+    comp=_composite(prob,vrp["val"])
     vrd,vc,ve=_verdict(comp,gex_st.regime)
     news=_news_cats(cat_intel)
     ua="NQ" if gex_sym in ("QQQ","NDX") else "ES"
@@ -681,7 +822,7 @@ def render_thesis_page():
          +_pill(f"Market Regime: {macro_reg}",reg_col)
          +_pill(f"Fear Level: {fl2} ({fear:.2f})",fc)
          +_pill(f"Liquidity: {liq_lab} (${abs(nl4wv):.0f}B)","#10b981" if nl4wv>=0 else "#ef4444")
-         +_pill(f"Stress Index: {rec:.0f}/100 ({rec_lbl})","#ef4444" if rec>50 else "#f59e0b" if rec>30 else "#10b981")
+         +_pill(f"Recession P(6m): {rec:.1f}%","#ef4444" if rec>50 else "#f59e0b" if rec>30 else "#10b981")
          +"</div>")
     strip=("<div style='display:grid;grid-template-columns:repeat(9,1fr);gap:6px;'>"
            +_tk("SPX",spx,q.get("SPX_pct",float("nan")))
@@ -721,8 +862,12 @@ def render_thesis_page():
          +_kv("21D RV",f"{vrp['rv21']:.2f}%" if np.isfinite(vrp['rv21']) else "N/A")
          +_kv("VRP Spread",f"{vrp['spread']:+.2f}" if np.isfinite(vrp['spread']) else "N/A",vc2)
          +"<div style='margin-top:8px;font-size:10px;color:rgba(255,255,255,0.4);letter-spacing:0.1em;'>ATM IV</div>"
-         +_kv("SPX ATM IV",f"{vix_live:.1f}%")
-         +_kv("NDX ATM IV",f"{vix_live*0.88:.1f}%")
+         +_kv("SPX ATM IV",
+              f"{atm_iv_chain:.1f}%" if (atm_iv_chain and gex_sym in ("SPY","SPX"))
+              else f"{vix_live:.1f}% (VIX proxy)")
+         +_kv("NDX ATM IV",
+              f"{atm_iv_chain:.1f}%" if (atm_iv_chain and gex_sym in ("QQQ","NDX"))
+              else f"{q.get('VIX3M_last', vix_live * 0.92):.1f}% (VIX3M proxy)")
          +"</div></div>")
     st.markdown(_card(vol),unsafe_allow_html=True)
 
@@ -734,14 +879,17 @@ def render_thesis_page():
     else:
         narr=f"Neutral dealer positioning ({gex_score:+d}): Near gamma flip — binary risk, reduce size."
 
+    # Section 3: show both ETF and SPX-equivalent levels
+    _g3_mult = 10.0 if gex_sym in ("SPY",) else 40.0 if gex_sym in ("QQQ",) else 1.0
+    _g3_label = "SPX" if gex_sym in ("SPY","SPX") else "NDX" if gex_sym in ("QQQ","NDX") else gex_sym
     gleft=("<div>"
-           +f"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>GEX LEVELS ({gex_sym})</div>"
-           +_kv(f"{gex_sym} Spot",f"{float(gex_spot):.2f}","#fff")
-           +_kv("GEX Flip",f"{flip:.2f}","#f59e0b")
-           +_kv("GEX Upper",f"{upper:.2f}","#10b981")
-           +_kv("GEX Lower",f"{lower:.2f}","#ef4444")
-           +_kv("GWAS Above",f"{gwas_a:.2f}" if gwas_a else "N/A","#6366f1")
-           +_kv("GWAS Below",f"{gwas_b:.2f}" if gwas_b else "N/A","#6366f1")
+           +f"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>GEX LEVELS ({gex_sym} → {_g3_label})</div>"
+           +_kv(f"{_g3_label} Spot",f"{spx:,.2f}","#fff")
+           +_kv("GEX Flip",f"{flip*_g3_mult:,.2f}","#f59e0b")
+           +_kv("GEX Upper",f"{upper*_g3_mult:,.2f}","#10b981")
+           +_kv("GEX Lower",f"{lower*_g3_mult:,.2f}","#ef4444")
+           +_kv("GWAS Above",f"{gwas_a*_g3_mult:,.2f}" if gwas_a else "N/A","#6366f1")
+           +_kv("GWAS Below",f"{gwas_b*_g3_mult:,.2f}" if gwas_b else "N/A","#6366f1")
            +_kv("GEX Regime",gex_reg,gex_rc)
            +"</div>")
     gright=("<div>"
@@ -749,7 +897,7 @@ def render_thesis_page():
             +_kv("P/C Dollar Ratio",f"{pcr:.2f}","#ef4444" if pcr>1.3 else "#10b981" if pcr<0.8 else "#94a3b8")
             +_kv("Flow Bias",fb.upper(),"#ef4444" if fb=="bearish" else "#10b981" if fb=="bullish" else "#94a3b8")
             +_kv("GEX Duration",f"{dur} ({frag:.0f}% weekly)","#ef4444" if dur=="FRAGILE" else "#10b981")
-            +_kv("Net GEX",f"${gex_st.total_gex/1e9:.2f}B" if gex_st.total_gex else "N/A")
+            +_kv("Net GEX",f"${gex_st.total_gex/1e9:.1f}B" if (gex_st.total_gex and abs(gex_st.total_gex)>=1e9) else f"${gex_st.total_gex/1e6:.0f}M" if gex_st.total_gex else "N/A")
             +_kv("Dist to Flip",f"{gex_st.distance_to_flip_pct:+.2f}%"))
     if show_ua:
         gright+=("<div style='margin-top:8px;border-top:1px solid rgba(255,255,255,0.08);padding-top:6px;'>"
@@ -767,6 +915,13 @@ def render_thesis_page():
               +f"font-size:12px;color:rgba(255,255,255,0.65);font-style:italic;'>"
               +f"<span style='color:{gex_rc};font-weight:700;'>{gex_reg}</span> — {narr}</div>")
     st.markdown(_card(gex_body),unsafe_allow_html=True)
+
+    # ── 3b. GEX HISTOGRAM ────────────────────────────────────────────────
+    st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>GEX HISTOGRAM — Net Gamma Exposure per Strike</div>",unsafe_allow_html=True)
+    st.plotly_chart(
+        _gex_histogram(chain_df if chain_df is not None else None, float(gex_spot), float(flip)),
+        use_container_width=True, key="th_gex_hist"
+    )
 
     # ── 4. PROBABILITY HEATMAP ────────────────────────────────────────────
     st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>4. PROBABILITY HEATMAP — MC Simulation</div>",unsafe_allow_html=True)
@@ -808,7 +963,7 @@ def render_thesis_page():
     nr=""
     for cat in news[:6]:
         s=cat["sentiment"]; col=("#10b981" if s>0.01 else "#ef4444" if s<-0.01 else "#94a3b8")
-        sign="+" if s>0 else ""
+        sign="+" if s>0.00005 else ("" if abs(s)<0.00005 else "")
         nr+=(f"<span style='font-size:11px;font-family:monospace;margin-right:10px;'>"
              f"<span style='color:rgba(255,255,255,0.5);'>{cat['icon']} {cat['label'].split('&')[0].strip().lower()}</span>: "
              f"<span style='color:{col};font-weight:600;'>{sign}{s:.4f}</span> "
@@ -840,20 +995,23 @@ def render_thesis_page():
     sigs=(_sig("✅" if vp else "⚠️",f"VRP {'positive' if vp else 'negative'} ({vs2})")
           +_sig("⚠️" if fear>55 else "✅",f"Fear composite {fl2}")
           +_sig("🔴" if rec>60 else "🟡" if rec>35 else "🟢",
-                f"Stress Index {rec_lbl.lower()} ({rec:.0f}/100) — composite of Sahm, HY OAS, yield curve, VIX")
-          +_sig("🔴" if "NEGATIVE" in gex_reg.upper() else "🟢",f"GEX: {gex_reg}")
-          +_sig("📊",f"Dominant 1D: {p1d.get('dominant_signal','—')} ({p1d.get('dominant_dir','neutral')})"))
+                f"Recession risk {'elevated' if rec>60 else 'moderate' if rec>35 else 'low'} ({rec:.1f}%)"))
+    # Convert GEX levels to SPX scale for display (GEX symbol may be SPY=1/10 SPX)
+    _kls_mult = 10.0 if gex_sym in ("SPY","SPX") else 40.0 if gex_sym in ("QQQ","NDX") else 1.0
+    _flip_disp  = flip  * _kls_mult if gex_sym in ("SPY","QQQ") else flip
+    _upper_disp = upper * _kls_mult if gex_sym in ("SPY","QQQ") else upper
+    _lower_disp = lower * _kls_mult if gex_sym in ("SPY","QQQ") else lower
     kls=(_kv("SPX Spot",f"{spx:,.2f}","#fff")
-         +_kv("GEX Flip",f"{flip:,.2f}","#f59e0b")
-         +_kv("GEX Upper",f"{upper:,.2f}","#10b981")
-         +_kv("GEX Lower",f"{lower:,.2f}","#ef4444")
+         +_kv("GEX Flip",f"{_flip_disp:,.2f}","#f59e0b")
+         +_kv("GEX Upper",f"{_upper_disp:,.2f}","#10b981")
+         +_kv("GEX Lower",f"{_lower_disp:,.2f}","#ef4444")
          +_kv("1σ Daily",f"{b['d1lo']:,.2f} — {b['d1hi']:,.2f}")
          +_kv("2σ Daily",f"{b['d2lo']:,.2f} — {b['d2hi']:,.2f}")
          +_kv("1σ Weekly",f"{b['w1lo']:,.2f} — {b['w1hi']:,.2f}")
          +_kv("2σ Weekly",f"{b['w2lo']:,.2f} — {b['w2hi']:,.2f}"))
     risks=[]
     if fear>60: risks.append(("⚠️","Elevated fear composite — potential for sharp moves"))
-    if rec>50: risks.append(("🔴",f"Stress Index {rec:.0f}/100 ({rec_lbl}) — Sahm={sahmv:.3f}, HY={hyv:.0f}bp, curve={crl:.0f}bp"))
+    if rec>50: risks.append(("⚠️",f"Recession probability at {rec:.1f}% — monitor labor data"))
     if np.isfinite(stlc) and stlc>0.2: risks.append(("⚠️","Positive stock-bond correlation — diversification impaired"))
     if "NEGATIVE" in gex_reg.upper(): risks.append(("🔴","Negative gamma regime — dealer hedging amplifies moves. No fading."))
     if dur=="FRAGILE": risks.append(("⚠️",f"GEX regime fragile — {frag:.0f}% of gamma ≤7 DTE. Levels expire by Friday."))

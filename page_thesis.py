@@ -785,59 +785,101 @@ def _rdist_fig(spy: pd.Series, idx, rd: Dict, spot: float = float("nan")) -> go.
 
 def _recession_stress(sahm: float, hy: float, s2s10_bp: float,
                       icsa_4w_chg: float, vix: float,
-                      icsa_series: "pd.Series | None" = None) -> dict:
+                      icsa_series: "pd.Series | None" = None,
+                      spx_dd: float = 0.0, epu_z: float = 0.0) -> dict:
+    """
+    Recession Stress Index — composite of leading recession indicators.
+
+    Components and weights:
+      Sahm Rule         35%  — best single real-time recession indicator
+      HY OAS            20%  — credit market leads equity by 2-6 weeks
+      Yield curve       15%  — 2s10s inversion predicts recessions 6-18M out
+      ICSA claims       12%  — weekly labor market deterioration
+      VIX level          8%  — market-implied stress
+      SPX drawdown       5%  — equity market pricing recession risk
+      EPU z-score        5%  — policy uncertainty (tariffs, trade war)
+
+    Calibration notes:
+      - Sigmoid centre shifted from 0.50 to 0.35: the old centre required
+        the majority of indicators to be firing before the score exceeded 50%.
+        In a tariff-shock environment with HY OAS at 400bp, VIX elevated, and
+        growth decelerating, raw ≈ 0.35-0.45 which the old sigmoid mapped to
+        only 25-40%. Shifting centre to 0.35 means moderate multi-indicator
+        stress correctly reads as elevated (50-65%).
+      - Sigmoid steepness kept at 8: preserves a full 0-100 output range.
+      - HY OAS thresholds: 350bp baseline (post-GFC normal), 800bp max
+        (GFC peak). Old range was 300-1000bp which undersized current 400bp.
+      - Label gates lowered: ELEVATED at HY>375bp or Sahm>=0.35 (old: 600/0.5).
+        400bp HY OAS during a growth scare IS elevated credit stress.
+    """
     from scipy.special import expit as _sigmoid
 
+    # ── Component z-scores (all clipped 0-1) ─────────────────────────────
     sahm_z  = np.clip(sahm / 0.4, 0, 1)
-    hy_z    = np.clip((hy - 300) / 700, 0, 1)
-    curve_z = np.clip((-s2s10_bp - 0) / 150, 0, 1)
+
+    # HY OAS: 350bp = baseline, 800bp = max stress (GFC = ~2000bp, 2020 = ~1100bp)
+    # Old range was 300-1000bp which undersized a current 400bp read
+    hy_z    = np.clip((hy - 350) / 450, 0, 1)
+
+    # Curve: -150bp inversion = max (historically predicts recessions reliably)
+    curve_z = np.clip((-s2s10_bp) / 150, 0, 1)
+
+    # VIX: 15 = calm, 50 = crisis
     vix_z   = np.clip((vix - 15) / 35, 0, 1)
 
-    # ICSA normalization: rolling z-score against 52-week history.
-    # The old threshold (clip to 0.20 = 20% 4W surge) pegged at 1.0 too
-    # quickly and lost all granularity during actual crises.  A rolling
-    # z-score preserves signal across the full historical range:
-    #   calm period (+5% claims)   → ~0.1–0.2
-    #   mild slowdown (+10%)       → ~0.3–0.5
-    #   2001/2008-type (+30–50%)   → ~0.8–0.95
-    #   2020 COVID spike           → ~1.0 (pegs only at 3σ+)
-    # 3σ normalisation: score=1 at a 3σ spike (2008/COVID-level), not 20%.
+    # SPX drawdown from 6M high: -7% = mild, -25% = severe
+    dd_z    = np.clip(-spx_dd / 0.20, 0, 1)   # spx_dd is negative (e.g. -0.12 = -12%)
+
+    # EPU z-score: policy uncertainty (tariff shock → high EPU)
+    epu_zz  = np.clip(epu_z / 2.0, 0, 1)      # 2σ EPU spike = max contribution
+
+    # ICSA: rolling z-score normalisation (see comment in body)
     if icsa_series is not None and icsa_series.dropna().size >= 26:
-        _ic = icsa_series.dropna()
+        _ic   = icsa_series.dropna()
         _mean = float(_ic.rolling(52, min_periods=26).mean().iloc[-1])
         _std  = float(_ic.rolling(52, min_periods=26).std().iloc[-1])
         if np.isfinite(_mean) and _std > 0:
-            _zscore_icsa = (_ic.iloc[-1] - _mean) / _std
-            icsa_z = float(np.clip(_zscore_icsa / 3.0, 0, 1))
+            icsa_z = float(np.clip((_ic.iloc[-1] - _mean) / (_std * 3.0), 0, 1))
         else:
             icsa_z = float(np.clip(icsa_4w_chg / 0.20, 0, 1))
     else:
-        # Fallback to pct-change method when insufficient history
         icsa_z = float(np.clip(icsa_4w_chg / 0.20, 0, 1))
 
-    raw = (0.35 * sahm_z + 0.25 * hy_z + 0.20 * curve_z
-           + 0.12 * icsa_z + 0.08 * vix_z)
+    # ── Weighted composite ────────────────────────────────────────────────
+    raw = (0.35 * sahm_z + 0.20 * hy_z + 0.15 * curve_z
+           + 0.12 * icsa_z + 0.08 * vix_z + 0.05 * dd_z + 0.05 * epu_zz)
 
-    score = float(_sigmoid((raw - 0.5) * 8) * 100)
+    # Sigmoid: centre=0.35 (not 0.50). At raw=0.35 → score=50.
+    # This means moderate multi-indicator stress (HY 400bp + VIX 25 + flat curve)
+    # correctly reads as elevated rather than benign.
+    score = float(_sigmoid((raw - 0.35) * 8) * 100)
     score = round(np.clip(score, 1, 99), 1)
 
-    if sahm >= 0.50 or hy > 600:   label = "ELEVATED"
-    elif sahm >= 0.30 or hy > 420: label = "MODERATE"
-    else:                           label = "LOW"
+    # Label gates: reflect current-environment thresholds
+    # ELEVATED: Sahm ≥0.35 (labour mkt deteriorating) OR HY OAS >375bp (credit stress)
+    # MODERATE: Sahm ≥0.20 OR HY OAS >320bp OR VIX >25 sustained
+    if sahm >= 0.35 or hy > 375 or score > 60:
+        label = "ELEVATED"
+    elif sahm >= 0.20 or hy > 320 or vix > 25:
+        label = "MODERATE"
+    else:
+        label = "LOW"
 
     return {
         "score": score, "label": label,
         "components": {
             "sahm_contribution":    round(0.35 * sahm_z  * 100, 1),
-            "hy_contribution":      round(0.25 * hy_z    * 100, 1),
-            "curve_contribution":   round(0.20 * curve_z * 100, 1),
+            "hy_contribution":      round(0.20 * hy_z    * 100, 1),
+            "curve_contribution":   round(0.15 * curve_z * 100, 1),
             "icsa_4w_contribution": round(0.12 * icsa_z  * 100, 1),
             "vix_contribution":     round(0.08 * vix_z   * 100, 1),
+            "drawdown_contribution":round(0.05 * dd_z    * 100, 1),
+            "epu_contribution":     round(0.05 * epu_zz  * 100, 1),
         },
         "note": (
-            "Recession Stress Index — NOT a calibrated probability. "
-            "Use Cleveland Fed CFNAI model or Estrella-Mishkin probit for "
-            "statistically grounded recession probabilities."
+            "Recession Stress Index — composite of leading indicators. "
+            "NOT a calibrated probability model. Centre=0.35 sigmoid. "
+            "Use Estrella-Mishkin probit or Cleveland Fed for calibrated recession probs."
         ),
     }
 
@@ -1102,7 +1144,54 @@ def render_thesis_page():
     net_liq=(walcl-tga-rrp)/1000
     nl4w=net_liq.diff(28); bs13=walcl.diff(91)/1000
     cyl=_sl(core_yoy,2.5); crl=_sl(s2s10,0.0)
-    macro_reg=classify_macro_regime_abs(cyl,crl)
+
+    # ── Macro regime — local classification ───────────────────────────────
+    # classify_macro_regime_abs in probability.py uses thresholds calibrated
+    # for a post-2021 inflationary world. In a tariff-shock / growth-scare
+    # environment where core CPI is decelerating rapidly and the curve is
+    # flat-to-inverted, it systematically reads "Goldilocks" or "Overheating"
+    # when the correct read is "Disinflation" or "Deflation Risk".
+    #
+    # 2×2 framework (growth z-score × inflation z-score):
+    #   Growth proxy:    2s10s spread (steepening = growth optimism)
+    #   Inflation proxy: core CPI YoY (level AND direction of travel)
+    #
+    # Quadrants:
+    #   Growth+, Inflation+  → Overheating   (curve steep, CPI hot)
+    #   Growth+, Inflation−  → Goldilocks    (curve steep, CPI cooling)
+    #   Growth−, Inflation+  → Stagflation   (curve flat/inv, CPI still hot)
+    #   Growth−, Inflation−  → Deflation     (curve flat/inv, CPI cooling)
+    #
+    # Additionally flag "Disinflation" when CPI is decelerating fast even if
+    # still above 2% — this is the current environment (CPI falling from 3%+
+    # toward 2% with growth uncertainty from tariff shock).
+    _gz_now  = _sl(gz, 0.0)   # 2s10s z-score
+    _iz_now  = _sl(iz, 0.0)   # core CPI YoY z-score
+    # Direction of travel: is core CPI trending down over the past 3 months?
+    _core_3m_chg = float(core_yoy.dropna().diff(63).dropna().iloc[-1]) if core_yoy.dropna().size > 63 else 0.0
+    _disinflating = _core_3m_chg < -0.10   # falling >10bp over 3M = clear disinflation trend
+
+    if _gz_now >= 0 and _iz_now >= 0:
+        macro_reg = "Overheating"
+    elif _gz_now >= 0 and _iz_now < 0:
+        macro_reg = "Goldilocks"
+    elif _gz_now < 0 and _iz_now >= 0:
+        # Stagflation — but if CPI is actively falling, soften to Disinflation
+        macro_reg = "Disinflation" if _disinflating else "Stagflation"
+    else:
+        # Growth−, Inflation−
+        macro_reg = "Deflation" if _iz_now < -0.5 else "Disinflation"
+
+    # Override: external regime classifier for continuity with other pages
+    # (only use if it returns a non-default value)
+    try:
+        _ext_reg = classify_macro_regime_abs(cyl, crl)
+        # Only trust it when it's in strong agreement with our z-score read
+        # i.e. don't let it override a Deflation/Disinflation call with Goldilocks
+        if _ext_reg in ("Stagflation", "Deflation") and macro_reg not in ("Overheating",):
+            macro_reg = _ext_reg
+    except Exception:
+        pass
     gz=zscore(s2s10.fillna(0)); iz=zscore(core_yoy.fillna(cyl))
 
     _hys_filled = (hys.fillna(hys.dropna().mean())
@@ -1158,7 +1247,12 @@ def render_thesis_page():
     tgadd=(tga.diff(28)<0).astype(int); rrpd=(rrp<50).astype(int)
     trp=float(np.clip(50+20*float(tgadd.iloc[-1])+15*float(rrpd.iloc[-1])+15*float(nl4w.iloc[-1]>=0),0,100))
     threeP=float(np.clip(0.35*trp+0.35*fp+0.30*tp,0,100))
-    _stress = _recession_stress(sahmv, hyv, crl, icsa_4w_chg, vl, icsa_series=icsa)
+    _stress = _recession_stress(
+        sahmv, hyv, crl, icsa_4w_chg, vl,
+        icsa_series=icsa,
+        spx_dd=float(spydd.iloc[-1]),    # SPX 6M drawdown (negative number)
+        epu_z=float(epuz.dropna().iloc[-1]) if epuz.dropna().size > 0 else 0.0,
+    )
     rec     = _stress["score"]
     rec_lbl = _stress["label"]
     sr=_to_1d(spy).reindex(idx).ffill().pct_change().dropna()
@@ -1287,7 +1381,8 @@ def render_thesis_page():
     ua="NQ" if gex_sym in ("QQQ","NDX") else "ES"
     um=40.0 if ua=="NQ" else 10.0
     def _ua(p): return f"{p*um:,.0f}"
-    reg_col={"Goldilocks":"#10b981","Overheating":"#f59e0b","Stagflation":"#ef4444","Deflation":"#6366f1"}.get(macro_reg,"#94a3b8")
+    reg_col={"Goldilocks":"#10b981","Overheating":"#f59e0b","Stagflation":"#ef4444",
+             "Deflation":"#6366f1","Disinflation":"#06b6d4"}.get(macro_reg,"#94a3b8")
     fl2="ELEVATED" if fear_z>1.0 else "MODERATE" if fear_z>0.0 else "COMPLACENT" if fear_z<-1.0 else "LOW"
     fc="#ef4444" if fear_z>1.0 else "#f59e0b" if fear_z>0.0 else "#10b981"
 
@@ -1537,10 +1632,21 @@ def render_thesis_page():
             +_gl("Skewness & Kurtosis",
                  "Skewness = asymmetry. Negative skew = more large down moves. "
                  "High kurtosis = fat tails (extreme moves more common than normal distribution predicts).")
+            +_gl("Market Regime",
+                 "2×2 framework on rolling z-scores: Growth (2s10s) × Inflation (core CPI YoY). "
+                 "Overheating: curve steep + CPI hot. Goldilocks: curve steep + CPI cooling. "
+                 "Stagflation: curve flat/inverted + CPI still hot. "
+                 "Disinflation: curve flat + CPI actively falling (>10bp over 3M). "
+                 "Deflation: growth− + inflation z-score < −0.5σ (CPI well below trend).")
             +_gl("Recession P(6m)",
-                 "Blends Sahm Rule, HY OAS, and Three Puts backstop. Sahm: 3M avg unemployment up 0.5% above 12M low = recession onset.")
+                 "7-component stress index: Sahm (35%), HY OAS (20%), yield curve (15%), "
+                 "ICSA claims (12%), VIX (8%), SPX drawdown (5%), EPU (5%). "
+                 "Sigmoid centred at 0.35 (not 0.50) — moderate multi-indicator stress "
+                 "correctly reads ELEVATED. ELEVATED: Sahm≥0.35 or HY>375bp or score>60. "
+                 "NOT a calibrated probability — use Estrella-Mishkin for that.")
             +_gl("Net Liquidity",
-                 "Fed Balance Sheet minus TGA minus RRP. Expanding = risk asset tailwind. Contracting = headwind.")),unsafe_allow_html=True)
+                 "Fed Balance Sheet minus TGA minus RRP. Expanding = risk asset tailwind. Contracting = headwind.")),
+            unsafe_allow_html=True)
     with g13:
         st.markdown(_card(
             _sh(13,"GLOSSARY — READING THE CHARTS")

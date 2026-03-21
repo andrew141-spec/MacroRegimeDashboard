@@ -509,40 +509,50 @@ def render_thesis_page():
             val_str += f"  →  **{ua_label} {es_nq_val:,.0f}**"
         return f"**{label}:** {val_str}  \n"
 
-    levels_body = f"""
-{_section_header(3, "KEY LEVELS")}
-<div style='display:grid;grid-template-columns:1fr 1fr;gap:6px 32px;'>
-  <div>
-    <div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>GEX LEVELS ({gex_symbol})</div>
-    {_kv(f"{gex_symbol} Spot",   f"{spot:.2f}", "#fff")}
-    {_kv("GEX Flip",             f"{flip:.2f}", "#f59e0b")}
-    {_kv("GEX Upper",            f"{upper:.2f}", "#10b981")}
-    {_kv("GEX Lower",            f"{lower:.2f}", "#ef4444")}
-    {_kv("GWAS Above",           f"{gwas_above:.2f}" if gwas_above else "N/A", "#6366f1")}
-    {_kv("GWAS Below",           f"{gwas_below:.2f}" if gwas_below else "N/A", "#6366f1")}
-    {_kv("GEX Duration",         f"{dur_label} ({frag_pct:.0f}% weekly)",
-         "#ef4444" if dur_label == "FRAGILE" else "#10b981" if dur_label == "DURABLE" else "#94a3b8")}
-  </div>
-  <div>
-    <div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>σ BANDS (VIX={vix_level:.1f})</div>
-    {_kv("1σ Daily",  f"{bands['daily_1s_lo']:.2f} — {bands['daily_1s_hi']:.2f}")}
-    {_kv("2σ Daily",  f"{bands['daily_2s_lo']:.2f} — {bands['daily_2s_hi']:.2f}")}
-    {_kv("1σ Weekly", f"{bands['weekly_1s_lo']:.2f} — {bands['weekly_1s_hi']:.2f}")}
-    {_kv("2σ Weekly", f"{bands['weekly_2s_lo']:.2f} — {bands['weekly_2s_hi']:.2f}")}
-"""
+    # Build ES/NQ block first so it can be injected cleanly into the grid
+    dur_color = "#ef4444" if dur_label == "FRAGILE" else "#10b981" if dur_label == "DURABLE" else "#94a3b8"
+    gwas_above_str = f"{gwas_above:.2f}" if gwas_above else "N/A"
+    gwas_below_str = f"{gwas_below:.2f}" if gwas_below else "N/A"
+
+    esnq_block = ""
     if show_es_nq:
-        levels_body += f"""
-    <div style='margin-top:8px;border-top:1px solid rgba(255,255,255,0.08);padding-top:6px;'>
-    <div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>{ua_label} EQUIVALENT</div>
-    {_kv(f"{ua_label} Spot",  _to_ua(spot))}
-    {_kv(f"{ua_label} Flip",  _to_ua(flip), "#f59e0b")}
-    {_kv(f"{ua_label} Upper", _to_ua(upper), "#10b981")}
-    {_kv(f"{ua_label} Lower", _to_ua(lower), "#ef4444")}
-    {_kv(f"{ua_label} GWAS↑", _to_ua(gwas_above) if gwas_above else "N/A", "#6366f1")}
-    {_kv(f"{ua_label} GWAS↓", _to_ua(gwas_below) if gwas_below else "N/A", "#6366f1")}
-    </div>
-"""
-    levels_body += "</div></div>"
+        esnq_block = (
+            "<div style='margin-top:8px;border-top:1px solid rgba(255,255,255,0.08);padding-top:6px;'>"
+            + f"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>{ua_label} EQUIVALENT</div>"
+            + _kv(f"{ua_label} Spot",  _to_ua(spot))
+            + _kv(f"{ua_label} Flip",  _to_ua(flip),  "#f59e0b")
+            + _kv(f"{ua_label} Upper", _to_ua(upper), "#10b981")
+            + _kv(f"{ua_label} Lower", _to_ua(lower), "#ef4444")
+            + _kv(f"{ua_label} GWAS↑", _to_ua(gwas_above) if gwas_above else "N/A", "#6366f1")
+            + _kv(f"{ua_label} GWAS↓", _to_ua(gwas_below) if gwas_below else "N/A", "#6366f1")
+            + "</div>"
+        )
+
+    levels_body = (
+        _section_header(3, "KEY LEVELS")
+        + "<div style='display:grid;grid-template-columns:1fr 1fr;gap:6px 32px;'>"
+        # Left column — GEX levels
+        + "<div>"
+        + f"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>GEX LEVELS ({gex_symbol})</div>"
+        + _kv(f"{gex_symbol} Spot", f"{spot:.2f}", "#fff")
+        + _kv("GEX Flip",           f"{flip:.2f}",  "#f59e0b")
+        + _kv("GEX Upper",          f"{upper:.2f}", "#10b981")
+        + _kv("GEX Lower",          f"{lower:.2f}", "#ef4444")
+        + _kv("GWAS Above",         gwas_above_str, "#6366f1")
+        + _kv("GWAS Below",         gwas_below_str, "#6366f1")
+        + _kv("GEX Duration",       f"{dur_label} ({frag_pct:.0f}% weekly)", dur_color)
+        + "</div>"
+        # Right column — sigma bands + optional ES/NQ
+        + "<div>"
+        + f"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>σ BANDS (VIX={vix_level:.1f})</div>"
+        + _kv("1σ Daily",  f"{bands['daily_1s_lo']:.2f} — {bands['daily_1s_hi']:.2f}")
+        + _kv("2σ Daily",  f"{bands['daily_2s_lo']:.2f} — {bands['daily_2s_hi']:.2f}")
+        + _kv("1σ Weekly", f"{bands['weekly_1s_lo']:.2f} — {bands['weekly_1s_hi']:.2f}")
+        + _kv("2σ Weekly", f"{bands['weekly_2s_lo']:.2f} — {bands['weekly_2s_hi']:.2f}")
+        + esnq_block
+        + "</div>"
+        + "</div>"
+    )
 
     st.markdown(_card(levels_body), unsafe_allow_html=True)
 

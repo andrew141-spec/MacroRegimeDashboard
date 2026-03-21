@@ -297,9 +297,11 @@ def _forward_prob_fig(
         showscale=False, zmin=0,
     ), row=2, col=1)
 
+    # NDX terminal: compute its OWN histogram from term_ndx, not a scaled SPX one
+    hist_vals_ndx, bin_edges_ndx = np.histogram(term_ndx, bins=40, density=True)
+    bin_centers_ndx = (bin_edges_ndx[:-1] + bin_edges_ndx[1:]) / 2
     fig.add_trace(go.Bar(
-        x=hist_vals, y=[f"{(v/ndx-1)*100:+.1f}%" for v in
-                        (bin_edges[:-1] + bin_edges[1:]) / 2 / spx * ndx],
+        x=hist_vals_ndx, y=[f"{(v/ndx-1)*100:+.1f}%" for v in bin_centers_ndx],
         orientation="h", marker_color="#06b6d4", opacity=0.7,
         name="NDX terminal", showlegend=False,
     ), row=2, col=2)
@@ -615,7 +617,7 @@ def _ivrv_fig(vix_s: pd.Series, spy: pd.Series, idx) -> go.Figure:
 
     fig.add_trace(go.Scatter(
         x=list(dates) + list(dates[::-1]),
-        y=list(rv5_d.fillna(method="ffill")) + list(rv63_d.fillna(method="ffill")[::-1]),
+        y=list(rv5_d.ffill()) + list(rv63_d.ffill()[::-1]),
         fill="toself", fillcolor="rgba(6,182,212,0.12)",
         line=dict(color="rgba(0,0,0,0)"), name="5d-63d RV range",
         showlegend=True,
@@ -1255,30 +1257,38 @@ def render_thesis_page():
     _chi_val   = _chi_v                                   # index
     _conf_val  = _conf_v                                  # index
 
-    def _score(val, good_hi, good_lo, bad_hi, bad_lo):
-        """Return +1 (good), 0 (neutral), -1 (bad). Handles NaN → 0."""
+    def _score_hi_good(val, good_thresh, bad_thresh):
+        """High value = good (+1). val>=good → +1, val<=bad → -1, else 0."""
         if not np.isfinite(val): return 0
-        if val >= good_hi: return +1
-        if val <= bad_lo:  return -1
+        if val >= good_thresh: return +1
+        if val <= bad_thresh:  return -1
+        return 0
+
+    def _score_hi_bad(val, bad_thresh, good_thresh):
+        """High value = bad (-1). val>=bad → -1, val<=good → +1, else 0."""
+        if not np.isfinite(val): return 0
+        if val >= bad_thresh:  return -1
+        if val <= good_thresh: return +1
         return 0
 
     # Growth scores (+1 = expansion, -1 = contraction)
-    _g_ur    = _score(_ur_val,   -99,  -99, 5.5, 4.0) * -1  # high UR → bad growth
-    _g_icsa  = _score(_icsa_val, -99,  -99, 350, 250) * -1  # high claims → bad growth
-    _g_nfp   = _score(_nfp_val,  250,   50, -99, -99)        # high NFP → good growth
-    _g_ism   = _score(_ism_val,   55,   50, -99,  50)        # >55 good, <50 bad
-    _g_ism_nm= _score(_ism_nm_val,55,   50, -99,  50)
-    _g_chi   = _score(_chi_val,   55,   50, -99,  50)
-    _g_conf  = _score(_conf_val, 120,  100, -99, 100)
+    # Image thresholds: UR high(>5.5%)=weak, normal(4-5.5%), low(<4%)=strong
+    _g_ur    = _score_hi_bad (_ur_val,    5.5,  4.0)   # high UR → bad growth
+    _g_icsa  = _score_hi_bad (_icsa_val, 350,  250)    # high claims → bad growth
+    _g_nfp   = _score_hi_good(_nfp_val,  250,   50)    # high NFP → good growth
+    _g_ism   = _score_hi_good(_ism_val,   55,   50)    # >55 expansion, <50 contraction
+    _g_ism_nm= _score_hi_good(_ism_nm_val,55,   50)
+    _g_chi   = _score_hi_good(_chi_val,   55,   50)
+    _g_conf  = _score_hi_good(_conf_val, 120,  100)    # >120 strong, <100 negative
 
     growth_score = (_g_ur + _g_icsa + _g_nfp +
                     _g_ism + _g_ism_nm + _g_chi + _g_conf)  # range: -7 to +7
 
     # Inflation scores (+1 = hot, -1 = cool)
-    _i_cpi   = _score(_cpi_val,   2.5,  1.5, -99, 1.5)  # >2.5% hot, <1.5% cool
-    _i_ccpi  = _score(_ccpi_val,  2.5,  1.5, -99, 1.5)
-    _i_ppi   = _score(_ppi_val,   0.2,  0.0, -99, 0.0)  # >0.2% hot, <0% cool
-    # ISM expansions can also signal reflation
+    # Image thresholds: CPI high(>2%)=hot, normal(~2%), low(<2%)=cool
+    _i_cpi   = _score_hi_good(_cpi_val,  2.5, 1.5)    # >2.5% hot, <1.5% cool
+    _i_ccpi  = _score_hi_good(_ccpi_val, 2.5, 1.5)
+    _i_ppi   = _score_hi_good(_ppi_val,  0.2, 0.0)    # >0.2% hot, <0% deflationary
     _i_ism_r = +1 if (np.isfinite(_ism_val) and _ism_val > 55) else (
                -1 if (np.isfinite(_ism_val) and _ism_val < 48) else 0)
 
@@ -1382,7 +1392,7 @@ def render_thesis_page():
     stlc=round(float(sr.rolling(21).corr(tr2).dropna().iloc[-1]),3) if sr.dropna().size>21 else float("nan")
     _cpi_raw = raw.get("CPIAUCSL", pd.Series(dtype=float)).dropna()
     cpi_now = round(float(_cpi_raw.pct_change(1).dropna().iloc[-1]) * 100, 3) if len(_cpi_raw) > 1 else float("nan")
-    rd=_retdist(spy,idx,0)
+    rd=None  # computed after quotes are fetched so spot is correct
 
     # ── Macro framework metric display strings & Fed signal ratings ───────
     # Raw scalars already computed above. Here we produce display strings
@@ -1911,8 +1921,10 @@ def render_thesis_page():
                  "high for months (the old global mean would absorb the spike and understate fear). "
                  ">+1.0σ = ELEVATED. <−1.0σ = COMPLACENT. Mapped 0–100 via logistic.")
             +_gl("Composite Score",
-                 "Probability buckets (tactical 5D / short 21D / medium 63D) weighted 25/35/40 with divisor=12. "
-                 "A 62% prob scores +1 (old divisor=20 required 70% for +1). "
+                 "Composite uses direct observables as primary drivers: fear z-score (35%), "
+                 "recession stress score (20%), SPX 6M drawdown (15%), macro regime quadrant (15%), "
+                 "external prob buckets capped ±1.5 (15%). Overlays: stress flags −0.25 each, "
+                 "GEX ±0.4, VRP ±0.3. Final ×2.2 scale maps to ±10. "
                  "Structural overlay: 2+ stress flags (Sahm, HY OAS >600bp, cross-asset SYSTEMIC, VTS backwardation) "
                  "hard-cap the score at -2. GEX asymmetry: negative gamma amplifies bearish reads ×1.4, "
                  "suppresses bullish reads ×0.6. Chokepoint disruption bonus gated on co-occurring military/attack keywords.")),

@@ -10,16 +10,17 @@ import plotly.graph_objects as go
 import plotly.express as px
 import yfinance as yf
 from scipy.stats import norm as scipy_norm
-from config import GammaState, GammaRegime, FeedItem, SetupScore, CSS
+from config import GammaState, GammaRegime, FeedItem, SetupScore, CSS, REGIME_OPERATIONAL_LABEL
 from utils import _to_1d, zscore, resample_ffill, yf_close, kelly, current_pct_rank
 from config import _get_secret
 from ui_components import pill, pbar, sec_hdr, plotly_dark, regime_chip, autorefresh_js, colored, gauge
+from data_loaders import get_gex_from_yfinance
 from gex_engine import (build_gamma_state, compute_gex_from_chain, find_gamma_flip,
                         nearest_expiry_chain, classify_gex_regime, compute_dealer_greeks, DealerGreeks,
                         compute_gwas, compute_gex_term_structure, compute_flow_imbalance)
 from schwab_api import (get_schwab_client, schwab_get_spot, schwab_get_options_chain,
                         SCHWAB_AVAILABLE)
-# yfinance OI fallback removed — Schwab/TOS is the sole OI source for chain/OI data
+# OI source priority: Schwab/TOS (live IV + volume) → yfinance fallback (OI only)
 from probability import get_session_context, evaluate_setups
 
 # ── Colors ────────────────────────────────────────────────────────────────────
@@ -757,40 +758,42 @@ def render_gex_engine():
                 if spot_live and spot_live > 0:
                     spot = spot_live
                 else:
-                    # get_quote failed — use last known spot rather than strike median
-                    # (median of strikes can be $5-10 off actual price)
                     last_known = float(st.session_state.get("_last_known_spot", 0))
                     spot = last_known if last_known > 0 else float(chain_df["strike"].median())
                 st.success(f"Schwab connected — live IV · {symbol} · ${spot:.2f}")
             else:
                 err = st.session_state.get("_schwab_chain_error", "unknown error")
-                st.error(
-                    f"⚠️ Schwab returned an empty chain for **{symbol}** — OI data unavailable.\n\n"
-                    f"**Reason:** {err}\n\n"
-                    "OI is sourced exclusively from Schwab/TOS. Please check your connection on the "
-                    "**Schwab/TOS** tab and try re-authorising."
+                st.warning(
+                    f"⚠️ Schwab returned empty chain for **{symbol}** ({err}). "
+                    "Falling back to yfinance OI data."
                 )
                 source = "Schwab API (empty chain)"
-        else:
-            st.warning(
-                "🔌 **Schwab/TOS not connected.** OI and GEX require a live Schwab connection — "
-                "yfinance is no longer used as a fallback for OI data.\n\n"
-                "Go to the **Schwab/TOS** tab to authorise your account."
-            )
-            source = "not connected"
+        if chain_df is None or len(chain_df) == 0:
+            # yfinance fallback — less data than Schwab but better than a dead end
+            chain_df, spot_yf, source = get_gex_from_yfinance(symbol)
+            if chain_df is not None and len(chain_df) > 0:
+                spot = spot_yf or spot
+                if not client:
+                    st.info(f"📊 Using yfinance OI data for **{symbol}** — connect Schwab/TOS for live IV and volume.")
+            else:
+                if not client:
+                    st.warning(
+                        "🔌 **Schwab/TOS not connected** and yfinance returned no data. "
+                        "Go to the **Schwab/TOS** tab to authorise, or check your connection."
+                    )
 
     # Save last known good spot so next load has a better fallback than 0
     if spot and spot > 0:
         st.session_state["_last_known_spot"] = spot
 
     if chain_df is None or len(chain_df) == 0:
-        st.error(f"No options data available. Source returned: `{source}`")
+        st.error(f"No options data available for **{symbol}**. Source: `{source}`")
         with st.expander("🔧 Debug Info", expanded=True):
             st.write(f"**Symbol:** {symbol}")
             st.write(f"**chain_df:** {'None' if chain_df is None else f'Empty DataFrame ({len(chain_df)} rows)'}")
             st.write(f"**spot:** {spot}")
             st.write(f"**source:** {source}")
-            st.write("**OI source:** Schwab/TOS only (yfinance fallback removed)")
+            st.write("**OI sources tried:** Schwab API → yfinance fallback")
             schwab_err = st.session_state.get("_schwab_chain_error", "none")
             schwab_dbg = st.session_state.get("_schwab_chain_debug", "none")
             st.write(f"**Schwab chain error:** {schwab_err}")
@@ -900,7 +903,7 @@ def render_gex_engine():
                                     f"{symbol} GEX", int(hm_height))
             st.plotly_chart(fig_gex, use_container_width=True, key="gex_chart_heatmap")
         else:
-            regime_str = gs.regime.value.replace("_"," ").title()
+            regime_str = REGIME_OPERATIONAL_LABEL.get(gs.regime, gs.regime.value)
             neg_frac = sum(1 for v in dg.gex_by_strike.values() if v < 0) / max(len(dg.gex_by_strike), 1)
             if neg_frac > 0.8:
                 regime_note = f"⚠ {neg_frac*100:.0f}% of strikes negative — heavy put positioning, dealers AMPLIFY moves."
@@ -1447,22 +1450,20 @@ def render_setups_page():
             spot = spot_live if (spot_live and spot_live > 0) else float(chain_df["strike"].median())
         else:
             err = st.session_state.get("_schwab_chain_error", "unknown error")
-            st.error(
-                f"⚠️ Schwab returned an empty chain for **{symbol}**.\n\n"
-                f"**Reason:** {err}\n\n"
-                "OI is sourced exclusively from Schwab/TOS."
-            )
+            st.warning(f"⚠️ Schwab empty chain for **{symbol}** ({err}). Falling back to yfinance.")
             source = "Schwab API (empty chain)"
-    else:
-        st.warning(
-            "🔌 **Schwab/TOS not connected.** OI and GEX require a live Schwab connection.\n\n"
-            "Go to the **Schwab/TOS** tab to authorise your account."
-        )
-        source = "not connected"
-
     if chain_df is None or len(chain_df) == 0:
-        st.error(f"No options data for {symbol}. Try refreshing or switching symbol.")
-        return
+        chain_df, spot_yf, source = get_gex_from_yfinance(symbol)
+        if chain_df is not None and len(chain_df) > 0:
+            spot = spot_yf or spot
+            if not client:
+                st.info(f"📊 yfinance OI data for **{symbol}** — connect Schwab/TOS for live IV.")
+        else:
+            if not client:
+                st.warning("🔌 **Schwab/TOS not connected** and yfinance returned no data.")
+            else:
+                st.error(f"⚠️ No options data for **{symbol}** from Schwab or yfinance.")
+            return
 
     gs        = build_gamma_state(chain_df, spot, source, max_dte=int(st.session_state.get('gex_hm_dte', 45)))
     dg        = compute_dealer_greeks(chain_df, spot, source, max_dte=int(st.session_state.get('gex_hm_dte', 45)))

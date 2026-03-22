@@ -220,14 +220,31 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
         return f"${v:.1f}M"
     text_vals = [[_cell(v) for v in row] for row in z_vals]
 
-    # ── Colour ────────────────────────────────────────────────────────────
+    # ── Colour — per-Greek colorscale ─────────────────────────────────────
     flat = [abs(v) for row in z_vals for v in row if abs(v) >= thresh]
     zmax = float(np.percentile(flat, 97)) if flat else 100.0
-    colorscale = [
-        [0.00, "#7f1d1d"], [0.30, "#ef4444"],
-        [0.47, "#1c1c1c"], [0.50, "#111111"], [0.53, "#1c1c1c"],
-        [0.70, "#10b981"], [1.00, "#064e3b"],
-    ]
+
+    if greek_col == "net_vex":
+        # VEX (vanna): purple positive, red negative
+        colorscale = [
+            [0.00, "#4c1d95"], [0.30, "#7c3aed"],   # deep purple → violet (negative vanna)
+            [0.47, "#1c1c1c"], [0.50, "#111111"], [0.53, "#1c1c1c"],
+            [0.70, "#8b5cf6"], [1.00, "#c4b5fd"],   # medium → light purple (positive vanna)
+        ]
+    elif greek_col == "net_cex":
+        # CEX (charm): teal positive, orange negative
+        colorscale = [
+            [0.00, "#7c2d12"], [0.30, "#f97316"],   # deep orange → orange (negative charm)
+            [0.47, "#1c1c1c"], [0.50, "#111111"], [0.53, "#1c1c1c"],
+            [0.70, "#06b6d4"], [1.00, "#0e7490"],   # teal → deep teal (positive charm)
+        ]
+    else:
+        # GEX: red negative, green positive
+        colorscale = [
+            [0.00, "#7f1d1d"], [0.30, "#ef4444"],
+            [0.47, "#1c1c1c"], [0.50, "#111111"], [0.53, "#1c1c1c"],
+            [0.70, "#10b981"], [1.00, "#064e3b"],
+        ]
 
     # ── Figure ────────────────────────────────────────────────────────────
     fig = go.Figure(go.Heatmap(
@@ -248,26 +265,43 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
         hovertemplate="Strike: $%{y:.0f}<br>Expiry: %{x}<br>%{z:.1f}M<extra></extra>",
     ))
 
-    # ── Spot line — horizontal, numeric y ────────────────────────────────
-    # Nearest strike to spot
-    nearest = min(strikes, key=lambda s: abs(s - spot))
-    # Draw a cyan line at the spot strike value on the numeric y axis
+    # ── Spot line — exact price on numeric y axis ─────────────────────────
     fig.add_shape(
         type="line",
         x0=-0.5, x1=n_cols - 0.5,
-        y0=nearest, y1=nearest,
+        y0=spot, y1=spot,
         xref="x", yref="y",
         line=dict(color="#06b6d4", width=2),
     )
-    # Spot label on the left
     fig.add_annotation(
-        x=-0.5, y=nearest,
+        x=-0.5, y=spot,
         text=f"▶ ${spot:.2f}",
         showarrow=False,
         xref="x", yref="y",
         xanchor="right",
         font=dict(color="#06b6d4", size=10, family="monospace"),
     )
+
+    # ── Flip line — exact price, only for GEX heatmap ────────────────────
+    _hm_flip = getattr(_make_heatmap, "_flip_level", None)
+    if greek_col == "net_gex" and _hm_flip and np.isfinite(_hm_flip):
+        y_min, y_max = min(strikes), max(strikes)
+        if y_min <= _hm_flip <= y_max:
+            fig.add_shape(
+                type="line",
+                x0=-0.5, x1=n_cols - 0.5,
+                y0=_hm_flip, y1=_hm_flip,
+                xref="x", yref="y",
+                line=dict(color=_C_FLIP, width=2, dash="dash"),
+            )
+            fig.add_annotation(
+                x=-0.5, y=_hm_flip,
+                text=f"⚡ FLIP ${_hm_flip:.2f}",
+                showarrow=False,
+                xref="x", yref="y",
+                xanchor="right",
+                font=dict(color=_C_FLIP, size=10, family="monospace"),
+            )
 
     # ── TOTAL separator ───────────────────────────────────────────────────
     fig.add_shape(
@@ -455,15 +489,15 @@ def _greek_bar_chart(by_strike: dict, spot: float, title: str,
     # Zero line (vertical for horizontal bars)
     fig.add_vline(x=0, line_color="rgba(255,255,255,0.35)", line_width=1)
 
-    # Spot and flip lines — use paper-fraction y coords for categorical axis
-    n_cats = len(near)
-    def _cat_y(target_strike):
-        """Return 0..1 paper fraction for a given strike on the categorical axis."""
-        if n_cats <= 1: return 0.5
-        nearest = min(near, key=lambda s: abs(s - target_strike))
-        # near is sorted high→low, index 0 = top. Paper y: 0=bottom, 1=top.
-        idx = near.index(nearest)
-        return 1.0 - (idx / (n_cats - 1))
+    # Spot and flip lines — interpolated position on categorical axis
+    # near is sorted HIGH→LOW; paper y: 0=bottom, 1=top
+    hi_s = near[0] if near else spot
+    lo_s = near[-1] if near else spot
+
+    def _cat_y(target_price: float) -> float:
+        if hi_s == lo_s: return 0.5
+        frac = (target_price - lo_s) / (hi_s - lo_s)
+        return float(np.clip(frac, 0.0, 1.0))
 
     spot_y = _cat_y(spot)
     fig.add_shape(type="line", xref="paper", yref="paper",
@@ -471,19 +505,19 @@ def _greek_bar_chart(by_strike: dict, spot: float, title: str,
                   line=dict(dash="dot", color="rgba(255,255,255,0.70)", width=1.5))
     fig.add_annotation(xref="paper", yref="paper",
                        x=1.01, y=spot_y,
-                       text=f"SPOT ${spot:.0f}",
+                       text=f"SPOT ${spot:.2f}",
                        showarrow=False, xanchor="left",
                        font=dict(size=10, color="rgba(255,255,255,0.85)"))
 
     # Flip line
-    if flip_level and abs(flip_level - spot) / max(spot, 1) < 0.20:
+    if flip_level and np.isfinite(flip_level) and abs(flip_level - spot) / max(spot, 1) < 0.20:
         flip_y = _cat_y(flip_level)
         fig.add_shape(type="line", xref="paper", yref="paper",
                       x0=0, x1=1, y0=flip_y, y1=flip_y,
-                      line=dict(dash="dash", color=_C_FLIP, width=1.5))
+                      line=dict(dash="dash", color=_C_FLIP, width=2.0))
         fig.add_annotation(xref="paper", yref="paper",
                            x=1.01, y=flip_y,
-                           text=f"FLIP ${flip_level:.0f}",
+                           text=f"⚡ FLIP ${flip_level:.2f}",
                            showarrow=False, xanchor="left",
                            font=dict(size=10, color=_C_FLIP))
 
@@ -620,33 +654,48 @@ def _two_sided_gex_chart(chain_df: pd.DataFrame, spot: float,
     # Zero line
     fig.add_vline(x=0, line_color="rgba(255,255,255,0.40)", line_width=1.5)
 
-    # Spot reference line (paper coords on categorical Y-axis)
+    # Spot and flip lines.
+    # Categorical Y-axis maps strike labels to integer positions 0..n-1.
+    # all_strikes is sorted HIGH→LOW, so index 0 = top of chart.
+    # Plotly paper coords: 0=bottom, 1=top → invert the index fraction.
     n_cats = len(all_strikes)
-    def _cat_y(target):
-        if n_cats <= 1: return 0.5
-        nearest = min(all_strikes, key=lambda s: abs(s - target))
-        idx = all_strikes.index(nearest)
-        return 1.0 - (idx / (n_cats - 1))
+
+    def _cat_y(target_price: float) -> float:
+        """
+        Interpolated paper-fraction for target_price on the categorical axis.
+        Handles prices that fall between two listed strikes correctly.
+        """
+        if n_cats <= 1:
+            return 0.5
+        # all_strikes sorted high→low
+        hi_s = all_strikes[0]
+        lo_s = all_strikes[-1]
+        if hi_s == lo_s:
+            return 0.5
+        # Linear interpolation within [lo_s, hi_s]
+        # price at hi_s → paper y = 1.0, price at lo_s → paper y = 0.0
+        frac = (target_price - lo_s) / (hi_s - lo_s)
+        return float(np.clip(frac, 0.0, 1.0))
 
     spot_y = _cat_y(spot)
     fig.add_shape(type="line", xref="paper", yref="paper",
                   x0=0, x1=1, y0=spot_y, y1=spot_y,
                   line=dict(dash="dot", color="rgba(255,255,255,0.75)", width=1.5))
     fig.add_annotation(xref="paper", yref="paper",
-                       x=1.01, y=spot_y, text=f"SPOT ${spot:.0f}",
+                       x=1.01, y=spot_y, text=f"SPOT ${spot:.2f}",
                        showarrow=False, xanchor="left",
                        font=dict(size=10, color="rgba(255,255,255,0.85)"))
 
-    # Flip line
-    if flip_level and abs(flip_level - spot) / max(spot, 1) < 0.15:
+    # Flip line — exact interpolated position
+    if flip_level and np.isfinite(flip_level):
         flip_y = _cat_y(flip_level)
         fig.add_shape(type="line", xref="paper", yref="paper",
                       x0=0, x1=1, y0=flip_y, y1=flip_y,
-                      line=dict(dash="dash", color=_C_FLIP, width=1.5))
+                      line=dict(dash="dash", color=_C_FLIP, width=2.0))
         fig.add_annotation(xref="paper", yref="paper",
-                           x=1.01, y=flip_y, text=f"FLIP ${flip_level:.0f}",
+                           x=1.01, y=flip_y, text=f"⚡ FLIP ${flip_level:.2f}",
                            showarrow=False, xanchor="left",
-                           font=dict(size=10, color=_C_FLIP))
+                           font=dict(size=10, color=_C_FLIP, family="monospace"))
 
     fig.update_layout(
         barmode="overlay",
@@ -1242,6 +1291,7 @@ def render_gex_engine():
             _make_heatmap._strike_lo = strike_lo
             _make_heatmap._strike_hi = strike_hi
             _make_heatmap._max_dte   = int(max_dte)
+            _make_heatmap._flip_level = float(gs.gamma_flip) if gs.gamma_flip else float("nan")
 
             src_label = "VOLUME (intraday flow)" if hm_use_volume else "OI (structural)"
             st.caption(

@@ -869,6 +869,7 @@ def _composite(prob: dict, vrp_val: float,
                hyg_1d_ret: float = 0.0,       # HYG 1-day return (fraction)
                lqd_1d_ret: float = 0.0,       # LQD 1-day return (fraction)
                dist_to_flip_pct: float = 5.0, # distance to GEX flip (%)
+               hy_oas_pct: float = 3.0,        # HY OAS in percent (e.g. 3.20 = 320bp)
                ) -> int:
     """
     Composite directional score −10 to +10.
@@ -981,9 +982,11 @@ def _composite(prob: dict, vrp_val: float,
     stress_count = 0
     if leading is not None:
         sahm_triggered = leading.get("sahm_triggered",  False)
-        hy_stress      = leading.get("hy_stress_gate",  False)
+        # hy_stress_gate was never written to leading — compute from hy_oas_pct directly
+        # hy_oas_pct is passed as a parameter; >4.0% (400bp) = stress territory
+        hy_stress      = (hy_oas_pct > 4.0) if np.isfinite(hy_oas_pct) else False
         corr_systemic  = leading.get("corr_regime", "NORMAL") == "SYSTEMIC"
-        stress_count   = sum([sahm_triggered, hy_stress, corr_systemic])
+        stress_count   = sum([bool(sahm_triggered), bool(hy_stress), bool(corr_systemic)])
         s -= stress_count * 0.3
 
     # Fix 3: VTS backwardation → contrarian positive overlay
@@ -995,18 +998,17 @@ def _composite(prob: dict, vrp_val: float,
         if neg_gex:  s -= 0.4
         elif pos_gex: s += 0.3
 
-    # ── Scale to ±10 range ────────────────────────────────────────────────
-    s = s * 2.2
-
-    # ── Fix 5: Hard structural cap (implemented, not just documented) ─────
-    # When 2+ binary stress flags are active simultaneously (Sahm + HY stress
-    # + systemic correlation), the composite cannot read bullish regardless of
-    # what other signals say. Divide by 2.2 to pre-compensate for the scale.
-    _PRE_SCALE = 2.2
+    # ── Hard structural caps — applied PRE-scale so they map to intended ±10 values
+    # Cap pre-scale values then multiply, so "cap at -2 post-scale" means
+    # pre-scale cap = -2/2.2 = -0.909, which after *2.2 gives exactly -2.0.
+    _SCALE = 2.2
     if stress_count >= 2:
-        s = min(s, -2.0)    # hard cap at -2 post-scale
+        s = min(s, -2.0 / _SCALE)   # ≥2 stress flags → post-scale max = -2
     elif stress_count == 1:
-        s = min(s, +3.0)    # one flag: cap bullish at +3 (not neutralised, just limited)
+        s = min(s,  3.0 / _SCALE)   # 1 stress flag → post-scale max = +3
+
+    # ── Scale to ±10 range ────────────────────────────────────────────────
+    s = s * _SCALE
 
     return int(np.clip(round(s), -10, 10))
 
@@ -1679,7 +1681,8 @@ def render_thesis_page():
                     spx_5d_ret=_spx_5d_ret,
                     hyg_1d_ret=_hyg_1d_ret,
                     lqd_1d_ret=_lqd_1d_ret,
-                    dist_to_flip_pct=_dist_flip)
+                    dist_to_flip_pct=_dist_flip,
+                    hy_oas_pct=hyv)
     vrd,vc,ve=_verdict(comp,gex_st.regime)
     news=_news_cats(cat_intel)
     ua="NQ" if gex_sym in ("QQQ","NDX") else "ES"
@@ -1753,7 +1756,7 @@ def render_thesis_page():
     else:
         narr=f"Neutral dealer positioning ({gex_score:+d}): Near gamma flip — binary risk, reduce size."
 
-    _g3_mult = 10.0 if gex_sym in ("SPY",) else 40.0 if gex_sym in ("QQQ",) else 1.0
+    _g3_mult = 10.0 if gex_sym in ("SPY","SPX") else 40.0 if gex_sym in ("QQQ","NDX") else 1.0
     _g3_label = "SPX" if gex_sym in ("SPY","SPX") else "NDX" if gex_sym in ("QQQ","NDX") else gex_sym
     gleft=("<div>"
            +f"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>GEX LEVELS ({gex_sym} → {_g3_label})</div>"
@@ -1971,16 +1974,25 @@ def render_thesis_page():
 
     # ── 10. THESIS VERDICT ────────────────────────────────────────────────
     cc="#10b981" if comp>0 else "#ef4444" if comp<0 else "#94a3b8"
-    vp=np.isfinite(vrp["val"]) and vrp["val"]>0
-    vs2=f"{vrp['val']:+.4f}" if np.isfinite(vrp["val"]) else "N/A"
-    sigs=(_sig("✅" if vp else "⚠️",f"VRP {'positive' if vp else 'negative'} ({vs2})")
+    _vrp_v = vrp["val"] if np.isfinite(vrp.get("val", float("nan"))) else float("nan")
+    vs2    = f"{_vrp_v:+.4f}" if np.isfinite(_vrp_v) else "N/A"
+    # Match the actual scoring thresholds in _composite (±2 and ±4)
+    if not np.isfinite(_vrp_v):  _vrp_icon, _vrp_desc = "⚫", f"VRP N/A"
+    elif _vrp_v > 4:   _vrp_icon, _vrp_desc = "✅", f"VRP strongly positive ({vs2}) — +0.30 to score"
+    elif _vrp_v > 2:   _vrp_icon, _vrp_desc = "✅", f"VRP positive ({vs2}) — +0.15 to score"
+    elif _vrp_v < -4:  _vrp_icon, _vrp_desc = "🔴", f"VRP strongly negative ({vs2}) — −0.30 to score"
+    elif _vrp_v < -2:  _vrp_icon, _vrp_desc = "⚠️", f"VRP negative ({vs2}) — −0.15 to score"
+    else:              _vrp_icon, _vrp_desc = "⚫", f"VRP neutral ({vs2}) — no scoring impact (thresholds ±2/±4)"
+    sigs=(_sig(_vrp_icon, _vrp_desc)
           +_sig("⚠️" if fear_z>0.5 else "✅",f"Fear composite {fl2} ({fear_z:+.2f}σ)")
           +_sig("🔴" if rec>60 else "🟡" if rec>35 else "🟢",
                 f"Recession risk {'elevated' if rec>60 else 'moderate' if rec>35 else 'low'} ({rec:.1f}%)"))
-    _kls_mult = 10.0 if gex_sym in ("SPY","SPX") else 40.0 if gex_sym in ("QQQ","NDX") else 1.0
-    _flip_disp  = flip  * _kls_mult if gex_sym in ("SPY","QQQ") else flip
-    _upper_disp = upper * _kls_mult if gex_sym in ("SPY","QQQ") else upper
-    _lower_disp = lower * _kls_mult if gex_sym in ("SPY","QQQ") else lower
+    # _kls_mult converts ETF-strike → index level for display.
+    # Apply uniformly: if sym is SPY/SPX → *10, QQQ/NDX → *40, else *1.
+    _kls_mult   = 10.0 if gex_sym in ("SPY","SPX") else 40.0 if gex_sym in ("QQQ","NDX") else 1.0
+    _flip_disp  = flip  * _kls_mult
+    _upper_disp = upper * _kls_mult
+    _lower_disp = lower * _kls_mult
     kls=(_kv("SPX Spot",f"{spx:,.2f}","#fff")
          +_kv(f"GEX Flip ({_flip_src_label})",f"{_flip_disp:,.2f}","#f59e0b")
          +_kv("GEX Upper",f"{_upper_disp:,.2f}","#10b981")

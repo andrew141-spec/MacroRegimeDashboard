@@ -250,15 +250,16 @@ def compute_dealer_greeks(chain: pd.DataFrame, spot: float,
 def _net_gamma_at_spot(chain: pd.DataFrame, x: float,
                         multiplier: int = 100, r: float = 0.05) -> float:
     """
-    Compute total net dealer gamma if spot were at price x.
+    Compute total net dealer dollar GEX if spot were at price x.
 
-    Recomputes BS gamma for every strike using x as the spot price.
-    This is required for the TRUE gamma flip — the level where total
-    net gamma (as a function of hypothetical spot) equals zero.
+    G_net(x) = Σ_calls[ Γ_i(x) · OI_i · x² · 100 ]
+             - Σ_puts [ Γ_i(x) · OI_i · x² · 100 ]
 
-    G_net(x) = Σ_calls[ Γ_i(x) · OI_i · 100 ] - Σ_puts[ Γ_i(x) · OI_i · 100 ]
+    Must include x² so the zero-crossing is found in dollar-GEX space,
+    consistent with how net_gex is computed in compute_gex_from_chain.
     """
     total = 0.0
+    x2 = x * x
     for _, row in chain.iterrows():
         K, T, iv = float(row["strike"]), float(row["expiry_T"]), float(row["iv"])
         if T <= 0 or iv <= 0:
@@ -266,61 +267,50 @@ def _net_gamma_at_spot(chain: pd.DataFrame, x: float,
         g = bs_gamma(x, K, T, iv, r)
         c_oi = float(row.get("call_oi", 0))
         p_oi = float(row.get("put_oi",  0))
-        total += g * multiplier * (c_oi - p_oi)
+        total += g * x2 * multiplier * (c_oi - p_oi)
     return total
 
 
 def find_gamma_flip(chain: pd.DataFrame, spot: float = None,
                     scan_pct: float = 0.10, n_points: int = 200) -> float:
     """
-    True zero-gamma level: the spot price x where total net dealer gamma = 0.
+    True zero-gamma level: the spot price x where total net dealer dollar GEX = 0.
 
-    Method (correct):
-        Scan a price grid x ∈ [spot*(1-scan_pct), spot*(1+scan_pct)] and
-        compute G_net(x) = Σ Γ_i(x)·OI_i·100 for calls minus puts at each x.
-        Find where G_net crosses zero and interpolate.
+    Method:
+        Scan x ∈ [spot*(1-scan_pct), spot*(1+scan_pct)].
+        At each x recompute G_net(x) = Σ Γ_i(x)·OI_i·x²·100 (calls minus puts).
+        Find sign changes, interpolate to the crossing nearest to current spot.
 
-    This is the proper definition: gamma at each strike changes as spot moves,
-    so the flip level requires recomputing greeks at each hypothetical price.
-
-    Fallback (when no zero crossing found):
-        Return the x with G_net closest to zero — the "vol trigger" / minimum
-        gamma level, equivalent to SpotGamma's zero-gamma fallback.
-
-    Reference: Carr & Madan (2001); SpotGamma methodology notes (2021).
+    Fallback: if no zero crossing exists, return x where |G_net| is minimised.
     """
     if chain is None or len(chain) == 0:
         return np.nan
 
-    # Build a deduplicated chain for efficiency (aggregate OI by strike/expiry)
-    cols = [c for c in ["strike","expiry_T","iv","call_oi","put_oi"] if c in chain.columns]
+    # Deduplicate — one row per (strike, expiry) for efficiency
+    cols = [c for c in ["strike", "expiry_T", "iv", "call_oi", "put_oi"] if c in chain.columns]
     chain_agg = (chain[cols]
-                 .groupby(["strike","expiry_T"])
-                 .agg({"iv":"mean","call_oi":"sum","put_oi":"sum"})
+                 .groupby(["strike", "expiry_T"])
+                 .agg({"iv": "mean", "call_oi": "sum", "put_oi": "sum"})
                  .reset_index())
 
-    # Determine scan range
     if spot is None or not np.isfinite(spot) or spot <= 0:
-        # Estimate spot from chain midpoint
         spot = float(chain_agg["strike"].median())
 
-    x_lo = spot * (1 - scan_pct)
-    x_hi = spot * (1 + scan_pct)
+    x_lo   = spot * (1 - scan_pct)
+    x_hi   = spot * (1 + scan_pct)
     x_grid = np.linspace(x_lo, x_hi, n_points)
 
-    # Vectorised computation of G_net at each grid point
     g_vals = np.array([_net_gamma_at_spot(chain_agg, float(x)) for x in x_grid])
 
     if not np.any(np.isfinite(g_vals)):
-        return float(spot)  # no valid data
+        return float(spot)
 
-    # Find zero crossings
+    # All zero crossings
     sign_changes = np.where(g_vals[:-1] * g_vals[1:] < 0)[0]
 
     if len(sign_changes) > 0:
-        # Interpolate within the crossing interval with largest transition
-        best_i = sign_changes[np.argmax([abs(g_vals[j+1] - g_vals[j])
-                                          for j in sign_changes])]
+        # Pick the crossing nearest to current spot (not the largest jump)
+        best_i = sign_changes[np.argmin(np.abs(x_grid[sign_changes] - spot))]
         x1, x2 = x_grid[best_i], x_grid[best_i + 1]
         g1, g2 = g_vals[best_i], g_vals[best_i + 1]
         return float(x1 + (x2 - x1) * (-g1) / (g2 - g1)) if (g2 - g1) != 0 else float(x1)

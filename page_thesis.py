@@ -2327,7 +2327,16 @@ def render_thesis_page():
         + "</div>"
     )
 
-    vbd = _sh(10, "THESIS VERDICT") + hero + conflict_html + how_html + support_grid
+    # Legacy single-word verdict line (e.g. "BEARISH" / "LEANING BULLISH")
+    legacy_verdict_html = (
+        f"<div style='display:flex;align-items:baseline;gap:16px;margin-bottom:10px;"
+        f"padding-bottom:10px;border-bottom:1px solid rgba(255,255,255,0.08);'>"
+        f"<div style='font-size:32px;font-weight:900;color:{vc};letter-spacing:0.02em;'>{vrd}</div>"
+        f"<div style='font-size:12px;color:rgba(255,255,255,0.40);font-style:italic;'>{ve}</div>"
+        f"</div>"
+    )
+
+    vbd = _sh(10, "THESIS VERDICT") + legacy_verdict_html + hero + conflict_html + how_html + support_grid
     st.markdown(_card(vbd, bg=f"{vc}08", border=f"{vc}30"), unsafe_allow_html=True)
 
     # ── 11-13. GLOSSARIES ─────────────────────────────────────────────────

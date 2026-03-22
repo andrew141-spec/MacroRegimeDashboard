@@ -51,7 +51,7 @@ def bs_vanna(S, K, T, sigma, r=0.05) -> float:
     """Vanna = dDelta/dIV = d2Delta/dSdSigma.
     Measures how dealer delta changes when IV changes.
     Vanna = -phi(d1) * d2 / sigma
-    Sign convention (per notes):
+    Sign convention:
     Positive vanna: IV rises → dealers BUY, IV falls → dealers SELL
     Negative vanna: IV rises → dealers SELL, IV falls → dealers BUY
     """
@@ -59,102 +59,146 @@ def bs_vanna(S, K, T, sigma, r=0.05) -> float:
     d1, d2 = _d1d2(S, K, T, sigma, r)
     return -scipy_norm.pdf(d1) * d2 / sigma
 
-def bs_charm(S, K, T, sigma, r=0.05) -> float:
-    """Charm = dDelta/dTime (delta decay per day).
-    Measures how dealer delta changes as time passes.
-    Charm = -phi(d1) * (2*r*T - d2*sigma*sqrt(T)) / (2*T*sigma*sqrt(T))
+
+def bs_vega(S, K, T, sigma, r=0.05) -> float:
+    """True Vega = dPrice/dIV = S * phi(d1) * sqrt(T).
+    Dollar sensitivity of option price to a 1-unit (100%) change in IV.
+    VEX = OI * vega * multiplier  →  dollar gamma per 1-vol move (matches Doc 1 definition).
+    For per-1-vol-point (1%), divide by 100 at display time.
+    """
+    if T <= 0 or sigma <= 0: return 0.0
+    d1, _ = _d1d2(S, K, T, sigma, r)
+    return S * scipy_norm.pdf(d1) * math.sqrt(T)
+
+
+def bs_charm(S, K, T, sigma, r=0.05, option_type: str = "call") -> float:
+    """Charm = dDelta/dTime (annualised rate of delta decay).
+    Full per-side formula (matches Doc 1):
+      call_charm = base - r * exp(-rT) * N(d2)
+      put_charm  = base + r * exp(-rT) * N(-d2)
+    where base = -phi(d1)*(2rT - d2*sigma*sqrt(T)) / (2T*sigma*sqrt(T))
+
     Sign convention: positive charm → dealer delta increases over time → they buy (upward drift).
     """
     if T <= 0 or sigma <= 0: return 0.0
     d1, d2 = _d1d2(S, K, T, sigma, r)
-    return -scipy_norm.pdf(d1) * (2 * r * T - d2 * sigma * math.sqrt(T)) / (2 * T * sigma * math.sqrt(T))
+    base = -scipy_norm.pdf(d1) * (2 * r * T - d2 * sigma * math.sqrt(T)) / (2 * T * sigma * math.sqrt(T))
+    if option_type == "put":
+        return base + r * math.exp(-r * T) * scipy_norm.cdf(-d2)
+    # default: call
+    return base - r * math.exp(-r * T) * scipy_norm.cdf(d2)
 
 def compute_gex_from_chain(chain: pd.DataFrame, spot: float,
                             multiplier=100, r=0.05) -> pd.DataFrame:
     """
     chain must have: strike, expiry_T, iv, call_oi, put_oi
+    Optional volume columns: call_volume, put_volume (used for 0DTE flow profile)
+
     GEX sign convention: calls sold by dealers = positive (stabilizing)
                          puts sold by dealers = negative (destabilizing)
-    Also computes VEX (vanna) and CEX (charm) with same sign convention.
+
+    Formulas (Doc 1 standard — no 0.01 baked in):
+      GEX  = OI × Γ × S² × multiplier          (raw dollar gamma)
+      VEX  = OI × vega × multiplier             (true vega exposure, Doc 1 definition)
+      CEX  = OI × charm × multiplier            (per-side charm, full r-correction)
+      VNNX = OI × vanna × multiplier            (vanna exposure — separate from VEX)
+
+    The 0.01 per-1%-move normalisation belongs at the DISPLAY layer, not here.
     """
     chain = chain.copy()
-    # Prefer Schwab's own model gamma when available (non-zero, finite).
-    # Schwab's gamma accounts for their vol surface assumptions and is more
-    # accurate than our flat-vol BS approximation.
-    # Fall back to BS gamma for yfinance data which has no per-contract gamma.
+
+    # ── Gamma source: prefer per-side Schwab gamma, fallback to BS ────────
+    bs_g = chain.apply(
+        lambda row: bs_gamma(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
+
+    has_call_gamma = ("call_gamma" in chain.columns and
+                      (chain["call_gamma"].fillna(0) > 0).any())
+    has_put_gamma  = ("put_gamma"  in chain.columns and
+                      (chain["put_gamma"].fillna(0)  > 0).any())
     has_schwab_gamma = (
         "schwab_gamma" in chain.columns
         and chain["schwab_gamma"].notna().any()
         and (chain["schwab_gamma"].abs() > 0).any()
     )
-    # Compute BS gamma as fallback for both sides
-    bs_g = chain.apply(
-        lambda row: bs_gamma(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
-
-    # Use per-side Schwab gamma when available (call_gamma and put_gamma columns).
-    # This is more accurate than schwab_gamma mean because OTM call gamma ≠ ITM put gamma.
-    has_call_gamma = ("call_gamma" in chain.columns and
-                      (chain["call_gamma"] > 0).any())
-    has_put_gamma  = ("put_gamma"  in chain.columns and
-                      (chain["put_gamma"]  > 0).any())
 
     if has_call_gamma and has_put_gamma:
-        # Use per-side Schwab gamma where valid, BS elsewhere
-        call_g_valid = chain["call_gamma"].fillna(0) > 0
-        put_g_valid  = chain["put_gamma"].fillna(0)  > 0
-
-        # call_gex uses call_gamma; put_gex uses put_gamma
+        call_g_valid   = chain["call_gamma"].fillna(0) > 0
+        put_g_valid    = chain["put_gamma"].fillna(0)  > 0
         call_gamma_col = np.where(call_g_valid, chain["call_gamma"].fillna(0), bs_g)
         put_gamma_col  = np.where(put_g_valid,  chain["put_gamma"].fillna(0),  bs_g)
-
-        # GEX = Γ · OI · 100 · S² · 0.01  → dollar gamma per 1% spot move
-        chain["call_gex"] =  chain["call_oi"] * call_gamma_col * multiplier * (spot ** 2) * 0.01
-        chain["put_gex"]  = -chain["put_oi"]  * put_gamma_col  * multiplier * (spot ** 2) * 0.01
-        chain["net_gex"]  =  chain["call_gex"] + chain["put_gex"]
-
-        # VEX and CEX still use blended BS vanna/charm (no per-side Schwab vanna)
-        chain["vanna"] = chain.apply(
-            lambda row: bs_vanna(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
-        chain["charm"] = chain.apply(
-            lambda row: bs_charm(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
-        chain["call_vex"] =  chain["call_oi"] * chain["vanna"] * multiplier
-        chain["put_vex"]  = -chain["put_oi"]  * chain["vanna"] * multiplier
-        chain["net_vex"]  =  chain["call_vex"] + chain["put_vex"]
-        chain["call_cex"] =  chain["call_oi"] * chain["charm"] * multiplier
-        chain["put_cex"]  = -chain["put_oi"]  * chain["charm"] * multiplier
-        chain["net_cex"]  =  chain["call_cex"] + chain["put_cex"]
-        return chain
-
     elif has_schwab_gamma:
-        # Legacy path: single schwab_gamma column (averaged — less accurate but usable)
         schwab_valid = (
             chain["schwab_gamma"].notna() &
             chain["schwab_gamma"].apply(np.isfinite) &
             (chain["schwab_gamma"] > 0)
         )
-        chain["gamma"] = np.where(schwab_valid, chain["schwab_gamma"], bs_g)
+        blended = np.where(schwab_valid, chain["schwab_gamma"], bs_g)
+        call_gamma_col = blended
+        put_gamma_col  = blended
     else:
-        chain["gamma"] = bs_g
-    chain["vanna"] = chain.apply(
-        lambda row: bs_vanna(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
-    chain["charm"] = chain.apply(
-        lambda row: bs_charm(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
+        call_gamma_col = bs_g.values
+        put_gamma_col  = bs_g.values
 
-    # GEX = Γ · OI · 100 · S² · 0.01  → dollar gamma per 1% spot move
-    chain["call_gex"] =  chain["call_oi"] * chain["gamma"] * multiplier * (spot ** 2) * 0.01
-    chain["put_gex"]  = -chain["put_oi"]  * chain["gamma"] * multiplier * (spot ** 2) * 0.01
+    # ── GEX: raw dollar gamma (Doc 1: OI × Γ × S² × 100, NO 0.01) ───────
+    chain["call_gex"] =  chain["call_oi"] * call_gamma_col * multiplier * (spot ** 2)
+    chain["put_gex"]  = -chain["put_oi"]  * put_gamma_col  * multiplier * (spot ** 2)
     chain["net_gex"]  =  chain["call_gex"] + chain["put_gex"]
 
-    # VEX = Vanna · OI · 100  (dimensionless vanna, no S factor)
-    # Dollarize separately when needed: VEX_dollar = VEX * S * 0.01 per 1vol pt
-    chain["call_vex"] =  chain["call_oi"] * chain["vanna"] * multiplier
-    chain["put_vex"]  = -chain["put_oi"]  * chain["vanna"] * multiplier
+    # ── Volume-based GEX for 0DTE flow profile (separate columns) ─────────
+    # Uses volume instead of OI — measures real-time dealer hedging pressure.
+    # OTM-only: calls at K >= spot, puts at K <= spot.
+    has_call_vol = ("call_volume" in chain.columns and
+                    (chain["call_volume"].fillna(0) > 0).any())
+    has_put_vol  = ("put_volume"  in chain.columns and
+                    (chain["put_volume"].fillna(0)  > 0).any())
+    if has_call_vol and has_put_vol:
+        call_vol = chain["call_volume"].fillna(0)
+        put_vol  = chain["put_volume"].fillna(0)
+    else:
+        # Fallback: use OI as volume proxy (less accurate)
+        call_vol = chain["call_oi"].fillna(0)
+        put_vol  = chain["put_oi"].fillna(0)
+
+    # OTM filter mask: calls above spot, puts below spot (Doc 2 §4 & §5)
+    otm_call_mask = chain["strike"] >= spot
+    otm_put_mask  = chain["strike"] <= spot
+
+    chain["call_vol_gex"] = np.where(
+        otm_call_mask,
+         call_vol * call_gamma_col * multiplier * (spot ** 2),
+        0.0
+    )
+    chain["put_vol_gex"] = np.where(
+        otm_put_mask,
+        -put_vol * put_gamma_col * multiplier * (spot ** 2),
+        0.0
+    )
+    chain["net_vol_gex"] = chain["call_vol_gex"] + chain["put_vol_gex"]
+
+    # ── Vanna (dDelta/dIV) — kept as VNNX, separate from VEX ─────────────
+    chain["vanna"] = chain.apply(
+        lambda row: bs_vanna(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
+    chain["call_vnnx"] =  chain["call_oi"] * chain["vanna"] * multiplier
+    chain["put_vnnx"]  = -chain["put_oi"]  * chain["vanna"] * multiplier
+    chain["net_vnnx"]  =  chain["call_vnnx"] + chain["put_vnnx"]
+
+    # ── VEX: TRUE Vega exposure (Doc 1: OI × vega × multiplier) ──────────
+    # vega = S × phi(d1) × sqrt(T)  — dollar price sensitivity to IV
+    chain["vega"] = chain.apply(
+        lambda row: bs_vega(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
+    chain["call_vex"] =  chain["call_oi"] * chain["vega"] * multiplier
+    chain["put_vex"]  = -chain["put_oi"]  * chain["vega"] * multiplier
     chain["net_vex"]  =  chain["call_vex"] + chain["put_vex"]
 
-    # CEX: Charm * OI * 100  (no S factor — charm is dDelta/dT, units = 1/time)
-    # Reference: Haug "The Complete Guide to Option Pricing Formulas" eq 2.20.
-    chain["call_cex"] =  chain["call_oi"] * chain["charm"] * multiplier
-    chain["put_cex"]  = -chain["put_oi"]  * chain["charm"] * multiplier
+    # ── CEX: Charm with full per-side r-correction (Doc 1 formula) ────────
+    chain["call_charm"] = chain.apply(
+        lambda row: bs_charm(spot, row["strike"], row["expiry_T"], row["iv"], r, "call"), axis=1)
+    chain["put_charm"] = chain.apply(
+        lambda row: bs_charm(spot, row["strike"], row["expiry_T"], row["iv"], r, "put"), axis=1)
+    # Backward-compat alias: charm = call charm (blended; sign is correct for calls/puts separately)
+    chain["charm"] = chain["call_charm"]
+    chain["call_cex"] =  chain["call_oi"] * chain["call_charm"] * multiplier
+    chain["put_cex"]  = -chain["put_oi"]  * chain["put_charm"]  * multiplier
     chain["net_cex"]  =  chain["call_cex"] + chain["put_cex"]
 
     return chain
@@ -170,14 +214,16 @@ def compute_dealer_greeks(chain: pd.DataFrame, spot: float,
 
     # Aggregate by strike (sum across expirations)
     agg = gex_chain.groupby("strike").agg(
-        net_gex=("net_gex", "sum"),
-        net_vex=("net_vex", "sum"),
-        net_cex=("net_cex", "sum"),
+        net_gex=("net_gex",  "sum"),
+        net_vex=("net_vex",  "sum"),   # true vega exposure (Doc 1 definition)
+        net_vnnx=("net_vnnx", "sum"),  # vanna exposure (dDelta/dIV — direction signal)
+        net_cex=("net_cex",  "sum"),
     ).reset_index()
 
-    gex_by_strike = dict(zip(agg["strike"], agg["net_gex"]))
-    vex_by_strike = dict(zip(agg["strike"], agg["net_vex"]))
-    cex_by_strike = dict(zip(agg["strike"], agg["net_cex"]))
+    gex_by_strike  = dict(zip(agg["strike"], agg["net_gex"]))
+    vex_by_strike  = dict(zip(agg["strike"], agg["net_vex"]))   # true vega
+    vnnx_by_strike = dict(zip(agg["strike"], agg["net_vnnx"]))  # vanna
+    cex_by_strike  = dict(zip(agg["strike"], agg["net_cex"]))
 
     # Key nodes = largest ABSOLUTE value (per Module 2: size matters most)
     def _key_nodes(by_strike: dict, n=5) -> List[Tuple[float, float]]:
@@ -192,17 +238,13 @@ def compute_dealer_greeks(chain: pd.DataFrame, spot: float,
     otm = {k: v for k, v in gex_by_strike.items() if abs(k - spot) > otm_threshold}
     otm_anchors = sorted(otm.items(), key=lambda x: abs(x[1]), reverse=True)[:10]
 
-    # Vanna direction: net VEX near spot (within 2%)
-    # Convention per notes:
+    # Vanna direction: use NET VNNX (true vanna) near spot (within 2%)
+    # Convention:
     #   Positive vanna: IV rises → dealers BUY, IV falls → dealers SELL
     #   Negative vanna: IV rises → dealers SELL, IV falls → dealers BUY
-    # We store the vanna sign and let the UI interpret based on IV regime.
-    # vanna_direction here = pressure direction IF IV IS RISING (most actionable context)
-    ntm_vex = sum(v for k, v in vex_by_strike.items() if abs(k - spot) / spot < 0.02)
-    # Positive vanna + rising IV = dealers buy = bullish pressure
-    # Negative vanna + rising IV = dealers sell = bearish pressure
-    vanna_direction = "bullish" if ntm_vex > 0 else ("bearish" if ntm_vex < 0 else "neutral")
-    vanna_sign = "positive" if ntm_vex > 0 else ("negative" if ntm_vex < 0 else "neutral")
+    ntm_vnnx = sum(v for k, v in vnnx_by_strike.items() if abs(k - spot) / spot < 0.02)
+    vanna_direction = "bullish" if ntm_vnnx > 0 else ("bearish" if ntm_vnnx < 0 else "neutral")
+    vanna_sign      = "positive" if ntm_vnnx > 0 else ("negative" if ntm_vnnx < 0 else "neutral")
 
     # Charm direction: net CEX near spot
     ntm_cex = sum(v for k, v in cex_by_strike.items() if abs(k - spot) / spot < 0.02)

@@ -171,18 +171,15 @@ def gex_zero_crossing(chain: pd.DataFrame, spot: float,
     """
     Find the exact price where per-strike net GEX crosses zero.
 
-    This is the VISUAL flip level — the price between the last negative-GEX
-    strike and the first positive-GEX strike (or vice-versa). It is the
-    boundary between red and green bars on the GEX chart.
+    Uses net_vol_gex (volume-weighted, OTM-only) when volume data is present —
+    this matches the two-sided bar chart and reflects real-time dealer flow.
+    Falls back to net_gex (OI-based) when volume is unavailable.
 
-    Method: aggregate net_gex by strike, sort ascending, find adjacent pair
-    with opposite signs, linear-interpolate to the zero crossing.
+    Method: aggregate by strike, sort ascending, interpolate between the two
+    adjacent strikes where sign changes — this is precisely the boundary
+    between red and green bars on the chart.
 
-    This is distinct from find_gamma_flip() which recomputes greeks at each
-    hypothetical spot price (vol-trigger style). Both are valid; this one
-    matches exactly what the bar chart shows.
-
-    Returns None if no sign change exists in the chain.
+    Returns None if no sign change exists.
     """
     if chain is None or chain.empty:
         return None
@@ -191,27 +188,30 @@ def gex_zero_crossing(chain: pd.DataFrame, spot: float,
     if near.empty:
         near = chain.copy()
 
-    gc  = compute_gex_from_chain(near, spot)
-    agg = (gc.groupby("strike")["net_gex"]
+    gc = compute_gex_from_chain(near, spot)
+
+    # Use volume-based GEX when available — matches the bar chart
+    has_vol = ("net_vol_gex" in gc.columns and
+               gc["net_vol_gex"].abs().sum() > 0)
+    gex_col = "net_vol_gex" if has_vol else "net_gex"
+
+    agg = (gc.groupby("strike")[gex_col]
              .sum()
              .reset_index()
              .sort_values("strike")
              .reset_index(drop=True))
 
-    strikes = agg["strike"].to_numpy(dtype=float)
-    gex_vals = agg["net_gex"].to_numpy(dtype=float)
+    strikes  = agg["strike"].to_numpy(dtype=float)
+    gex_vals = agg[gex_col].to_numpy(dtype=float)
 
-    # Find adjacent pairs with sign change
     sign_changes = np.where(gex_vals[:-1] * gex_vals[1:] < 0)[0]
     if len(sign_changes) == 0:
         return None
 
-    # Pick the crossing nearest to spot
     best_i = sign_changes[np.argmin(np.abs(strikes[sign_changes] - spot))]
     k1, k2 = strikes[best_i], strikes[best_i + 1]
     g1, g2 = gex_vals[best_i], gex_vals[best_i + 1]
 
-    # Linear interpolation: price where GEX = 0 between k1 and k2
     if (g2 - g1) == 0:
         return float(k1)
     return float(k1 + (k2 - k1) * (-g1) / (g2 - g1))

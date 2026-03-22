@@ -1323,62 +1323,40 @@ def render_gex_engine():
 """)
 
     with tab_vex:
-        st.markdown(f"{sec_hdr('VEGA EXPOSURE (VEX) — Dollar Sensitivity to IV Changes')}", unsafe_allow_html=True)
+        st.markdown(f"{sec_hdr('VANNA EXPOSURE (VEX) — Reaction to IV Changes')}", unsafe_allow_html=True)
         st.caption(
-            "VEX = OI × Vega × 100. Measures total dollar P&L sensitivity to a 1-vol-unit IV change. "
-            "Positive VEX: falling IV benefits dealers (calls dominant). "
-            "For vanna (dDelta/dIV) see the VNNX column in raw data. "
-            "Divide by 100 for per-1%-vol-point sensitivity."
+            "VEX = OI × Vanna × 100. Vanna = dDelta/dIV = -φ(d1)·d2/σ. "
+            "Positive vanna: IV rises → dealers BUY. Negative: IV rises → dealers SELL."
         )
         if "not connected" in source.lower() or "empty chain" in source.lower():
             st.warning("⚠️ VEX requires a live Schwab/TOS connection for per-strike IV and OI data.")
 
         view_mode_vex = st.radio("View", ["Heatmap", "Bar Chart"], horizontal=True, key="vex_view_mode")
         if view_mode_vex == "Heatmap":
-            st.caption("Strike × Expiry matrix · Purple/green = positive VEX (vega) · Red = negative VEX · TOTAL = net across all expiries")
-            fig_vex = _make_heatmap(chain_df, spot, "net_vex", f"{symbol} VEX (True Vega)", int(st.session_state.get("gex_hm_height", 1000)))
+            st.caption("Strike × Expiry matrix · Purple/green = positive vanna · Red = negative vanna · TOTAL = net across all expiries")
+            fig_vex = _make_heatmap(chain_df, spot, "net_vex", f"{symbol} VEX (Vanna)", int(st.session_state.get("gex_hm_height", 1000)))
             st.plotly_chart(fig_vex, use_container_width=True, key="gex_chart_vex_heatmap")
         else:
             fig_vex = _greek_bar_chart(dg.vex_by_strike, spot,
-                                       "Net VEX (True Vega) by Strike", _C_VEX, _C_NEG, gs.gamma_flip)
+                                       "Net VEX (Vanna) by Strike", _C_VEX, _C_NEG, gs.gamma_flip)
             st.plotly_chart(fig_vex, use_container_width=True, key="gex_chart_vex_bar")
 
         ntm_vex_val = sum(v for k, v in dg.vex_by_strike.items() if abs(k - spot) / spot < 0.02)
         v1, v2 = st.columns(2)
         with v1:
-            st.metric("Net VEX near spot", f"${ntm_vex_val / 1e6:.1f}M")
-            st.caption("VEX = OI × S × φ(d1) × √T × 100 — dollar P&L per 1-vol-unit IV move")
+            st.metric("Net VEX (Vanna) near spot", f"${ntm_vex_val / 1e6:.1f}M")
+            st.caption("VEX = OI × vanna × 100  where  vanna = -φ(d1)·d2/σ")
         with v2:
             st.markdown("""
-**VEX = True Dollar Vega Exposure**
-- Large positive VEX → dealers heavily long vega (collect premium) → IV drops benefit them
-- Large negative VEX → dealers short vega → IV spikes hurt them → forced hedging
-- Divide by 100 for per-1-vol-point sensitivity
+**VEX = Vanna Exposure**
+- Large positive VEX → positive vanna dominant → IV drop → dealers BUY
+- Large negative VEX → negative vanna dominant → IV spike → dealers SELL
 """)
 
-        st.markdown("---")
-        st.markdown(f"**🌀 Vanna Exposure (VNNX) — dDelta/dIV — IV-driven Hedging Flow**")
-        st.caption(
-            "Vanna = -φ(d1)·d2/σ. Positive vanna: IV rises → dealers BUY. "
-            "Negative vanna: IV rises → dealers SELL. Separate from VEX — this drives directional flow, not P&L."
-        )
-        # Build vanna by strike from the same chain
-        _vnnx_chain = compute_gex_from_chain(
-            chain_df[chain_df["expiry_T"] <= float(st.session_state.get("gex_hm_dte", 30)) / 365.0].copy()
-            if not chain_df.empty else chain_df,
-            spot
-        )
-        _vnnx_agg = _vnnx_chain.groupby("strike")["net_vnnx"].sum().reset_index()
-        vnnx_by_strike = dict(zip(_vnnx_agg["strike"], _vnnx_agg["net_vnnx"]))
-        ntm_vnnx = sum(v for k, v in vnnx_by_strike.items() if abs(k - spot) / spot < 0.02)
-
-        fig_vnnx = _greek_bar_chart(vnnx_by_strike, spot,
-                                    "Vanna Exposure (VNNX) by Strike", _C_VEX, _C_NEG, gs.gamma_flip)
-        st.plotly_chart(fig_vnnx, use_container_width=True, key="gex_chart_vnnx_bar")
-
+        ntm_vex_val = sum(v for k, v in dg.vex_by_strike.items() if abs(k - spot) / spot < 0.02)
         va1, va2 = st.columns(2)
         with va1:
-            st.metric("Net Vanna near spot", f"${ntm_vnnx / 1e6:.1f}M")
+            st.metric("Net VEX (Vanna) near spot", f"${ntm_vex_val / 1e6:.1f}M")
             st.markdown(f"**Vanna Sign:** {dg.vanna_sign.upper()}")
         with va2:
             if dg.vanna_sign == "positive":

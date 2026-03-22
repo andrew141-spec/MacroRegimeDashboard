@@ -87,12 +87,45 @@ def compute_gex_from_chain(chain: pd.DataFrame, spot: float,
         and chain["schwab_gamma"].notna().any()
         and (chain["schwab_gamma"].abs() > 0).any()
     )
-    if has_schwab_gamma:
-        # Schwab gamma is always positive (it's the absolute rate of delta change).
-        # Sign is handled downstream via call_oi (+) and put_oi (-) convention.
-        # Use vectorised operation for performance instead of row-wise apply.
-        bs_g = chain.apply(
-            lambda row: bs_gamma(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
+    # Compute BS gamma as fallback for both sides
+    bs_g = chain.apply(
+        lambda row: bs_gamma(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
+
+    # Use per-side Schwab gamma when available (call_gamma and put_gamma columns).
+    # This is more accurate than schwab_gamma mean because OTM call gamma ≠ ITM put gamma.
+    has_call_gamma = ("call_gamma" in chain.columns and
+                      (chain["call_gamma"] > 0).any())
+    has_put_gamma  = ("put_gamma"  in chain.columns and
+                      (chain["put_gamma"]  > 0).any())
+
+    if has_call_gamma and has_put_gamma:
+        # Use per-side Schwab gamma where valid, BS elsewhere
+        call_g_valid = chain["call_gamma"].fillna(0) > 0
+        put_g_valid  = chain["put_gamma"].fillna(0)  > 0
+
+        # call_gex uses call_gamma; put_gex uses put_gamma
+        call_gamma_col = np.where(call_g_valid, chain["call_gamma"].fillna(0), bs_g)
+        put_gamma_col  = np.where(put_g_valid,  chain["put_gamma"].fillna(0),  bs_g)
+
+        chain["call_gex"] =  chain["call_oi"] * call_gamma_col * multiplier * (spot ** 2)
+        chain["put_gex"]  = -chain["put_oi"]  * put_gamma_col  * multiplier * (spot ** 2)
+        chain["net_gex"]  =  chain["call_gex"] + chain["put_gex"]
+
+        # VEX and CEX still use blended BS vanna/charm (no per-side Schwab vanna)
+        chain["vanna"] = chain.apply(
+            lambda row: bs_vanna(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
+        chain["charm"] = chain.apply(
+            lambda row: bs_charm(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
+        chain["call_vex"] =  chain["call_oi"] * chain["vanna"] * multiplier * (spot ** 2)
+        chain["put_vex"]  = -chain["put_oi"]  * chain["vanna"] * multiplier * (spot ** 2)
+        chain["net_vex"]  =  chain["call_vex"] + chain["put_vex"]
+        chain["call_cex"] =  chain["call_oi"] * chain["charm"] * multiplier * (spot ** 2)
+        chain["put_cex"]  = -chain["put_oi"]  * chain["charm"] * multiplier * (spot ** 2)
+        chain["net_cex"]  =  chain["call_cex"] + chain["put_cex"]
+        return chain
+
+    elif has_schwab_gamma:
+        # Legacy path: single schwab_gamma column (averaged — less accurate but usable)
         schwab_valid = (
             chain["schwab_gamma"].notna() &
             chain["schwab_gamma"].apply(np.isfinite) &
@@ -100,19 +133,15 @@ def compute_gex_from_chain(chain: pd.DataFrame, spot: float,
         )
         chain["gamma"] = np.where(schwab_valid, chain["schwab_gamma"], bs_g)
     else:
-        chain["gamma"] = chain.apply(
-            lambda row: bs_gamma(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
+        chain["gamma"] = bs_g
     chain["vanna"] = chain.apply(
         lambda row: bs_vanna(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
     chain["charm"] = chain.apply(
         lambda row: bs_charm(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
 
-    # GEX per the equation: Σ(Γᵢ · OIᵢ · ContractSize · S²)
-    # calls: dealers long gamma = stabilizing (+)
-    # puts:  dealers short gamma = destabilizing (-)
-    # S² = spot² — the dollar gamma term that gives GEX its units of $ per 1% move
+    # GEX: use per-side gamma where available, else blended gamma
     chain["call_gex"] =  chain["call_oi"] * chain["gamma"] * multiplier * (spot ** 2)
-    chain["put_gex"]  = -chain["put_oi"] * chain["gamma"] * multiplier * (spot ** 2)
+    chain["put_gex"]  = -chain["put_oi"]  * chain["gamma"] * multiplier * (spot ** 2)
     chain["net_gex"]  =  chain["call_gex"] + chain["put_gex"]
 
     # VEX: positive vanna + rising IV → dealers buy (bullish pressure on IV spike)

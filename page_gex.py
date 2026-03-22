@@ -1113,18 +1113,48 @@ def render_gex_engine():
             st.write(f"**Schwab chain debug:** {schwab_dbg}")
         return
 
-    # ── Compute all Greeks ────────────────────────────────────────────────
-    gs  = build_gamma_state(chain_df, spot, source, max_dte=int(st.session_state.get('gex_hm_dte', 45)))
-    dg  = compute_dealer_greeks(chain_df, spot, source, max_dte=int(st.session_state.get('gex_hm_dte', 45)))
+    # ── Compute all Greeks — cached so widget interactions don't recompute ──
+    # st.cache_data caches by (chain hash, spot, source, max_dte).
+    # The cache is cleared on manual refresh or auto-refresh cycle.
+    _max_dte = int(st.session_state.get('gex_hm_dte', 45))
+
+    @st.cache_data(ttl=120, show_spinner=False)
+    def _cached_gamma_state(_chain_json, _spot, _source, _max_dte):
+        import pandas as _pd, io as _io
+        _df = _pd.read_json(_io.StringIO(_chain_json))
+        return build_gamma_state(_df, _spot, _source, max_dte=_max_dte)
+
+    @st.cache_data(ttl=120, show_spinner=False)
+    def _cached_dealer_greeks(_chain_json, _spot, _source, _max_dte):
+        import pandas as _pd, io as _io
+        _df = _pd.read_json(_io.StringIO(_chain_json))
+        return compute_dealer_greeks(_df, _spot, _source, max_dte=_max_dte)
+
+    @st.cache_data(ttl=120, show_spinner=False)
+    def _cached_analytics(_chain_json, _spot):
+        import pandas as _pd, io as _io
+        _df = _pd.read_json(_io.StringIO(_chain_json))
+        return (compute_gwas(_df, _spot),
+                compute_gex_term_structure(_df, _spot),
+                compute_flow_imbalance(_df, _spot))
+
+    try:
+        _chain_json = chain_df.to_json()
+        gs   = _cached_gamma_state(_chain_json, spot, source, _max_dte)
+        dg   = _cached_dealer_greeks(_chain_json, spot, source, _max_dte)
+        gwas, term_str, flow = _cached_analytics(_chain_json, spot)
+    except Exception:
+        # Fallback: compute directly if serialization fails
+        gs   = build_gamma_state(chain_df, spot, source, max_dte=_max_dte)
+        dg   = compute_dealer_greeks(chain_df, spot, source, max_dte=_max_dte)
+        gwas     = compute_gwas(chain_df, spot)
+        term_str = compute_gex_term_structure(chain_df, spot)
+        flow     = compute_flow_imbalance(chain_df, spot)
+
     session   = get_session_context()
     vix_df    = yf.Ticker("^VIX").history(period="1d")
     vix_level = float(vix_df["Close"].iloc[-1]) if len(vix_df) > 0 else 20.0
-
-    # ── Advanced analytics (new) ──────────────────────────────────────────
-    gwas     = compute_gwas(chain_df, spot)
-    term_str = compute_gex_term_structure(chain_df, spot)
-    flow     = compute_flow_imbalance(chain_df, spot)
-    rvol     = _fetch_rvol_surface(symbol)
+    rvol      = _fetch_rvol_surface(symbol)
 
     # ── Header ────────────────────────────────────────────────────────────
     m1, m2, m3, m4, m5 = st.columns(5)

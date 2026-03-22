@@ -488,6 +488,169 @@ def _greek_bar_chart(by_strike: dict, spot: float, title: str,
     return plotly_dark(fig, title, height)
 
 
+def _two_sided_gex_chart(chain_df: pd.DataFrame, spot: float,
+                          flip_level: float = None,
+                          use_volume: bool = True,
+                          max_dte: int = 1,
+                          height: int = 420,
+                          strike_range_pct: float = 0.05) -> go.Figure:
+    """
+    Two-sided GEX profile (Doc 2 standard):
+      - Calls (OTM: K >= spot) → positive bars on the RIGHT
+      - Puts  (OTM: K <= spot) → negative bars on the LEFT
+      - Volume-based when available, OI fallback otherwise
+      - OTM-only filtering (removes ITM distortion)
+      - Strikes within ±strike_range_pct of spot
+
+    This matches the GEXBot / SpotGamma intraday 0DTE flow chart.
+    """
+    if chain_df is None or len(chain_df) == 0:
+        fig = go.Figure()
+        plotly_dark(fig, "0DTE GEX Profile (no data)", height)
+        return fig
+
+    from gex_engine import compute_gex_from_chain
+
+    # ── Filter: 0DTE (or nearest expiry ≤ max_dte) ────────────────────────
+    near = chain_df[chain_df["expiry_T"] <= max_dte / 365.0].copy()
+    if near.empty:
+        # fallback: just the nearest expiry
+        min_T = chain_df["expiry_T"].min()
+        near  = chain_df[chain_df["expiry_T"] <= min_T + 1 / 365.0].copy()
+    actual_dte = int(round(near["expiry_T"].min() * 365)) if not near.empty else 0
+    dte_label  = "0DTE" if actual_dte <= 1 else f"{actual_dte}DTE"
+
+    gex_chain = compute_gex_from_chain(near, spot)
+
+    # ── Decide OI vs volume ───────────────────────────────────────────────
+    has_vol = ("call_volume" in gex_chain.columns and
+               (gex_chain["call_volume"].fillna(0) > 0).any() and
+               "put_volume" in gex_chain.columns and
+               (gex_chain["put_volume"].fillna(0) > 0).any())
+    using_volume = use_volume and has_vol
+    flow_label   = "VOLUME" if using_volume else "OI"
+
+    if using_volume:
+        call_gex_col = "call_vol_gex"
+        put_gex_col  = "put_vol_gex"
+    else:
+        call_gex_col = "call_gex"
+        put_gex_col  = "put_gex"
+
+    # Aggregate across expirations (if multiple) by strike
+    agg = (gex_chain.groupby("strike")
+                    .agg(**{
+                        "call_gex_val": (call_gex_col, "sum"),
+                        "put_gex_val":  (put_gex_col,  "sum"),
+                    })
+                    .reset_index())
+
+    # ── OTM filter: calls K≥spot, puts K≤spot (Doc 2 §4 & §5) ────────────
+    call_side = agg[agg["strike"] >= spot].copy()
+    put_side  = agg[agg["strike"] <= spot].copy()
+
+    # ── Strike range filter: ±strike_range_pct of spot ────────────────────
+    lo = spot * (1 - strike_range_pct)
+    hi = spot * (1 + strike_range_pct)
+    call_side = call_side[call_side["strike"] <= hi]
+    put_side  = put_side[put_side["strike"]  >= lo]
+
+    # Merge into single strike set for unified Y-axis
+    all_strikes = sorted(set(call_side["strike"]).union(set(put_side["strike"])), reverse=True)
+    if not all_strikes:
+        fig = go.Figure()
+        plotly_dark(fig, f"NET {dte_label} GEX ({flow_label}) — no strikes in range", height)
+        return fig
+
+    call_map = dict(zip(call_side["strike"], call_side["call_gex_val"]))
+    put_map  = dict(zip(put_side["strike"],  put_side["put_gex_val"]))
+
+    # Per-strike values ($M): calls positive, puts negative
+    call_vals = [call_map.get(s, 0.0) / 1e6 for s in all_strikes]
+    put_vals  = [put_map.get(s,  0.0) / 1e6 for s in all_strikes]
+    y_labels  = [f"${s:.0f}" for s in all_strikes]
+
+    # ── Auto-scale: $B if any bar exceeds $1B ─────────────────────────────
+    max_abs = max((abs(v) for v in call_vals + put_vals), default=1.0)
+    if max_abs >= 1000:
+        call_vals = [v / 1000 for v in call_vals]
+        put_vals  = [v / 1000 for v in put_vals]
+        unit = "$B"
+    else:
+        unit = "$M"
+
+    fig = go.Figure()
+
+    # Call bars (positive, right side) — green
+    fig.add_trace(go.Bar(
+        x=call_vals,
+        y=y_labels,
+        orientation="h",
+        name=f"Call GEX ({flow_label})",
+        marker_color=[_C_POS if v > 0 else _C_NEG for v in call_vals],
+        marker_line_width=0,
+        opacity=0.88,
+    ))
+
+    # Put bars (negative, left side) — red
+    fig.add_trace(go.Bar(
+        x=put_vals,
+        y=y_labels,
+        orientation="h",
+        name=f"Put GEX ({flow_label})",
+        marker_color=[_C_NEG if v < 0 else _C_POS for v in put_vals],
+        marker_line_width=0,
+        opacity=0.88,
+    ))
+
+    # Zero line
+    fig.add_vline(x=0, line_color="rgba(255,255,255,0.40)", line_width=1.5)
+
+    # Spot reference line (paper coords on categorical Y-axis)
+    n_cats = len(all_strikes)
+    def _cat_y(target):
+        if n_cats <= 1: return 0.5
+        nearest = min(all_strikes, key=lambda s: abs(s - target))
+        idx = all_strikes.index(nearest)
+        return 1.0 - (idx / (n_cats - 1))
+
+    spot_y = _cat_y(spot)
+    fig.add_shape(type="line", xref="paper", yref="paper",
+                  x0=0, x1=1, y0=spot_y, y1=spot_y,
+                  line=dict(dash="dot", color="rgba(255,255,255,0.75)", width=1.5))
+    fig.add_annotation(xref="paper", yref="paper",
+                       x=1.01, y=spot_y, text=f"SPOT ${spot:.0f}",
+                       showarrow=False, xanchor="left",
+                       font=dict(size=10, color="rgba(255,255,255,0.85)"))
+
+    # Flip line
+    if flip_level and abs(flip_level - spot) / max(spot, 1) < 0.15:
+        flip_y = _cat_y(flip_level)
+        fig.add_shape(type="line", xref="paper", yref="paper",
+                      x0=0, x1=1, y0=flip_y, y1=flip_y,
+                      line=dict(dash="dash", color=_C_FLIP, width=1.5))
+        fig.add_annotation(xref="paper", yref="paper",
+                           x=1.01, y=flip_y, text=f"FLIP ${flip_level:.0f}",
+                           showarrow=False, xanchor="left",
+                           font=dict(size=10, color=_C_FLIP))
+
+    fig.update_layout(
+        barmode="overlay",
+        xaxis_title=f"GEX ({unit}, per 1% S move × 0.01)",
+        yaxis=dict(
+            title="Strike",
+            categoryorder="array",
+            categoryarray=y_labels,
+            tickfont=dict(size=10),
+        ),
+        bargap=0.10,
+        showlegend=True,
+        legend=dict(orientation="h", y=1.04, x=0, font=dict(size=10)),
+    )
+    source_note = "VOLUME (intraday flow)" if using_volume else "OI (positional)"
+    return plotly_dark(fig, f"NET {dte_label} GEX — {source_note} — OTM Only", height)
+
+
 def _key_nodes_table(nodes: List[Tuple[float, float]], spot: float, label: str):
     if not nodes:
         st.caption("No key nodes computed.")
@@ -1039,20 +1202,62 @@ def render_gex_engine():
             st.plotly_chart(fig_gex, use_container_width=True, key="gex_chart_heatmap")
         else:
             # ── Use EXACT same chain slice as heatmap ─────────────────────
-            # Read strike range and DTE from the same attributes _make_heatmap uses.
             _hm_lo  = getattr(_make_heatmap, "_strike_lo", spot - int(st.session_state.get("gex_strikes_each_side", 20)))
             _hm_hi  = getattr(_make_heatmap, "_strike_hi", spot + int(st.session_state.get("gex_strikes_each_side", 20)))
             _hm_dte = int(getattr(_make_heatmap, "_max_dte", st.session_state.get("gex_hm_dte", 30)))
 
-            # Filter chain to same DTE window as heatmap
+            # ── Sub-controls for bar chart ────────────────────────────────
+            bc1, bc2, bc3 = st.columns(3)
+            with bc1:
+                use_vol_toggle = st.toggle(
+                    "Use Volume (0DTE flow)", value=True, key="gex_bar_use_volume",
+                    help="ON = volume-weighted intraday flow (real-time). OFF = OI-weighted positional inventory."
+                )
+            with bc2:
+                range_pct = st.slider(
+                    "Strike range (±% of spot)", min_value=1, max_value=15, value=5,
+                    key="gex_bar_range_pct",
+                    help="Controls how many strikes are shown around spot."
+                ) / 100.0
+            with bc3:
+                near_dte = st.number_input(
+                    "0DTE max DTE", min_value=0, max_value=7, value=1,
+                    key="gex_bar_near_dte",
+                    help="0=0DTE only, 1=today+tomorrow, up to 7 for weekly"
+                )
+
+            # ── PRIMARY: Two-sided 0DTE flow chart (Doc 2 standard) ──────
+            st.markdown(
+                "<div style='font-size:10px;color:rgba(255,255,255,0.5);margin:4px 0 2px;'>"
+                "🔴🟢 NET 0DTE GEX — OTM calls (right) vs OTM puts (left) — volume = real-time dealer flow</div>",
+                unsafe_allow_html=True
+            )
+            fig_twosided = _two_sided_gex_chart(
+                chain_df, spot,
+                flip_level=gs.gamma_flip,
+                use_volume=use_vol_toggle,
+                max_dte=int(near_dte),
+                height=int(st.session_state["gex_hm_height"] // 2),
+                strike_range_pct=range_pct,
+            )
+            st.plotly_chart(fig_twosided, use_container_width=True, key="gex_chart_bar_twosided")
+
+            flow_src = "volume" if use_vol_toggle else "OI"
+            st.caption(
+                f"Calls OTM (K≥spot) positive · Puts OTM (K≤spot) negative · "
+                f"{flow_src}-weighted · ≤{near_dte}DTE · ±{range_pct*100:.0f}% strike range · "
+                f"Volume = intraday hedging flow / OI = structural positioning"
+            )
+
+            st.markdown("---")
+
+            # ── SECONDARY: All-expiry net GEX bar (structural view) ──────
             _bar_chain = chain_df[chain_df["expiry_T"] <= _hm_dte / 365.0].copy()
             if _bar_chain.empty:
                 _bar_chain = chain_df.copy()
 
-            # Aggregate net GEX by strike, same range as heatmap
             _bar_gex = compute_gex_from_chain(_bar_chain, spot)
-            _bar_agg = (_bar_gex.groupby("strike")["net_gex"]
-                                .sum().reset_index())
+            _bar_agg = (_bar_gex.groupby("strike")["net_gex"].sum().reset_index())
             _bar_agg = _bar_agg[(_bar_agg["strike"] >= _hm_lo) & (_bar_agg["strike"] <= _hm_hi)]
             filtered = dict(zip(_bar_agg["strike"], _bar_agg["net_gex"]))
 
@@ -1063,27 +1268,15 @@ def render_gex_engine():
                 regime_note = f"✓ {(1-neg_frac)*100:.0f}% of strikes positive — dealers PIN price."
             else:
                 regime_note = f"Mixed: {(1-neg_frac)*100:.0f}% pos / {neg_frac*100:.0f}% neg."
-            st.caption(f"Green = positive · Red = negative · Yellow = flip · {regime_note} · ${_hm_lo:.0f}–${_hm_hi:.0f} · ≤{_hm_dte}DTE")
 
-            # Nearest expiry (0DTE-style) using same chain slice
-            near0_chain = nearest_expiry_chain(_bar_chain)
-            if near0_chain is not None and len(near0_chain) > 0:
-                near0_gex = compute_gex_from_chain(near0_chain, spot)
-                near0_agg = near0_gex.groupby("strike")["net_gex"].sum().reset_index()
-                near0_agg = near0_agg[(near0_agg["strike"] >= _hm_lo) & (near0_agg["strike"] <= _hm_hi)]
-                near0_filtered = dict(zip(near0_agg["strike"], near0_agg["net_gex"]))
-                min_dte = int(round(near0_chain["expiry_T"].min() * 365))
-                dte_label = "0DTE" if min_dte <= 1 else f"{min_dte}DTE"
-                fig_near0 = _greek_bar_chart(near0_filtered, spot,
-                                             f"Net GEX · Nearest Expiry ({dte_label})",
-                                             _C_POS, _C_NEG, gs.gamma_flip,
-                                             height=int(st.session_state["gex_hm_height"] // 2))
-                st.plotly_chart(fig_near0, use_container_width=True, key="gex_chart_bar_0dte")
-                st.caption(f"↑ Nearest expiry ({dte_label}) — matches GEXBot. ↓ All ≤{_hm_dte}DTE combined.")
-
+            st.markdown(
+                "<div style='font-size:10px;color:rgba(255,255,255,0.4);margin:8px 0 2px;'>"
+                f"ALL-EXPIRY NET GEX (OI-based structural view) — ≤{_hm_dte}DTE · {regime_note}</div>",
+                unsafe_allow_html=True
+            )
             regime_str = REGIME_OPERATIONAL_LABEL.get(gs.regime, gs.regime.value)
             fig_gex = _greek_bar_chart(filtered, spot,
-                                       f"Net GEX · {regime_str} · ≤{_hm_dte}DTE · ${_hm_lo:.0f}–${_hm_hi:.0f}",
+                                       f"Net GEX (OI) · {regime_str} · ≤{_hm_dte}DTE",
                                        _C_POS, _C_NEG, gs.gamma_flip,
                                        height=int(st.session_state["gex_hm_height"] // 2))
             st.plotly_chart(fig_gex, use_container_width=True, key="gex_chart_bar")
@@ -1130,41 +1323,77 @@ def render_gex_engine():
 """)
 
     with tab_vex:
-        st.markdown(f"{sec_hdr('VANNA EXPOSURE — Reaction to IV Changes')}", unsafe_allow_html=True)
-        st.caption("Positive vanna: falling IV → dealers buy underlying (bullish). Negative vanna: falling IV → dealers sell (bearish).")
+        st.markdown(f"{sec_hdr('VEGA EXPOSURE (VEX) — Dollar Sensitivity to IV Changes')}", unsafe_allow_html=True)
+        st.caption(
+            "VEX = OI × Vega × 100. Measures total dollar P&L sensitivity to a 1-vol-unit IV change. "
+            "Positive VEX: falling IV benefits dealers (calls dominant). "
+            "For vanna (dDelta/dIV) see the VNNX column in raw data. "
+            "Divide by 100 for per-1%-vol-point sensitivity."
+        )
         if "not connected" in source.lower() or "empty chain" in source.lower():
             st.warning("⚠️ VEX requires a live Schwab/TOS connection for per-strike IV and OI data.")
 
         view_mode_vex = st.radio("View", ["Heatmap", "Bar Chart"], horizontal=True, key="vex_view_mode")
         if view_mode_vex == "Heatmap":
-            st.caption("Strike × Expiry matrix · Purple/green = positive vanna · Red = negative vanna · TOTAL = net across all expiries")
-            fig_vex = _make_heatmap(chain_df, spot, "net_vex", f"{symbol} VEX", int(st.session_state.get("gex_hm_height", 1000)))
+            st.caption("Strike × Expiry matrix · Purple/green = positive VEX (vega) · Red = negative VEX · TOTAL = net across all expiries")
+            fig_vex = _make_heatmap(chain_df, spot, "net_vex", f"{symbol} VEX (True Vega)", int(st.session_state.get("gex_hm_height", 1000)))
             st.plotly_chart(fig_vex, use_container_width=True, key="gex_chart_vex_heatmap")
         else:
             fig_vex = _greek_bar_chart(dg.vex_by_strike, spot,
-                                       "Net VEX by Strike ($M)", _C_VEX, _C_NEG, gs.gamma_flip)
+                                       "Net VEX (True Vega) by Strike", _C_VEX, _C_NEG, gs.gamma_flip)
             st.plotly_chart(fig_vex, use_container_width=True, key="gex_chart_vex_bar")
 
+        ntm_vex_val = sum(v for k, v in dg.vex_by_strike.items() if abs(k - spot) / spot < 0.02)
         v1, v2 = st.columns(2)
-        ntm_vex_val = sum(v for k,v in dg.vex_by_strike.items() if abs(k-spot)/spot < 0.02)
         with v1:
-            st.markdown(f"**Net Vanna near spot:** ${ntm_vex_val/1e6:.1f}M")
-            st.markdown(f"**Vanna Sign:** {dg.vanna_sign.upper()}")
+            st.metric("Net VEX near spot", f"${ntm_vex_val / 1e6:.1f}M")
+            st.caption("VEX = OI × S × φ(d1) × √T × 100 — dollar P&L per 1-vol-unit IV move")
         with v2:
-            st.markdown("**Interpretation:**")
+            st.markdown("""
+**VEX = True Dollar Vega Exposure**
+- Large positive VEX → dealers heavily long vega (collect premium) → IV drops benefit them
+- Large negative VEX → dealers short vega → IV spikes hurt them → forced hedging
+- Divide by 100 for per-1-vol-point sensitivity
+""")
+
+        st.markdown("---")
+        st.markdown(f"**🌀 Vanna Exposure (VNNX) — dDelta/dIV — IV-driven Hedging Flow**")
+        st.caption(
+            "Vanna = -φ(d1)·d2/σ. Positive vanna: IV rises → dealers BUY. "
+            "Negative vanna: IV rises → dealers SELL. Separate from VEX — this drives directional flow, not P&L."
+        )
+        # Build vanna by strike from the same chain
+        _vnnx_chain = compute_gex_from_chain(
+            chain_df[chain_df["expiry_T"] <= float(st.session_state.get("gex_hm_dte", 30)) / 365.0].copy()
+            if not chain_df.empty else chain_df,
+            spot
+        )
+        _vnnx_agg = _vnnx_chain.groupby("strike")["net_vnnx"].sum().reset_index()
+        vnnx_by_strike = dict(zip(_vnnx_agg["strike"], _vnnx_agg["net_vnnx"]))
+        ntm_vnnx = sum(v for k, v in vnnx_by_strike.items() if abs(k - spot) / spot < 0.02)
+
+        fig_vnnx = _greek_bar_chart(vnnx_by_strike, spot,
+                                    "Vanna Exposure (VNNX) by Strike", _C_VEX, _C_NEG, gs.gamma_flip)
+        st.plotly_chart(fig_vnnx, use_container_width=True, key="gex_chart_vnnx_bar")
+
+        va1, va2 = st.columns(2)
+        with va1:
+            st.metric("Net Vanna near spot", f"${ntm_vnnx / 1e6:.1f}M")
+            st.markdown(f"**Vanna Sign:** {dg.vanna_sign.upper()}")
+        with va2:
             if dg.vanna_sign == "positive":
                 st.markdown("""
 **Positive Vanna near spot:**
-- 📈 **IV rises** → dealers forced to **BUY** underlying (bullish pressure)
-- 📉 **IV falls** → dealers forced to **SELL** underlying (bearish pressure)
-- → **Vanna Squeeze**: IV elevated + likely to compress → dealer selling phase → then upside break
+- 📈 **IV rises** → dealers forced to **BUY** (bullish)
+- 📉 **IV falls** → dealers forced to **SELL** (bearish)
+- → **Vanna Squeeze**: IV elevated + compress → dealer buying → upside break
 """)
             elif dg.vanna_sign == "negative":
                 st.markdown("""
 **Negative Vanna near spot:**
-- 📈 **IV rises** → dealers forced to **SELL** underlying (bearish — amplifies selloff)
-- 📉 **IV falls** → dealers forced to **BUY** underlying (bullish on vol crush)
-- → **Vanna Rug risk**: catalyst spikes IV → dealers sell → cascading selloff
+- 📈 **IV rises** → dealers forced to **SELL** (bearish, amplifies selloff)
+- 📉 **IV falls** → dealers forced to **BUY** (bullish on vol crush)
+- → **Vanna Rug risk**: catalyst spikes IV → dealers sell → cascade
 """)
             else:
                 st.info("Neutral vanna — no strong IV-driven directional pressure.")

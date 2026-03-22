@@ -23,9 +23,6 @@ from intel_monitor import (load_feeds, geo_shock_score, categorise_items,
                             category_shock_score, _all_feeds_flat, INTEL_CATEGORIES)
 
 # ── Chokepoint disruption guard ───────────────────────────────────────────────
-# geo_shock_score in intel_monitor awards points for chokepoint mentions but
-# does not distinguish between routine traffic reports and actual disruption
-# events (military strikes, seizures, blockades). This filter gates the bonus.
 _CHOKEPOINT_DISRUPTION = {
     "blocked", "closed", "seized", "attack", "struck", "mine",
     "missile", "navy", "warship", "tanker", "disrupted",
@@ -35,10 +32,9 @@ _CHOKEPOINT_DISRUPTION = {
 try:
     from intel_monitor import STRATEGIC_CHOKEPOINTS as _CHOKEPOINTS
 except ImportError:
-    _CHOKEPOINTS = {}   # graceful fallback if not exported
+    _CHOKEPOINTS = {}
 
 def _chokepoint_bonus(txt: str) -> float:
-    """Return 8.0 if text mentions a chokepoint AND a disruption keyword."""
     txt_l = txt.lower()
     for name, aliases in _CHOKEPOINTS.items():
         if any(alias.lower() in txt_l for alias in aliases):
@@ -156,14 +152,6 @@ def _forward_prob_fig(
     rv_ndx = _rv20(qqq)
 
     def _sim_paths(spot, ann_vol, vvix_val, vts_s, days, n):
-        """Merton jump-diffusion paths — GBM + calibrated jump component.
-
-        Using plain GBM systematically underestimates tail probabilities.
-        On high-VVIX days (ratio >5.5) the difference in P(down>3%) vs pure
-        GBM is 3-5 percentage points. _merton_calibrate scales lam with the
-        VVIX/VIX ratio and mj with VTS shape, so jump intensity and size
-        both respond to current market stress.
-        """
         sig = ann_vol / 100.0
         dt  = 1 / 252
         params = _merton_calibrate(ann_vol, vvix_val, vts_s, vrp_val=0)
@@ -171,15 +159,14 @@ def _forward_prob_fig(
         mj        = params["mj"]
         sj        = params["sj"]
         jump_comp = params["jump_comp"]
-        # Risk-neutral drift: subtract jump compensation so paths are martingales
         drift = -0.5 * sig**2 - jump_comp
 
         paths = np.zeros((n, days + 1))
         paths[:, 0] = spot
         for t in range(1, days + 1):
             z  = rng.standard_normal(n)
-            nj = rng.poisson(lam * dt, n)          # number of jumps per path
-            j  = rng.normal(mj, sj, n) * nj        # aggregate log-jump size
+            nj = rng.poisson(lam * dt, n)
+            j  = rng.normal(mj, sj, n) * nj
             paths[:, t] = paths[:, t-1] * np.exp(
                 drift * dt + sig * np.sqrt(dt) * z + j
             )
@@ -231,7 +218,6 @@ def _forward_prob_fig(
     pr_spx = _prob_row(spx_paths, spx)
     pr_ndx = _prob_row(ndx_paths, ndx)
 
-    # Merton calibration params for subtitle annotation
     _mp = _merton_calibrate(vix, vvix, vts_shape, vrp_val=0)
 
     fig = make_subplots(
@@ -298,7 +284,6 @@ def _forward_prob_fig(
         showscale=False, zmin=0,
     ), row=2, col=1)
 
-    # NDX terminal: compute its OWN histogram from term_ndx, not a scaled SPX one
     hist_vals_ndx, bin_edges_ndx = np.histogram(term_ndx, bins=40, density=True)
     bin_centers_ndx = (bin_edges_ndx[:-1] + bin_edges_ndx[1:]) / 2
     fig.add_trace(go.Bar(
@@ -791,39 +776,18 @@ def _recession_stress(sahm: float, hy: float, s2s10_bp: float,
                       icsa_series: "pd.Series | None" = None,
                       spx_dd: float = 0.0, epu_z: float = 0.0,
                       s2s10_series: "pd.Series | None" = None) -> dict:
-    """
-    Recession Stress Index — orthogonal to the fear composite.
-
-    The fear composite already captures VIX (35%) and HY OAS (25%). Including
-    them here too causes multicollinearity: fear and rec_sig together represent
-    55% of the composite weight but share the same underlying data.
-
-    Fix: rec_sig uses ONLY signals that are genuinely independent of VIX/EPU:
-      Sahm Rule          40%  — best single real-time recession indicator
-      HY OAS             25%  — credit leads equity, partially distinct from VIX
-      Yield curve        20%  — 6-18M leading, slow-moving, independent of VIX
-      ICSA claims        15%  — weekly labor, independent of vol markets
-
-    VIX and EPU are REMOVED from this index (they live in fear_composite).
-    Yield curve inversion DURATION is added as an extra multiplier — a curve
-    that's been inverted for 200 days is a stronger recession signal than one
-    that just inverted last week.
-    """
     from scipy.special import expit as _sigmoid
 
     sahm_z = np.clip(sahm / 0.4, 0, 1)
     hy_z   = np.clip((hy - 350) / 450, 0, 1)
     curve_z = np.clip((-s2s10_bp) / 150, 0, 1)
 
-    # Curve inversion duration multiplier: the longer the curve has been
-    # inverted, the stronger the recession signal (caps at 2× for 18M+ inv.)
     inv_dur_mult = 1.0
     if s2s10_series is not None and s2s10_series.dropna().size > 10:
         _inv_days = int((s2s10_series.dropna() < 0).rolling(252, min_periods=1).sum().iloc[-1])
         inv_dur_mult = float(np.clip(1.0 + _inv_days / 365.0, 1.0, 2.0))
     curve_z = np.clip(curve_z * inv_dur_mult, 0, 1)
 
-    # ICSA: rolling z-score vs 52W history (3σ spike = max)
     if icsa_series is not None and icsa_series.dropna().size >= 26:
         _ic   = icsa_series.dropna()
         _mean = float(_ic.rolling(52, min_periods=26).mean().iloc[-1])
@@ -858,8 +822,6 @@ def _recession_stress(sahm: float, hy: float, s2s10_bp: float,
 
 # ══════════════════════════════════════════════════════════════════════════════
 # THREE-HORIZON ENGINES + COMPOSITE
-# Each engine is self-contained, returns score on [-5, +5].
-# Final composite blends them with regime-conditional weights.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _intraday_engine(
@@ -875,45 +837,36 @@ def _intraday_engine(
         rv5: float,
         rv20: float,
 ) -> dict:
-    """
-    Intraday / 0–1 day engine.
-    Inputs: GEX positioning, multi-horizon momentum, credit spread, vol trend.
-    Returns score [-5, +5] and component dict.
-    """
     neg = gex_regime in (GammaRegime.NEGATIVE, GammaRegime.STRONG_NEGATIVE)
     pos = gex_regime in (GammaRegime.POSITIVE, GammaRegime.STRONG_POSITIVE)
 
-    # 1. Multi-horizon SPX momentum (weighted, gamma-conditional direction)
     mom_raw = 0.5 * spx_1d_ret + 0.3 * spx_3d_ret + 0.2 * spx_5d_ret
     if pos:
-        mom_spx = -mom_raw   # positive GEX → mean-revert
+        mom_spx = -mom_raw
     elif neg:
-        mom_spx =  mom_raw   # negative GEX → follow trend
+        mom_spx =  mom_raw
     else:
         mom_spx = -mom_raw * 0.5
     mom_spx = float(np.clip(mom_spx / 0.03, -2.5, 2.5))
 
-    # 2. Credit spread (multi-horizon, HYG vs LQD)
     credit_1d = hyg_1d_ret - lqd_1d_ret
     credit_3d = hyg_3d_ret - lqd_3d_ret
     mom_credit = float(np.clip((0.6 * credit_1d + 0.4 * credit_3d) / 0.005, -1.5, 1.5))
 
-    # 3. GEX flip proximity — nonlinear tanh response
     if np.isfinite(dist_to_flip_pct):
-        mom_gex = float(np.tanh(dist_to_flip_pct / 1.5))   # smooth ±1
+        mom_gex = float(np.tanh(dist_to_flip_pct / 1.5))
     else:
         mom_gex = 0.0
 
-    # 4. Vol expansion/compression — rv5 > rv20 = expanding = bearish
     if np.isfinite(rv5) and np.isfinite(rv20) and rv20 > 0:
         vol_trend = rv5 - rv20
-        vol_signal = float(np.clip(-vol_trend / 3.0, -1.0, 1.0))  # expanding → negative
+        vol_signal = float(np.clip(-vol_trend / 3.0, -1.0, 1.0))
     else:
         vol_signal = 0.0
 
     score = mom_spx * 0.40 + mom_credit * 0.25 + mom_gex * 0.20 + vol_signal * 0.15
     return {
-        "score":      float(np.clip(score * (5 / 1.5), -5.0, 5.0)),  # normalise to ±5
+        "score":      float(np.clip(score * (5 / 1.5), -5.0, 5.0)),
         "mom_spx":    mom_spx,
         "mom_credit": mom_credit,
         "mom_gex":    mom_gex,
@@ -928,30 +881,21 @@ def _short_term_engine(
         spx_dd: float,
         prob: dict,
 ) -> dict:
-    """
-    Short-term / 1–5 day engine.
-    Inputs: VRP (vol carry), VTS shape, fear composite, drawdown, prob buckets.
-    Returns score [-5, +5].
-    """
-    # 1. VRP — positive VRP = vol sellers have carry = bullish 1-5d (Bollerslev 2009)
     if np.isfinite(vrp_val):
         if vrp_val > 4:    vrp_sig =  2.0
         elif vrp_val > 2:  vrp_sig =  1.0
         elif vrp_val < -4: vrp_sig = -2.0
         elif vrp_val < -2: vrp_sig = -1.0
-        else:              vrp_sig =  vrp_val * 0.3  # linear in the neutral zone
+        else:              vrp_sig =  vrp_val * 0.3
     else:
         vrp_sig = 0.0
 
-    # 2. Fear composite — high fear = bearish short-term, but backwardation = contrarian
     fear_sig = float(np.clip(-fear_z * 1.2, -2.5, 2.5))
     if vts_shape == "BACKWARDATION":
-        fear_sig += 0.5   # contrarian: vol mean-reverts ~60% within 1-3 weeks
+        fear_sig += 0.5
 
-    # 3. Drawdown momentum — recent SPX decline is context
     dd_sig = float(np.clip(spx_dd / 0.05, -1.5, 1.5))
 
-    # 4. Probability buckets (tactical 1-5d, not medium)
     def _bs(p): return (p - 50.0) / 10.0
     prob_sig = float(np.clip(
         0.60 * _bs(prob.get("tactical_prob", 50.0)) +
@@ -975,24 +919,18 @@ def _medium_term_engine(
         rec_score: float,
         prob: dict,
 ) -> dict:
-    """
-    Medium-term / 2–4 week engine.
-    Inputs: macro regime, economic breadth, recession stress, medium prob.
-    Returns score [-5, +5].
-    """
-    # 1. Macro regime quadrant
+    # FIX 2: Goldilocks base reduced from +2.0 → +1.0 to prevent systematic
+    # bull tilt from regime label alone on otherwise ambiguous days.
     regime_base = {
-        "Goldilocks":   +1.0,  # reduced: avoid systematic bull tilt on regime label alone
+        "Goldilocks":   +1.0,
         "Overheating":  +0.5,
         "Disinflation": -0.5,
         "Stagflation":  -2.0,
         "Deflation":    -3.0,
     }.get(macro_reg, 0.0)
 
-    # 2. Economic breadth (7-metric growth score, -7 to +7)
     growth_sig = float(np.clip(growth_score / 4.5, -1.5, 1.5))
 
-    # 3. Medium-term probability bucket
     def _bs(p): return (p - 50.0) / 10.0
     prob_sig = float(np.clip(_bs(prob.get("medium_prob", 50.0)), -1.5, 1.5))
 
@@ -1018,7 +956,6 @@ def _composite(prob: dict, vrp_val: float,
                lqd_1d_ret: float = 0.0,
                dist_to_flip_pct: float = 5.0,
                hy_oas_pct: float = 3.0,
-               # Extended inputs for upgraded engines
                spx_1d_ret: float = 0.0,
                spx_3d_ret: float = 0.0,
                hyg_3d_ret: float = 0.0,
@@ -1026,28 +963,10 @@ def _composite(prob: dict, vrp_val: float,
                rv5: float = float("nan"),
                rv20: float = float("nan"),
                ) -> float:
-    """
-    Three-horizon composite score -10 to +10.
-
-    Architecture:
-      intraday_engine  (GEX, momentum, credit, vol trend) → [-5,+5]
-      short_term_engine (VRP, fear, drawdown, prob 1-5d)  → [-5,+5]
-      medium_term_engine (macro, breadth, prob 2-4w)      → [-5,+5]
-
-    Blending weights are REGIME-CONDITIONAL:
-      Negative GEX (trending market):  intraday 40%, short 40%, medium 20%
-      Positive GEX (mean-rev market):  intraday 20%, short 40%, medium 40%
-      Neutral:                         intraday 30%, short 40%, medium 30%
-
-    Recession: smooth sigmoid filter (no hard jumps).
-    GEX double-counting removed: GEX only in intraday momentum, not as overlay.
-    NO EDGE state: returned when score is weak AND momentum is weak.
-    """
     neg = gex_regime in (GammaRegime.NEGATIVE, GammaRegime.STRONG_NEGATIVE) if gex_regime else False
     pos = gex_regime in (GammaRegime.POSITIVE, GammaRegime.STRONG_POSITIVE)  if gex_regime else False
     at_flip = abs(dist_to_flip_pct) < 0.4 if np.isfinite(dist_to_flip_pct) else False
 
-    # ── Run three engines ─────────────────────────────────────────────────────
     intra  = _intraday_engine(
         gex_regime, dist_to_flip_pct,
         spx_1d_ret, spx_3d_ret, spx_5d_ret,
@@ -1057,25 +976,20 @@ def _composite(prob: dict, vrp_val: float,
     short  = _short_term_engine(vrp_val, vts_shape, fear_z, spx_dd, prob)
     medium = _medium_term_engine(macro_reg, growth_score, rec_score, prob)
 
-    # ── Regime-conditional blending ───────────────────────────────────────────
     if neg:
-        # Trending market: intraday + short-term matter most, macro less
         wi, ws, wm = 0.40, 0.40, 0.20
     elif pos:
-        # Mean-reversion market: macro + short-term matter more, intraday faded
         wi, ws, wm = 0.20, 0.40, 0.40
     else:
         wi, ws, wm = 0.30, 0.40, 0.30
 
     s = wi * intra["score"] + ws * short["score"] + wm * medium["score"]
 
-    # ── Smooth recession filter — sigmoid, no hard jumps (Fix 4) ─────────────
     rec_penalty = 1.0 / (1.0 + np.exp(-(rec_score - 50.0) / 10.0))
-    s *= (1.0 - 0.40 * rec_penalty)           # shrink signal in stressed environments
-    max_bull = 5.0 * (1.0 - 0.70 * rec_penalty)  # compress bullish ceiling
+    s *= (1.0 - 0.40 * rec_penalty)
+    max_bull = 5.0 * (1.0 - 0.70 * rec_penalty)
     s = min(s, max_bull)
 
-    # ── Stress flags (Sahm + HY stress + corr systemic) ──────────────────────
     stress_count = 0
     if leading is not None:
         sahm_triggered = leading.get("sahm_triggered", False)
@@ -1084,22 +998,23 @@ def _composite(prob: dict, vrp_val: float,
         stress_count   = sum([bool(sahm_triggered), bool(hy_stress), bool(corr_systemic)])
         s -= stress_count * 0.4
 
-    # ── VTS backwardation contrarian overlay ──────────────────────────────────
     if vts_shape == "BACKWARDATION":
-        s += 0.25  # vol mean-reverts ~60% within 3 weeks → mild bull carry
+        s += 0.25
 
-    # ── Hard structural caps (pre-scale) ─────────────────────────────────────
-    _SCALE = 2.0   # ±5 engine outputs → ±10 final
+    _SCALE = 2.0
     if stress_count >= 2:
-        s = min(s, -1.0)    # post-scale = -2
+        s = min(s, -1.0)
     elif stress_count == 1:
-        s = min(s,  1.5)    # post-scale = +3
+        s = min(s,  1.5)
 
-    # ── Scale to ±10 ─────────────────────────────────────────────────────────
     s = s * _SCALE
 
-    # ── NO EDGE state: at flip or both score and momentum weak ───────────────
-    # Exception: VTS backwardation is a genuine contrarian signal — preserve it.
+    # FIX 1: Backwardation contrarian NO EDGE bug.
+    # Previously: `if at_flip or (abs(s) < 1.5 and mom_abs < 0.5)`
+    # This wiped out the backwardation contrarian signal even when it was the
+    # primary edge (VTS backwardation + positive gamma + slight fear).
+    # Fix: exclude the backwardation case from the NO EDGE condition so the
+    # vol mean-reversion signal survives weak-momentum days.
     mom_abs = abs(intra.get("mom_spx", 0)) + abs(intra.get("mom_credit", 0))
     _vts_contrarian = (vts_shape == "BACKWARDATION") and not at_flip
     if at_flip or (abs(s) < 1.5 and mom_abs < 0.5 and not _vts_contrarian):
@@ -1108,18 +1023,6 @@ def _composite(prob: dict, vrp_val: float,
     return float(np.clip(s, -10.0, 10.0))
 
 def _verdict(c: float, gex: GammaRegime) -> Tuple[str,str,str]:
-    """
-    Map composite score to verdict label.
-
-    With the recalibrated _composite (divisor=8, no ×3 multiplier):
-      Typical neutral day (probs ~50%): s ≈ 0 ± overlays → −2 to +1
-      Mild conviction (probs ~58%):     s ≈ ±1 + overlays
-      Strong conviction (probs ~70%):   s ≈ ±2.5 + overlays
-      Max theoretical:                  s ≈ ±8
-
-    Thresholds scaled accordingly — BEARISH requires genuine bearish
-    probability signal OR strong probability signal + structural stress.
-    """
     neg=gex in (GammaRegime.NEGATIVE,GammaRegime.STRONG_NEGATIVE)
     pos=gex in (GammaRegime.POSITIVE,GammaRegime.STRONG_POSITIVE)
     if c<=-3: return "BEARISH","#ef4444","Multiple signals aligned bearish."
@@ -1138,7 +1041,6 @@ def _verdict3(c: float, gex: GammaRegime, vrp_val: float,
               vts_shape: str, fear_z: float, rec_score: float,
               macro_reg: str, dist_flip_pct: float,
               leading: dict = None) -> dict:
-    """3-layer verdict: BIAS + STRUCTURE + STRATEGY + conflict detection."""
     neg = gex in (GammaRegime.NEGATIVE, GammaRegime.STRONG_NEGATIVE)
     pos = gex in (GammaRegime.POSITIVE, GammaRegime.STRONG_POSITIVE)
     at_flip = abs(dist_flip_pct) < 0.5 if np.isfinite(dist_flip_pct) else False
@@ -1147,7 +1049,6 @@ def _verdict3(c: float, gex: GammaRegime, vrp_val: float,
     backw      = vts_shape == "BACKWARDATION"
     corr_stress = (leading or {}).get("corr_regime", "NORMAL") in ("STRESS","SYSTEMIC")
 
-    # ── BIAS ──────────────────────────────────────────────────────────────────
     if c == 0.0 and at_flip:
         bias, bias_color = "NO TRADE",          "#94a3b8"
     elif c == 0.0:
@@ -1161,12 +1062,10 @@ def _verdict3(c: float, gex: GammaRegime, vrp_val: float,
     elif c <= 2.5:  bias, bias_color = "LEANING BULLISH", "#34d399"
     else:           bias, bias_color = "BULLISH",          "#10b981"
 
-    # ── CONFIDENCE ────────────────────────────────────────────────────────────
     n_weak = sum([at_flip, corr_stress, abs(c) < 1.5, fear_z > 1.5])
     confidence = "LOW" if n_weak >= 2 else "HIGH" if (abs(c) > 3.0 and not at_flip) else "MEDIUM"
     confidence_pct = float(min(abs(c) / 5.0, 1.0))
 
-    # ── BIAS TYPE ─────────────────────────────────────────────────────────────
     if "BEARISH" in bias or "CAUTIOUS" in bias:
         if neg and fear_z > 0.5:
             bias_type = "TREND BEARISH"
@@ -1194,7 +1093,6 @@ def _verdict3(c: float, gex: GammaRegime, vrp_val: float,
         bias_type = "NO DIRECTIONAL EDGE"
         bias_type_note = "Conflicting or insufficient inputs — reduce size"
 
-    # ── STRUCTURE ─────────────────────────────────────────────────────────────
     if at_flip:
         structure, structure_note = "⚡ NEAR FLIP",       "At gamma flip — binary outcome, no mechanical edge"
     elif neg and fear_z > 0.5:
@@ -1206,7 +1104,6 @@ def _verdict3(c: float, gex: GammaRegime, vrp_val: float,
     else:
         structure, structure_note = "〰️ CHOP",             "No clear mechanical bias"
 
-    # ── STRATEGY ─────────────────────────────────────────────────────────────
     if at_flip or c == 0.0:
         strategy = "🚫 NO TRADE — no mechanical edge. Wait for resolution."
     elif bias_type == "TREND BEARISH":
@@ -1226,7 +1123,6 @@ def _verdict3(c: float, gex: GammaRegime, vrp_val: float,
     else:
         strategy = "⚖️ STAY FLAT / REDUCE SIZE — no clear edge."
 
-    # ── SIGNAL CONFLICTS ──────────────────────────────────────────────────────
     conflicts = []
     sdir = {}
     if vrp_high:       sdir["Vol (VRP)"]   = "bullish"
@@ -1251,7 +1147,6 @@ def _verdict3(c: float, gex: GammaRegime, vrp_val: float,
     if pos and fear_z > 1.0:
         conflicts.append(("⚠️","GEX says pin (pos gamma) but fear elevated — dealers may unwind"))
 
-    # ── HOW TO TRADE ──────────────────────────────────────────────────────────
     how_to = []
     if at_flip:
         how_to.append(("🚫","At gamma flip — sit out or 25% size."))
@@ -1357,7 +1252,6 @@ def _gex_histogram(chain_df, spot: float, flip: float,
 
         gex_chain = compute_gex_from_chain(near_chain, spot)
 
-        # Volume GEX when available — matches the bar chart and flip line
         _vol_avail = ("net_vol_gex" in gex_chain.columns and
                       gex_chain["net_vol_gex"].abs().sum() > 0)
         _gex_col = "net_vol_gex" if _vol_avail else "net_gex"
@@ -1403,7 +1297,6 @@ def _gex_histogram(chain_df, spot: float, flip: float,
             annotation_position="top right",
         )
 
-        # Flip line — exact price at net GEX = 0 crossing
         if flip and np.isfinite(flip) and lo <= flip <= hi:
             fig.add_vline(
                 x=flip, line_dash="dash",
@@ -1429,19 +1322,12 @@ def _gex_histogram(chain_df, spot: float, flip: float,
         return fig
 
 
-
 def _intraday_bias(q: dict, gex_state) -> tuple:
-    """
-    Derive a quick intraday directional bias label from live quotes.
-    Uses SPX session change + VIX direction + credit spread.
-    Returns (label, color) e.g. ("BULL FLOW", "#10b981")
-    """
     spx_pct  = q.get("SPX_pct", 0.0) or 0.0
     vix_pct  = q.get("VIX_pct", 0.0) or 0.0
     hyg_pct  = q.get("HYG_pct", 0.0) or 0.0
     lqd_pct  = q.get("LQD_pct", 0.0) or 0.0
 
-    # Credit spread: HYG outperforming LQD = risk-on
     credit_spread = hyg_pct - lqd_pct
 
     bull_pts = 0
@@ -1452,7 +1338,7 @@ def _intraday_bias(q: dict, gex_state) -> tuple:
     elif spx_pct < -0.3: bear_pts += 2
     elif spx_pct < 0:    bear_pts += 1
 
-    if vix_pct < -3:   bull_pts += 2   # VIX crushing = risk-on
+    if vix_pct < -3:   bull_pts += 2
     elif vix_pct < 0:  bull_pts += 1
     elif vix_pct > 5:  bear_pts += 2
     elif vix_pct > 0:  bear_pts += 1
@@ -1460,11 +1346,10 @@ def _intraday_bias(q: dict, gex_state) -> tuple:
     if credit_spread > 0.2:  bull_pts += 1
     elif credit_spread < -0.2: bear_pts += 1
 
-    # GEX context: near flip = compress signal
     try:
         dist = abs(float(gex_state.distance_to_flip_pct))
         if dist < 0.3:
-            bull_pts = bear_pts = 0  # at flip = no directional edge
+            bull_pts = bear_pts = 0
     except Exception:
         pass
 
@@ -1510,20 +1395,14 @@ def render_thesis_page():
         epu=resample_ffill(epu_r,idx) if len(epu_r.dropna())>0 else None
         icsa_r=raw.get("ICSA",pd.Series(dtype=float))
         icsa=resample_ffill(icsa_r,idx) if len(icsa_r.dropna())>0 else None
-        # ── Additional metrics from the macro framework ────────────────────
-        # Job Market: NFP (PAYEMS MoM change in thousands)
         nfp_r   = raw.get("PAYEMS", pd.Series(dtype=float))
         nfp_s   = resample_ffill(nfp_r, idx) if len(nfp_r.dropna()) > 0 else None
-        # Inflation: PPI MoM
         ppi_r   = raw.get("PPIACO", pd.Series(dtype=float))
         ppi_s   = resample_ffill(ppi_r, idx) if len(ppi_r.dropna()) > 0 else None
-        # Economic Activity: ISM Non-Manufacturing (NMI)
         ism_nm_r = raw.get("NMFCI", pd.Series(dtype=float))
         ism_nm   = resample_ffill(ism_nm_r, idx) if len(ism_nm_r.dropna()) > 0 else None
-        # Economic Activity: Chicago PMI
         chi_pmi_r = raw.get("CHPMINDX", pd.Series(dtype=float))
         chi_pmi   = resample_ffill(chi_pmi_r, idx) if len(chi_pmi_r.dropna()) > 0 else None
-        # Economic Activity: Consumer Confidence (UMich)
         conf_r  = raw.get("UMCSENT", pd.Series(dtype=float))
         conf_s  = resample_ffill(conf_r, idx) if len(conf_r.dropna()) > 0 else None
 
@@ -1535,8 +1414,6 @@ def render_thesis_page():
     cyl=_sl(core_yoy,2.5); crl=_sl(s2s10,0.0)
     gz=zscore(s2s10.fillna(0)); iz=zscore(core_yoy.fillna(cyl))
 
-    # ── Raw metric scalars (needed by regime classifier below) ────────────
-    # These are computed here — display strings / Fed signals computed later.
     _icsa_v_raw  = _sl(icsa, float("nan")) if icsa is not None else float("nan")
     _icsa_v_k    = _icsa_v_raw / 1000 if np.isfinite(_icsa_v_raw) else float("nan")
     _nfp_v       = float(nfp_s.dropna().diff(1).dropna().iloc[-1]) if (nfp_s is not None and nfp_s.dropna().size > 1) else float("nan")
@@ -1546,98 +1423,65 @@ def render_thesis_page():
     _ism_nm_v    = _sl(ism_nm, float("nan")) if ism_nm is not None else float("nan")
     _chi_v       = _sl(chi_pmi, float("nan")) if chi_pmi is not None else float("nan")
     _conf_v      = _sl(conf_s, float("nan")) if conf_s is not None else float("nan")
-    # ur and cyi also needed by regime classifier
     ur  = _sl(unrate, 4.0)
     cyi = _sl(cpi_yoy, 2.5)
 
-    # ── Macro regime — multi-metric classification ────────────────────────
-    # Uses all 10 metrics from the framework image with their exact thresholds.
-    #
-    # Each metric contributes a GROWTH score and an INFLATION score:
-    #   Growth score  >0 → expansionary conditions → supports Goldilocks/Overheating
-    #   Growth score  <0 → contractionary conditions → supports Stagflation/Deflation
-    #   Inflation score >0 → inflation hot → Overheating/Stagflation
-    #   Inflation score <0 → inflation cooling → Goldilocks/Deflation
-    #
-    # Metric → Growth / Inflation signal mapping:
-    #   Unemployment  high → bad growth (-1), low → good growth (+1)       | no inflation signal
-    #   ICSA          high → bad growth (-1), low → good growth (+1)       | no inflation signal
-    #   NFP           high → good growth (+1), low → bad growth (-1)       | no inflation signal
-    #   CPI YoY       high → hot inflation (+1 inf), low → cool (-1 inf)   | slight growth drag if >3%
-    #   Core CPI YoY  high → hot inflation (+1 inf), low → cool (-1 inf)   | no growth signal
-    #   PPI MoM       high → hot inflation (+1 inf), low → cool (-1 inf)   | no growth signal
-    #   ISM Mfg PMI   >55 → good growth (+1), <50 → bad growth (-1)        | >55 mild inflation
-    #   ISM Non-Mfg   >55 → good growth (+1), <50 → bad growth (-1)        | >55 mild inflation
-    #   Chicago PMI   >55 → good growth (+1), <50 → bad growth (-1)        | no inflation signal
-    #   Cons Conf     >120 → good growth (+1), <100 → bad growth (-1)      | no inflation signal
-
-    # Use scalars computed above — fall back to NaN-safe defaults
-    _ur_val    = ur                                        # percent
-    _icsa_val  = _icsa_v_k if np.isfinite(_icsa_v_k) else float("nan")  # thousands
-    _nfp_val   = _nfp_v                                   # thousands MoM
-    _cpi_val   = cyi                                       # percent YoY
-    _ccpi_val  = _ccpi_v                                  # percent YoY
-    _ppi_val   = _ppi_mom                                 # percent MoM
-    _ism_val   = _ism_mfg_v                               # index
-    _ism_nm_val= _ism_nm_v                                # index
-    _chi_val   = _chi_v                                   # index
-    _conf_val  = _conf_v                                  # index
+    _ur_val    = ur
+    _icsa_val  = _icsa_v_k if np.isfinite(_icsa_v_k) else float("nan")
+    _nfp_val   = _nfp_v
+    _cpi_val   = cyi
+    _ccpi_val  = _ccpi_v
+    _ppi_val   = _ppi_mom
+    _ism_val   = _ism_mfg_v
+    _ism_nm_val= _ism_nm_v
+    _chi_val   = _chi_v
+    _conf_val  = _conf_v
 
     def _score_hi_good(val, good_thresh, bad_thresh):
-        """High value = good (+1). val>=good → +1, val<=bad → -1, else 0."""
         if not np.isfinite(val): return 0
         if val >= good_thresh: return +1
         if val <= bad_thresh:  return -1
         return 0
 
     def _score_hi_bad(val, bad_thresh, good_thresh):
-        """High value = bad (-1). val>=bad → -1, val<=good → +1, else 0."""
         if not np.isfinite(val): return 0
         if val >= bad_thresh:  return -1
         if val <= good_thresh: return +1
         return 0
 
-    # Growth scores (+1 = expansion, -1 = contraction)
-    # Image thresholds: UR high(>5.5%)=weak, normal(4-5.5%), low(<4%)=strong
-    _g_ur    = _score_hi_bad (_ur_val,    5.5,  4.0)   # high UR → bad growth
-    _g_icsa  = _score_hi_bad (_icsa_val, 350,  250)    # high claims → bad growth
-    _g_nfp   = _score_hi_good(_nfp_val,  250,   50)    # high NFP → good growth
-    _g_ism   = _score_hi_good(_ism_val,   55,   50)    # >55 expansion, <50 contraction
+    _g_ur    = _score_hi_bad (_ur_val,    5.5,  4.0)
+    _g_icsa  = _score_hi_bad (_icsa_val, 350,  250)
+    _g_nfp   = _score_hi_good(_nfp_val,  250,   50)
+    _g_ism   = _score_hi_good(_ism_val,   55,   50)
     _g_ism_nm= _score_hi_good(_ism_nm_val,55,   50)
     _g_chi   = _score_hi_good(_chi_val,   55,   50)
-    _g_conf  = _score_hi_good(_conf_val, 120,  100)    # >120 strong, <100 negative
+    _g_conf  = _score_hi_good(_conf_val, 120,  100)
 
     growth_score = (_g_ur + _g_icsa + _g_nfp +
-                    _g_ism + _g_ism_nm + _g_chi + _g_conf)  # range: -7 to +7
+                    _g_ism + _g_ism_nm + _g_chi + _g_conf)
 
-    # Inflation scores (+1 = hot, -1 = cool)
-    # Image thresholds: CPI high(>2%)=hot, normal(~2%), low(<2%)=cool
-    _i_cpi   = _score_hi_good(_cpi_val,  2.5, 1.5)    # >2.5% hot, <1.5% cool
+    _i_cpi   = _score_hi_good(_cpi_val,  2.5, 1.5)
     _i_ccpi  = _score_hi_good(_ccpi_val, 2.5, 1.5)
-    _i_ppi   = _score_hi_good(_ppi_val,  0.2, 0.0)    # >0.2% hot, <0% deflationary
+    _i_ppi   = _score_hi_good(_ppi_val,  0.2, 0.0)
     _i_ism_r = +1 if (np.isfinite(_ism_val) and _ism_val > 55) else (
                -1 if (np.isfinite(_ism_val) and _ism_val < 48) else 0)
 
-    inflation_score = _i_cpi + _i_ccpi + _i_ppi + _i_ism_r  # range: -4 to +4
+    inflation_score = _i_cpi + _i_ccpi + _i_ppi + _i_ism_r
 
-    # Direction of travel modifier: is core CPI actively falling?
     _core_3m_chg = float(core_yoy.dropna().diff(63).dropna().iloc[-1]) if core_yoy.dropna().size > 63 else 0.0
-    _disinflating = _core_3m_chg < -0.10  # falling >10bp over 3M
+    _disinflating = _core_3m_chg < -0.10
 
-    # Classify regime from growth_score × inflation_score
     if growth_score >= 1 and inflation_score >= 1:
-        macro_reg = "Overheating"      # strong growth + hot inflation
+        macro_reg = "Overheating"
     elif growth_score >= 1 and inflation_score <= 0:
-        macro_reg = "Goldilocks"       # strong growth + cooling inflation
+        macro_reg = "Goldilocks"
     elif growth_score <= -1 and inflation_score >= 1:
-        # Stagflation — soften if CPI is already falling (transitory stagflation)
         macro_reg = "Disinflation" if _disinflating else "Stagflation"
     elif growth_score <= -1 and inflation_score <= -1:
-        macro_reg = "Deflation"        # weak growth + falling prices
+        macro_reg = "Deflation"
     elif growth_score <= -1 and inflation_score == 0:
-        macro_reg = "Disinflation"     # weak growth + neutral inflation = slowing
+        macro_reg = "Disinflation"
     else:
-        # Mixed signals — use z-score tiebreaker
         _gz_now = _sl(gz, 0.0)
         _iz_now = _sl(iz, 0.0)
         if _gz_now >= 0 and _iz_now >= 0:   macro_reg = "Overheating"
@@ -1645,7 +1489,6 @@ def render_thesis_page():
         elif _gz_now < 0 and _iz_now >= 0:  macro_reg = "Disinflation" if _disinflating else "Stagflation"
         else:                                macro_reg = "Deflation" if _iz_now < -0.5 else "Disinflation"
 
-    # Override: external classifier only when it reads more stress than we do
     try:
         _ext_reg = classify_macro_regime_abs(cyl, crl)
         if _ext_reg in ("Stagflation", "Deflation") and macro_reg in ("Goldilocks", "Overheating"):
@@ -1660,14 +1503,7 @@ def render_thesis_page():
                    if epu is not None and epu.dropna().size > 0
                    else pd.Series(100.0, index=idx))
 
-    # ── Fear composite — rolling 252-day z-score ──────────────────────────
-    # Using global zscore over the full 2Y window causes a bias: when VIX
-    # spends months elevated (2025 tariff shock etc.), the long-run mean
-    # rises and a VIX of 30 looks "normal" against itself.  A 252-day
-    # rolling window anchors each component to its OWN past year so a
-    # current VIX spike of 40 registers as elevated vs the past 12 months.
     def _rz(s: pd.Series, window: int = 252) -> pd.Series:
-        """Rolling z-score: (x - rolling_mean) / rolling_std."""
         mu  = s.rolling(window, min_periods=63).mean()
         sig = s.rolling(window, min_periods=63).std()
         return (s - mu) / sig.replace(0, np.nan).ffill().fillna(1)
@@ -1677,17 +1513,14 @@ def render_thesis_page():
     hyz  = _rz(_hys_filled)
     epuz = _rz(_epu_filled)
 
-    # Weights: VIX 35% (real-time), HY OAS 25% (credit leads equity by 2-6wk),
-    #          NFCI 25% (broad funding/leverage conditions), EPU 15% (policy)
     fear_raw = 0.35*vz + 0.25*hyz + 0.25*nz + 0.15*epuz
 
-    # Map to 0-100 via logistic: score=50 at 0σ, ~73 at +1σ, ~27 at -1σ
     _fear_raw_scalar = float(fear_raw.dropna().iloc[-1]) if fear_raw.dropna().size > 0 else 0.0
     fear   = float(np.clip(100.0 / (1.0 + np.exp(-_fear_raw_scalar)), 0, 100))
     fear_z = _fear_raw_scalar
 
     vl=_sl(vix_s,20.0); sahmv=_sl(sahm,0.0) if sahm is not None else 0.0
-    hyv=_sl(hys,3.0) if hys is not None else 3.0   # in percent (e.g. 3.20 = 320bp)
+    hyv=_sl(hys,3.0) if hys is not None else 3.0
     ur=_sl(unrate,4.0); cyi=_sl(cpi_yoy,2.5); gzv=_sl(gz,0.0); izv=_sl(iz,0.0)
     nl4wv=_sl(nl4w,0.0)
     liq_lab="Expanding" if nl4wv>=0 else "Contracting"
@@ -1706,7 +1539,7 @@ def render_thesis_page():
     trp=float(np.clip(50+20*float(tgadd.iloc[-1])+15*float(rrpd.iloc[-1])+15*float(nl4w.iloc[-1]>=0),0,100))
     threeP=float(np.clip(0.35*trp+0.35*fp+0.30*tp,0,100))
     _stress = _recession_stress(
-        sahmv, hyv*100, crl, icsa_4w_chg, vl,  # recession stress needs bp
+        sahmv, hyv*100, crl, icsa_4w_chg, vl,
         icsa_series=icsa,
         spx_dd=float(spydd.iloc[-1]),
         epu_z=float(epuz.dropna().iloc[-1]) if epuz.dropna().size > 0 else 0.0,
@@ -1719,17 +1552,9 @@ def render_thesis_page():
     stlc=round(float(sr.rolling(21).corr(tr2).dropna().iloc[-1]),3) if sr.dropna().size>21 else float("nan")
     _cpi_raw = raw.get("CPIAUCSL", pd.Series(dtype=float)).dropna()
     cpi_now = round(float(_cpi_raw.pct_change(1).dropna().iloc[-1]) * 100, 3) if len(_cpi_raw) > 1 else float("nan")
-    rd=None  # computed after quotes are fetched so spot is correct
-
-    # ── Macro framework metric display strings & Fed signal ratings ───────
-    # Raw scalars already computed above. Here we produce display strings
-    # and Fed action signals using the image thresholds.
+    rd=None
 
     def _fed_sig(val, high_is_exp: bool, hi_thresh, lo_thresh, fmt=".1f"):
-        """Classify a metric into Fed action signal using image thresholds.
-        high_is_exp=True  → high value → Expansionary (e.g. unemployment high = Fed cuts)
-        high_is_exp=False → high value → Contractionary (e.g. CPI high = Fed hikes)
-        """
         if not np.isfinite(val):
             return "N/A", "N/A", "#94a3b8"
         vs = f"{val:{fmt}}"
@@ -1742,42 +1567,23 @@ def render_thesis_page():
             elif val >= lo_thresh: return vs, "Neutral",         "#f59e0b"
             else:                  return vs, "Expansionary",    "#10b981"
 
-    # Unemployment Rate — High: >5.5% (Exp), Normal: 4–5.5%, Low: <4% (Con)
     _ur_v, _ur_sig, _ur_col = _fed_sig(ur, True, 5.5, 4.0, ".1f")
-
-    # Initial Jobless Claims
     _icsa_vs, _icsa_sig, _icsa_col = _fed_sig(_icsa_v_k, True, 350, 250, ".0f")
     _icsa_vs = f"{_icsa_v_k:.0f}k" if np.isfinite(_icsa_v_k) else "N/A"
-
-    # Nonfarm Payrolls MoM change (thousands)
     _nfp_vs, _nfp_sig, _nfp_col = _fed_sig(_nfp_v, False, 250, 50, ".0f")
     _nfp_vs = f"{_nfp_v:+.0f}k" if np.isfinite(_nfp_v) else "N/A"
-
-    # CPI YoY
     _cpi_vs, _cpi_sig, _cpi_col = _fed_sig(cyi, False, 2.5, 1.5, ".2f")
     _cpi_vs = f"{cyi:.2f}%"
-
-    # Core CPI YoY
     _ccpi_vs, _ccpi_sig, _ccpi_col = _fed_sig(_ccpi_v, False, 2.5, 1.5, ".2f")
     _ccpi_vs = f"{_ccpi_v:.2f}%" if np.isfinite(_ccpi_v) else "N/A"
-
-    # PPI MoM
     _ppi_vs, _ppi_sig, _ppi_col = _fed_sig(_ppi_mom, False, 0.2, 0.0, "+.2f")
     _ppi_vs = f"{_ppi_mom:+.2f}%" if np.isfinite(_ppi_mom) else "N/A"
-
-    # ISM Manufacturing PMI
     _ism_vs, _ism_sig, _ism_col = _fed_sig(_ism_mfg_v, False, 55, 50, ".1f")
     _ism_vs = f"{_ism_mfg_v:.1f}" if np.isfinite(_ism_mfg_v) else "N/A"
-
-    # ISM Non-Manufacturing PMI
     _ism_nm_vs, _ism_nm_sig, _ism_nm_col = _fed_sig(_ism_nm_v, False, 55, 50, ".1f")
     _ism_nm_vs = f"{_ism_nm_v:.1f}" if np.isfinite(_ism_nm_v) else "N/A"
-
-    # Chicago PMI
     _chi_vs, _chi_sig, _chi_col = _fed_sig(_chi_v, False, 55, 50, ".1f")
     _chi_vs = f"{_chi_v:.1f}" if np.isfinite(_chi_v) else "N/A"
-
-    # Consumer Confidence (UMich)
     _conf_vs, _conf_sig, _conf_col = _fed_sig(_conf_v, False, 120, 100, ".1f")
     _conf_vs = f"{_conf_v:.1f}" if np.isfinite(_conf_v) else "N/A"
 
@@ -1821,41 +1627,28 @@ def render_thesis_page():
             gex_st=GammaState(data_source="unavailable",timestamp=dt.datetime.now().strftime("%H:%M:%S"))
             gwas=tstr=fl={}; net_gex=gex_score=0; atm_iv_chain=None
 
-        # ── Always load QQQ chain for NDX IV surface ──────────────────────
-        # CRITICAL: qqq_spot must be the ETF price (~420), NOT the NDX index
-        # level (~24,000). _ivsurf_from_chain computes moneyness as strike/spot,
-        # so strike=420 / spot=24000 = 0.0175, which fails the moneyness>=0.93
-        # filter and returns zero rows every time.
         qqq_chain_df = None
-        # Start from the live quote for QQQ ETF (already fetched in _quotes())
-        # q["QQQ_last"] ≈ 420; ndx ≈ 24,000 — never use ndx as the spot here.
-        qqq_spot = q.get("QQQ_last", None)   # ETF price, not index level
+        qqq_spot = q.get("QQQ_last", None)
         if gex_sym not in ("QQQ", "NDX", "^NDX"):
-            # gex_sym is SPY/SPX or something else — fetch QQQ separately
             if client:
                 _qqq_chain = schwab_get_options_chain(client, "QQQ", spot=None)
                 if _qqq_chain is not None and len(_qqq_chain) > 0:
                     qqq_chain_df = _qqq_chain
                     _schwab_qqq_spot = schwab_get_spot(client, "QQQ")
                     if _schwab_qqq_spot and _schwab_qqq_spot > 0:
-                        qqq_spot = _schwab_qqq_spot   # ETF price from broker
+                        qqq_spot = _schwab_qqq_spot
             if qqq_chain_df is None or len(qqq_chain_df) == 0:
                 _yf_chain, _yf_spot, _ = get_gex_from_yfinance("QQQ")
                 if _yf_chain is not None and len(_yf_chain) > 0:
                     qqq_chain_df = _yf_chain
-                    # yfinance returns ETF price for QQQ, safe to use directly
                     if _yf_spot and _yf_spot > 0:
                         qqq_spot = _yf_spot
-            # Final fallback: derive ETF price from NDX (ratio ≈ 57.7)
             if not qqq_spot:
                 qqq_spot = ndx / 57.7
         else:
-            # gex_sym is already QQQ/NDX — reuse what we fetched above
-            # gex_spot for QQQ is the ETF price (schwab/yfinance both return it)
             qqq_chain_df = chain_df
-            qqq_spot = gex_spot   # already correct ETF price
+            qqq_spot = gex_spot
 
-    # Flip: use volume-based zero crossing (sits at visual red/green boundary)
     _vol_flip = gex_zero_crossing(chain_df, float(gex_spot), max_dte=45) if chain_df is not None else None
     if _vol_flip is not None and np.isfinite(_vol_flip):
         flip = _vol_flip
@@ -1902,7 +1695,6 @@ def render_thesis_page():
         s_2s10s=s2s10,net_liq_4w=nl4w,nfci_z=nz,fear_score=fear,
         session=get_session_context(),idx=idx,sahm_rule=sahm,hy_spread=hys)
 
-    # ── Compute multi-horizon momentum inputs for 3-engine composite ────────
     def _last(s, n=1):
         v = _to_1d(s).reindex(idx).ffill().pct_change(n).dropna()
         return float(v.iloc[-1]) if len(v) > 0 else 0.0
@@ -1920,12 +1712,13 @@ def render_thesis_page():
     _lqd_3d_ret = _last(_lqd_a, 3)
     _dist_flip  = float(gex_st.distance_to_flip_pct) if (gex_st.distance_to_flip_pct and np.isfinite(gex_st.distance_to_flip_pct)) else 5.0
 
-    # Realised vol for vol-trend signal
     _spy_rets = _spy_a.pct_change().dropna()
     _rv5  = float(_spy_rets.rolling(5,  min_periods=3).std().dropna().iloc[-1] * np.sqrt(252) * 100) if len(_spy_rets) > 5  else float("nan")
     _rv20 = float(_spy_rets.rolling(20, min_periods=10).std().dropna().iloc[-1] * np.sqrt(252) * 100) if len(_spy_rets) > 20 else float("nan")
 
-    # Override stale daily closes with live Schwab session data during market hours
+    # FIX 3: Override stale daily closes with live Schwab intraday data.
+    # Without this, reruns during the trading day use last night's close for
+    # 1d momentum, making _intraday_engine blind to the current session move.
     _intraday_live = get_intraday_signals(client) if client else {}
     if _intraday_live:
         _spx_1d_ret = _intraday_live.get("SPY_pct", _spx_1d_ret)
@@ -1972,7 +1765,7 @@ def render_thesis_page():
     # ── 1. MARKET REGIME ──────────────────────────────────────────────────
     _q_live = dict(q)
     if _intraday_live:
-        # Schwab returns fractions; _intraday_bias uses percent
+        # FIX 3 (cont): _intraday_bias uses percent; Schwab returns fractions
         _q_live["SPX_pct"] = _intraday_live.get("SPY_pct", q.get("SPX_pct", 0.0)) * 100
         _q_live["VIX_pct"] = _intraday_live.get("VIX_pct", q.get("VIX_pct", 0.0))
         _q_live["HYG_pct"] = _intraday_live.get("HYG_pct", q.get("HYG_pct", 0.0)) * 100
@@ -2141,8 +1934,6 @@ def render_thesis_page():
         )
 
     # ── 5 & 6. IV SURFACES ────────────────────────────────────────────────
-    # Section 5: SPX surface — uses gex_sym chain (typically SPY)
-    # Section 6: NDX surface — always uses qqq_chain_df (loaded unconditionally above)
     c5,c6=st.columns(2)
     with c5:
         st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>5. IMPLIED VOL SURFACE — SPX</div>",unsafe_allow_html=True)
@@ -2153,7 +1944,6 @@ def render_thesis_page():
         )
     with c6:
         st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>6. IMPLIED VOL SURFACE — NDX</div>",unsafe_allow_html=True)
-        # qqq_chain_df is always populated regardless of gex_sym
         st.plotly_chart(
             _ivsurf_from_chain(qqq_chain_df, float(qqq_spot), "NDX", vxn_live, vts.get("shape","MIXED")),
             use_container_width=True, key="th_ivs_ndx"
@@ -2180,7 +1970,6 @@ def render_thesis_page():
              f"<span style='color:rgba(255,255,255,0.3);'>({cat['count']} articles)</span></span>")
 
     def _mrow(metric, value, signal, sig_col, threshold_hint=""):
-        """Single metric row: name | value | Fed signal | threshold hint."""
         return (
             f"<div style='display:grid;grid-template-columns:2fr 1.2fr 1.5fr 2fr;"
             f"gap:0 8px;align-items:center;padding:4px 0;"
@@ -2193,7 +1982,6 @@ def render_thesis_page():
         )
 
     def _mcat(label):
-        """Category sub-header."""
         return (f"<div style='font-size:10px;font-weight:700;letter-spacing:0.12em;"
                 f"color:rgba(255,255,255,0.35);text-transform:uppercase;"
                 f"padding:8px 0 4px;margin-top:4px;'>{label}</div>")
@@ -2215,8 +2003,6 @@ def render_thesis_page():
         + f"{macro_reg} &nbsp;<span style='font-size:12px;font-weight:400;color:rgba(255,255,255,0.4);'>"
         + f"Growth Z: {gzv:+.2f}  ·  Inflation Z: {izv:+.2f}</span></div>"
         + "<div style='display:grid;grid-template-columns:1fr 1fr;gap:0 32px;'>"
-
-        # ── Left column: Job Market + Inflation ──────────────────────────
         + "<div>"
         + _mcol_hdr()
         + _mcat("📊 Job Market")
@@ -2228,8 +2014,6 @@ def render_thesis_page():
         + _mrow("Core CPI (YoY)",        _ccpi_vs,   _ccpi_sig,  _ccpi_col,  ">2% Con · ~2% Neu · <2% Exp")
         + _mrow("PPI (MoM)",             _ppi_vs,    _ppi_sig,   _ppi_col,   ">0.2% Con · 0–0.2% Neu · <0% Exp")
         + "</div>"
-
-        # ── Right column: Economic Activities ────────────────────────────
         + "<div>"
         + _mcol_hdr()
         + _mcat("🏭 Economic Activities")
@@ -2237,8 +2021,6 @@ def render_thesis_page():
         + _mrow("ISM Non-Manufacturing PMI", _ism_nm_vs, _ism_nm_sig, _ism_nm_col, ">55 Con · 50–55 Neu · <50 Exp")
         + _mrow("Chicago PMI",               _chi_vs,    _chi_sig,    _chi_col,    ">55 Con · 50–55 Neu · <50 Exp")
         + _mrow("Consumer Confidence",       _conf_vs,   _conf_sig,   _conf_col,   ">120 Con · 100–120 Neu · <100 Exp")
-
-        # ── Supporting macro context ──────────────────────────────────────
         + _mcat("📉 Credit & Labor Context")
         + _kv("HY OAS",    f"{hyv:.2f}%",   "#ef4444" if hyv>4.5 else "#f59e0b" if hyv>3.5 else "#94a3b8")
         + _kv("Sahm Rule", f"{sahmv:.3f}",  "#ef4444" if sahmv>=0.5 else "#f59e0b" if sahmv>=0.3 else "#10b981")
@@ -2247,8 +2029,6 @@ def render_thesis_page():
         + _kv("CPI Nowcast", f"{cpi_now:+.3f}% MoM" if np.isfinite(cpi_now) else "N/A")
         + "</div>"
         + "</div>"
-
-        # ── News sentiment strip ──────────────────────────────────────────
         + f"<div style='margin-top:12px;border-top:1px solid rgba(255,255,255,0.08);padding-top:8px;'>"
         + "<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:5px;letter-spacing:0.1em;'>NEWS SENTIMENT</div>"
         + f"<div style='display:flex;flex-wrap:wrap;gap:4px;'>{nr}</div></div>"
@@ -2263,16 +2043,12 @@ def render_thesis_page():
 
     hero = (
         f"<div style='display:flex;flex-wrap:wrap;align-items:flex-start;gap:20px;margin-bottom:14px;'>"
-
-        # BIAS
         f"<div style='min-width:200px;'>"
         f"<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;margin-bottom:4px;'>BIAS</div>"
         f"<div style='font-size:40px;font-weight:900;color:{vc};line-height:1;'>{v3['bias']}</div>"
         f"<div style='font-size:12px;color:rgba(255,255,255,0.55);margin-top:4px;font-style:italic;'>{v3['bias_type']}</div>"
         f"<div style='font-size:11px;color:rgba(255,255,255,0.30);margin-top:2px;'>{v3['bias_type_note']}</div>"
         f"</div>"
-
-        # STRUCTURE + CONFIDENCE
         f"<div style='min-width:200px;border-left:1px solid rgba(255,255,255,0.08);padding-left:20px;'>"
         f"<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;margin-bottom:6px;'>STRUCTURE</div>"
         f"<div style='font-size:18px;font-weight:700;color:rgba(255,255,255,0.85);'>{v3['structure']}</div>"
@@ -2281,8 +2057,6 @@ def render_thesis_page():
         f"<div style='font-size:16px;font-weight:700;color:{conf_col};margin-top:2px;'>{v3['confidence']} ({v3['confidence_pct']*100:.0f}%)</div>"
         f"<div style='font-size:10px;color:rgba(255,255,255,0.30);margin-top:2px;'>Score: {comp:+.1f} / ±10 · {dt.date.today().strftime('%b %d, %Y')}</div>"
         f"</div>"
-
-        # STRATEGY
         f"<div style='flex:1;min-width:220px;border-left:1px solid rgba(255,255,255,0.08);padding-left:20px;'>"
         f"<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;margin-bottom:6px;'>STRATEGY</div>"
         f"<div style='font-size:15px;font-weight:700;color:rgba(255,255,255,0.90);line-height:1.4;'>{v3['strategy']}</div>"
@@ -2290,7 +2064,6 @@ def render_thesis_page():
         f"</div>"
     )
 
-    # SIGNAL CONFLICTS
     conflict_html = ""
     if v3["conflicts"]:
         conflict_html = (
@@ -2302,7 +2075,6 @@ def render_thesis_page():
             conflict_html += f"<div style='font-size:12px;color:rgba(255,255,255,0.70);margin-bottom:4px;'>{icon} {txt}</div>"
         conflict_html += "</div>"
 
-    # HOW TO TRADE
     how_html = ""
     if v3["how_to"]:
         how_html = (
@@ -2314,7 +2086,6 @@ def render_thesis_page():
             how_html += f"<div style='font-size:12px;color:rgba(255,255,255,0.70);margin-bottom:4px;'>{icon} {txt}</div>"
         how_html += "</div>"
 
-    # KEY LEVELS + RISK (compact, secondary)
     _kls_mult   = 10.0 if gex_sym in ("SPY","SPX") else 40.0 if gex_sym in ("QQQ","NDX") else 1.0
     _flip_disp  = flip  * _kls_mult
     _upper_disp = upper * _kls_mult
@@ -2343,7 +2114,6 @@ def render_thesis_page():
         + "</div>"
     )
 
-    # Legacy single-word verdict line (e.g. "BEARISH" / "LEANING BULLISH")
     legacy_verdict_html = (
         f"<div style='display:flex;align-items:baseline;gap:16px;margin-bottom:10px;"
         f"padding-bottom:10px;border-bottom:1px solid rgba(255,255,255,0.08);'>"
@@ -2387,10 +2157,9 @@ def render_thesis_page():
                  "Disinflation: curve flat + CPI actively falling (>10bp over 3M). "
                  "Deflation: growth− + inflation z-score < −0.5σ (CPI well below trend).")
             +_gl("Recession P(6m)",
-                 "7-component stress index: Sahm (35%), HY OAS (20%), yield curve (15%), "
-                 "ICSA claims (12%), VIX (8%), SPX drawdown (5%), EPU (5%). "
-                 "Sigmoid centred at 0.35 (not 0.50) — moderate multi-indicator stress "
-                 "correctly reads ELEVATED. ELEVATED: Sahm≥0.35 or HY>375bp or score>60. "
+                 "Recession Stress Index — orthogonal to fear composite (no VIX/EPU). "
+                 "Sahm 40% + HY OAS 25% + yield curve 20% (with duration mult) + ICSA 15%. "
+                 "Sigmoid centred at 0.35. ELEVATED: Sahm≥0.35 or HY>375bp or score>60. "
                  "NOT a calibrated probability — use Estrella-Mishkin for that.")
             +_gl("Net Liquidity",
                  "Fed Balance Sheet minus TGA minus RRP. Expanding = risk asset tailwind. Contracting = headwind.")),
@@ -2422,7 +2191,7 @@ def render_thesis_page():
                  "Regime-conditional blending: neg-gamma (trending) → 40/40/20, "
                  "pos-gamma (mean-rev) → 20/40/40, neutral → 30/40/30. "
                  "Smooth sigmoid recession filter. Backwardation contrarian preserved. "
-                 "NO EDGE fires when score + momentum both weak.")),
+                 "NO EDGE fires when score + momentum both weak (backwardation exempted).")),
             unsafe_allow_html=True)
 
     st.markdown(

@@ -32,42 +32,6 @@ _C_VEX   = "#8b5cf6"   # purple — vanna
 _C_CEX   = "#06b6d4"   # teal   — charm
 _C_MUTED = "rgba(255,255,255,0.52)"
 
-
-def _exposure_scale(values) -> Tuple[float, str]:
-    arr = np.asarray(list(values), dtype=float).ravel()
-    arr = arr[np.isfinite(arr)] if arr.size else arr
-    max_abs = float(np.max(np.abs(arr))) if arr.size else 0.0
-    if max_abs >= 1e9:
-        return 1e9, "B"
-    if max_abs >= 1e6:
-        return 1e6, "M"
-    if max_abs >= 1e3:
-        return 1e3, "K"
-    return 1.0, ""
-
-
-def _format_scaled_exposure(value: float, unit: str) -> str:
-    sign = "-" if value < 0 else ""
-    abs_val = abs(float(value))
-    if abs_val >= 100:
-        num = f"{abs_val:,.0f}"
-    elif abs_val >= 10:
-        num = f"{abs_val:,.1f}"
-    else:
-        num = f"{abs_val:,.2f}"
-    return f"{sign}${num}{unit}"
-
-
-def _unit_label(unit: str) -> str:
-    return f"${unit}" if unit else "$"
-
-
-def _format_exposure(value: float) -> str:
-    if value is None or not np.isfinite(value):
-        return "N/A"
-    scale, unit = _exposure_scale([value])
-    return _format_scaled_exposure(float(value) / scale, unit)
-
 def _days_to_exp(label: str) -> int:
     """Convert 'Mar 18' style label back to days from today.""",
     try:
@@ -162,12 +126,11 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
     )
 
     # ── Pivot: numeric strike index ───────────────────────────────────────
-    raw_pivot = (gex_chain
-                 .groupby(["strike", "exp_label"])[greek_col]
-                 .sum()
-                 .unstack(fill_value=0))
-    scale, unit = _exposure_scale(raw_pivot.to_numpy().ravel())
-    pivot = raw_pivot / scale
+    pivot = (gex_chain
+             .groupby(["strike", "exp_label"])[greek_col]
+             .sum()
+             .unstack(fill_value=0)
+             / 1e6)
     pivot.columns = pivot.columns.get_level_values(0) if pivot.columns.nlevels > 1 else pivot.columns
 
     # ── Filters ───────────────────────────────────────────────────────────
@@ -197,12 +160,14 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
     if keep:
         pivot = pivot[sorted(keep)]
 
-    max_abs_scaled = float(pivot.abs().to_numpy().max()) if not pivot.empty else 0.0
-    thresh = 0.5 if max_abs_scaled >= 10 else max(max_abs_scaled * 0.05, 0.05)
-    pivot = pivot.loc[(pivot.abs() >= thresh).any(axis=1)]
+    pivot = pivot.loc[(pivot.abs() >= 0.5).any(axis=1)]
     if pivot.empty:
         # Lower threshold and try again before giving up
-        pivot_retry = raw_pivot / scale
+        pivot_retry = (gex_chain
+                       .groupby(["strike", "exp_label"])[greek_col]
+                       .sum()
+                       .unstack(fill_value=0)
+                       / 1e6)
         pivot_retry.columns = pivot_retry.columns.get_level_values(0) if pivot_retry.columns.nlevels > 1 else pivot_retry.columns
         pivot_retry = pivot_retry[(pivot_retry.index >= strike_lo) & (pivot_retry.index <= strike_hi)]
         keep2 = [c for c in pivot_retry.columns if _dte(c) <= max_dte]
@@ -234,12 +199,12 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
     n_rows, n_cols = len(strikes), len(pivot.columns)
 
     # ── Cell text ─────────────────────────────────────────────────────────
+    thresh = 0.5
     def _cell(v):
-        if abs(v) < thresh:
-            return ""
-        return _format_scaled_exposure(v, unit)
+        if abs(v) < thresh: return ""
+        if abs(v) >= 1000:  return f"${v/1000:.1f}B"
+        return f"${v:.1f}M"
     text_vals = [[_cell(v) for v in row] for row in z_vals]
-    hover_vals = [[_format_scaled_exposure(v, unit) for v in row] for row in z_vals]
 
     # ── Colour ────────────────────────────────────────────────────────────
     flat = [abs(v) for row in z_vals for v in row if abs(v) >= thresh]
@@ -256,19 +221,17 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
         x=display_x,
         y=strikes,          # NUMERIC — enables correct shapes and range
         text=text_vals,
-        customdata=hover_vals,
         texttemplate="%{text}",
         textfont=dict(size=max(7, min(10, int(380/max(n_cols,1)))),
                       color="rgba(255,255,255,0.90)", family="monospace"),
         colorscale=colorscale,
         zmid=0, zmin=-zmax, zmax=zmax,
         showscale=True,
-        colorbar=dict(title=_unit_label(unit),
-                      tickfont=dict(size=9, color="rgba(255,255,255,0.6)"),
-                      thickness=14, len=0.88, tickformat=".2f",
+        colorbar=dict(tickfont=dict(size=9, color="rgba(255,255,255,0.6)"),
+                      thickness=14, len=0.88, tickformat="$.0s",
                       bgcolor="rgba(0,0,0,0)", bordercolor="rgba(255,255,255,0.08)"),
         xgap=0, ygap=0,
-        hovertemplate="Strike: $%{y:.0f}<br>Expiry: %{x}<br>%{customdata}<extra></extra>",
+        hovertemplate="Strike: $%{y:.0f}<br>Expiry: %{x}<br>%{z:.1f}M<extra></extra>",
     ))
 
     # ── Spot line — horizontal, numeric y ────────────────────────────────
@@ -418,7 +381,7 @@ def _cumulative_gex_chart(chain_df: pd.DataFrame, spot: float,
         # Min/max annotations
         min_idx = prof["cum_gex"].idxmin()
         max_idx = prof["cum_gex"].idxmax()
-        for idx, label, col in [(min_idx, "MAX PAIN", _C_NEG),
+        for idx, label, col in [(min_idx, "MAX NEG GEX", _C_NEG),
                                  (max_idx, "MAX PIN",  _C_POS)]:
             fig.add_annotation(
                 x=float(prof.loc[idx, "strike"]),
@@ -445,50 +408,81 @@ def _cumulative_gex_chart(chain_df: pd.DataFrame, spot: float,
 
 def _greek_bar_chart(by_strike: dict, spot: float, title: str,
                      pos_color: str, neg_color: str,
-                     flip_level: float = None, height=340,
-                     measure_label: str = "GEX") -> go.Figure:
-    strikes = sorted(by_strike.keys())
+                     flip_level: float = None, height=340) -> go.Figure:
+    """Horizontal bar chart matching GEXBot layout: strike on Y-axis, GEX on X-axis."""
+    strikes = sorted(by_strike.keys(), reverse=True)   # high strike at top (GEXBot style)
     near    = [s for s in strikes if spot * 0.90 < s < spot * 1.10]
     if not near:
-        near = strikes  # fallback: show all if range filter removes everything
+        near = strikes
 
-    raw_vals = [by_strike[s] for s in near]
-    scale, unit = _exposure_scale(raw_vals)
+    # Auto-scale: $B if any value exceeds $5B, else $M
+    raw_vals = [by_strike[s] / 1e6 for s in near]
+    max_abs  = max((abs(v) for v in raw_vals), default=1)
+    if max_abs >= 5000:
+        scale, unit = 1000.0, "$B"
+    else:
+        scale, unit = 1.0, "$M"
     vals   = [v / scale for v in raw_vals]
     colors = [pos_color if v > 0 else neg_color for v in vals]
 
+    # Strike labels — format as "$587"
+    y_labels = [f"${s:.0f}" for s in near]
+
     fig = go.Figure(go.Bar(
-        x=near, y=vals,
+        x=vals,
+        y=y_labels,
+        orientation="h",          # horizontal — matches GEXBot
         marker_color=colors,
         marker_line_width=0,
-        opacity=0.85,
+        opacity=0.88,
         name=title,
     ))
 
-    # Zero line — prominent horizontal reference
-    fig.add_hline(y=0, line_color="rgba(255,255,255,0.35)", line_width=1)
+    # Zero line (vertical for horizontal bars)
+    fig.add_vline(x=0, line_color="rgba(255,255,255,0.35)", line_width=1)
 
-    # Spot line
-    fig.add_vline(x=spot, line_dash="dot", line_color="rgba(255,255,255,0.70)", line_width=1.5,
-                  annotation_text=f"SPOT ${spot:.0f}",
-                  annotation_font_size=10, annotation_font_color="rgba(255,255,255,0.8)",
-                  annotation_position="top right")
+    # Spot and flip lines — use paper-fraction y coords for categorical axis
+    n_cats = len(near)
+    def _cat_y(target_strike):
+        """Return 0..1 paper fraction for a given strike on the categorical axis."""
+        if n_cats <= 1: return 0.5
+        nearest = min(near, key=lambda s: abs(s - target_strike))
+        # near is sorted high→low, index 0 = top. Paper y: 0=bottom, 1=top.
+        idx = near.index(nearest)
+        return 1.0 - (idx / (n_cats - 1))
+
+    spot_y = _cat_y(spot)
+    fig.add_shape(type="line", xref="paper", yref="paper",
+                  x0=0, x1=1, y0=spot_y, y1=spot_y,
+                  line=dict(dash="dot", color="rgba(255,255,255,0.70)", width=1.5))
+    fig.add_annotation(xref="paper", yref="paper",
+                       x=1.01, y=spot_y,
+                       text=f"SPOT ${spot:.0f}",
+                       showarrow=False, xanchor="left",
+                       font=dict(size=10, color="rgba(255,255,255,0.85)"))
 
     # Flip line
     if flip_level and abs(flip_level - spot) / max(spot, 1) < 0.20:
-        fig.add_vline(x=flip_level, line_dash="dash", line_color=_C_FLIP, line_width=1.5,
-                      annotation_text=f"FLIP ${flip_level:.0f}",
-                      annotation_font_size=10, annotation_font_color=_C_FLIP,
-                      annotation_position="top left")
+        flip_y = _cat_y(flip_level)
+        fig.add_shape(type="line", xref="paper", yref="paper",
+                      x0=0, x1=1, y0=flip_y, y1=flip_y,
+                      line=dict(dash="dash", color=_C_FLIP, width=1.5))
+        fig.add_annotation(xref="paper", yref="paper",
+                           x=1.01, y=flip_y,
+                           text=f"FLIP ${flip_level:.0f}",
+                           showarrow=False, xanchor="left",
+                           font=dict(size=10, color=_C_FLIP))
 
-    # X-axis: centre on spot with equal padding
-    if near:
-        x_pad = max(abs(max(near) - spot), abs(spot - min(near))) * 1.05
-        fig.update_layout(xaxis=dict(range=[spot - x_pad, spot + x_pad]))
-
+    # Y-axis: show all strike labels, tight range
     fig.update_layout(
-        yaxis_title=f"Net {measure_label} ({_unit_label(unit)})",
-        bargap=0.15,
+        xaxis_title=f"Net GEX ({unit})",
+        yaxis=dict(
+            title="Strike",
+            categoryorder="array",
+            categoryarray=y_labels,   # maintains high-to-low order
+            tickfont=dict(size=10),
+        ),
+        bargap=0.12,
         showlegend=False,
     )
     return plotly_dark(fig, title, height)
@@ -504,8 +498,8 @@ def _key_nodes_table(nodes: List[Tuple[float, float]], spot: float, label: str):
         direction = "Above" if strike > spot else "Below"
         rows.append({
             "Strike":    f"${strike:.1f}",
-            "Exposure":  _format_exposure(val),
-            "Abs Size":  _format_exposure(abs(val)),
+            "Exposure":  f"${val/1e6:.1f}M",
+            "Abs Size":  f"${abs(val)/1e6:.1f}M",
             "Dist":      f"{dist_pct:+.2f}%",
             "Direction": direction,
         })
@@ -584,14 +578,6 @@ def _module3_setups(dg: "DealerGreeks", gs: "GammaState", spot: float,
     ntm_gex = sum(v for k, v in dg.gex_by_strike.items() if abs(k-spot)/spot < 0.02)
     ntm_vex = sum(v for k, v in dg.vex_by_strike.items() if abs(k-spot)/spot < 0.02)
     ntm_cex = sum(v for k, v in dg.cex_by_strike.items() if abs(k-spot)/spot < 0.02)
-    gex_large_node = 50e6 * 0.01
-    gex_break_node = 100e6 * 0.01
-    neg_gex_cluster = -100e6 * 0.01
-    vex_pos_threshold = 50e6 * (0.01 / max(spot, 1.0))
-    vex_neg_threshold = -30e6 * (0.01 / max(spot, 1.0))
-    cex_abs_threshold = 20e6 * (1.0 / (365.0 * max(spot, 1.0)))
-    vex_align_threshold = 30e6 * (0.01 / max(spot, 1.0))
-    cex_align_threshold = 15e6 * (1.0 / (365.0 * max(spot, 1.0)))
 
     # Consecutive same-sign strikes in 5% band
     near = sorted([k for k in dg.gex_by_strike if abs(k-spot)/spot < 0.05])
@@ -631,8 +617,8 @@ def _module3_setups(dg: "DealerGreeks", gs: "GammaState", spot: float,
     m, x = [], []
     (m if regime in (GammaRegime.STRONG_POSITIVE, GammaRegime.POSITIVE) else x).append("✓ Positive gamma regime")
     (m if pos_run >= 3 else x).append(f"{'✓' if pos_run>=3 else '○'} {pos_run}/3 consecutive positive strikes near spot")
-    (m if (abs(largest_above[1]) > gex_large_node or abs(largest_below[1]) > gex_large_node) else x).append(
-        f"{'✓' if abs(largest_above[1])>gex_large_node or abs(largest_below[1])>gex_large_node else '○'} Large nodes defining range ({_format_exposure(gex_large_node)}+)")
+    (m if (abs(largest_above[1]) > 50e6 or abs(largest_below[1]) > 50e6) else x).append(
+        f"{'✓' if abs(largest_above[1])>50e6 or abs(largest_below[1])>50e6 else '○'} Large nodes defining range ($50M+)")
 
     sup  = pos_nodes_below[0][0] if pos_nodes_below else spot * 0.997
     res  = pos_nodes_above[0][0] if pos_nodes_above else spot * 1.003
@@ -658,9 +644,8 @@ def _module3_setups(dg: "DealerGreeks", gs: "GammaState", spot: float,
     # Conditions: near gamma flip + large node within 1.5% of spot
     m, x = [], []
     (m if near_flip else x).append(f"{'✓' if near_flip else '○'} Near gamma flip (dist: {dist:+.2f}%, need <1.5%)")
-    large_nearby = [(k,v) for k,v in gex.items() if abs(k-spot)/spot < 0.015 and abs(v) > gex_break_node]
-    (m if large_nearby else x).append(
-        f"{'✓' if large_nearby else '○'} Large node ({_format_exposure(gex_break_node)}+) within 1.5% of spot")
+    large_nearby = [(k,v) for k,v in gex.items() if abs(k-spot)/spot < 0.015 and abs(v) > 100e6]
+    (m if large_nearby else x).append(f"{'✓' if large_nearby else '○'} Large node ($100M+) within 1.5% of spot")
     (m if regime in (GammaRegime.POSITIVE, GammaRegime.NEUTRAL) else x).append(
         f"{'✓' if regime in (GammaRegime.POSITIVE,GammaRegime.NEUTRAL) else '○'} Transitional regime")
 
@@ -690,8 +675,8 @@ def _module3_setups(dg: "DealerGreeks", gs: "GammaState", spot: float,
     (m if regime in (GammaRegime.NEGATIVE, GammaRegime.STRONG_NEGATIVE) else x).append(
         f"{'✓' if regime in (GammaRegime.NEGATIVE,GammaRegime.STRONG_NEGATIVE) else '○'} Negative gamma regime")
     (m if neg_run >= 3 else x).append(f"{'✓' if neg_run>=3 else '○'} {neg_run}/3 consecutive negative strikes near spot")
-    (m if ntm_gex < neg_gex_cluster else x).append(
-        f"{'✓' if ntm_gex < neg_gex_cluster else '○'} Strong negative GEX cluster ({_format_exposure(ntm_gex)}, need {_format_exposure(neg_gex_cluster)})")
+    (m if ntm_gex < -100e6 else x).append(
+        f"{'✓' if ntm_gex < -100e6 else '○'} Strong negative GEX cluster (${ntm_gex/1e6:.0f}M, need -$100M)")
 
     # In neg gamma: follow breakouts. Entry = current direction continuation.
     # Next neg node in direction of move = target (dealers amplify through them)
@@ -722,8 +707,7 @@ def _module3_setups(dg: "DealerGreeks", gs: "GammaState", spot: float,
 
     # ── 4. Vanna Squeeze ─────────────────────────────────────────────────
     m, x = [], []
-    (m if ntm_vex > vex_pos_threshold else x).append(
-        f"{'✓' if ntm_vex > vex_pos_threshold else '○'} Positive vanna near spot ({_format_exposure(ntm_vex)}, need {_format_exposure(vex_pos_threshold)}+)")
+    (m if ntm_vex > 50e6 else x).append(f"{'✓' if ntm_vex>50e6 else '○'} Positive vanna near spot (${ntm_vex/1e6:.0f}M, need $50M+)")
     (m if vix_level > 22 else x).append(f"{'✓' if vix_level>22 else '○'} IV elevated (VIX {vix_level:.1f}, need >22)")
     (m if regime in (GammaRegime.POSITIVE, GammaRegime.NEUTRAL) else x).append(
         f"{'✓' if regime in (GammaRegime.POSITIVE,GammaRegime.NEUTRAL) else '○'} Positive/neutral gamma")
@@ -750,8 +734,7 @@ def _module3_setups(dg: "DealerGreeks", gs: "GammaState", spot: float,
     # ── 5. Vanna Rug / Vol Shock ─────────────────────────────────────────
     neg_vex_ntm = sum(v for k,v in dg.vex_by_strike.items() if abs(k-spot)/spot < 0.03 and v < 0)
     m, x = [], []
-    (m if neg_vex_ntm < vex_neg_threshold else x).append(
-        f"{'✓' if neg_vex_ntm < vex_neg_threshold else '○'} Negative vanna near spot ({_format_exposure(neg_vex_ntm)}, need {_format_exposure(vex_neg_threshold)})")
+    (m if neg_vex_ntm < -30e6 else x).append(f"{'✓' if neg_vex_ntm < -30e6 else '○'} Negative vanna near spot (${neg_vex_ntm/1e6:.0f}M, need -$30M+)")
     (m if vix_level < 18 else x).append(f"{'✓' if vix_level<18 else '○'} IV compressed (VIX {vix_level:.1f}, need <18)")
     (m if (session.get('is_data_day') or session.get('is_opex_friday')) else x).append(
         f"{'✓' if session.get('is_data_day') or session.get('is_opex_friday') else '○'} Catalyst present (data day/OpEx)")
@@ -777,10 +760,9 @@ def _module3_setups(dg: "DealerGreeks", gs: "GammaState", spot: float,
 
     # ── 6. Charm Drift (EOD) ─────────────────────────────────────────────
     m, x = [], []
-    strong_charm = abs(ntm_cex) > cex_abs_threshold
+    strong_charm = abs(ntm_cex) > 20e6
     charm_long = ntm_cex > 0
-    (m if strong_charm else x).append(
-        f"{'✓' if strong_charm else '○'} Strong charm near spot ({_format_exposure(ntm_cex)}, need ±{_format_exposure(cex_abs_threshold)})")
+    (m if strong_charm else x).append(f"{'✓' if strong_charm else '○'} Strong charm near spot (${ntm_cex/1e6:.0f}M, need ±$20M+)")
     (m if is_late else x).append(f"{'✓' if is_late else '○'} Late session — charm strongest after 2pm (currently: {session['window']})")
 
     cd_entry = spot
@@ -810,9 +792,8 @@ def _module3_setups(dg: "DealerGreeks", gs: "GammaState", spot: float,
     m, x = [], []
     (m if dg.vanna_charm_aligned else x).append(
         f"{'✓' if dg.vanna_charm_aligned else '○'} Vanna ({dg.vanna_direction}) + Charm ({dg.charm_direction}) aligned")
-    both_size = abs(ntm_vex) > vex_align_threshold and abs(ntm_cex) > cex_align_threshold
-    (m if both_size else x).append(
-        f"{'✓' if both_size else '○'} VEX ({_format_exposure(ntm_vex)} need {_format_exposure(vex_align_threshold)}+) and CEX ({_format_exposure(ntm_cex)} need {_format_exposure(cex_align_threshold)}+)")
+    both_size = abs(ntm_vex) > 30e6 and abs(ntm_cex) > 15e6
+    (m if both_size else x).append(f"{'✓' if both_size else '○'} VEX (${ntm_vex/1e6:.0f}M need $30M+) and CEX (${ntm_cex/1e6:.0f}M need $15M+)")
 
     align_long = dg.vanna_direction == "bullish"
     if align_long:
@@ -972,7 +953,7 @@ def render_gex_engine():
     m1.metric("Spot",          f"{spot:.2f}")
     m2.metric("Gamma Flip",    f"{gs.gamma_flip:.2f}" if gs.gamma_flip else "N/A",
                                f"{gs.distance_to_flip_pct:+.2f}%")
-    m3.metric("Net GEX",       _format_exposure(gs.total_gex))
+    m3.metric("Net GEX",       f"${gs.total_gex/1e6:.1f}M")
     m4.metric("Vanna Dir",     dg.vanna_direction.upper())
     m5.metric("Charm Dir",     dg.charm_direction.upper())
 
@@ -1057,56 +1038,64 @@ def render_gex_engine():
                                     f"{symbol} GEX", int(hm_height))
             st.plotly_chart(fig_gex, use_container_width=True, key="gex_chart_heatmap")
         else:
-            regime_str = REGIME_OPERATIONAL_LABEL.get(gs.regime, gs.regime.value)
-            neg_frac = sum(1 for v in dg.gex_by_strike.values() if v < 0) / max(len(dg.gex_by_strike), 1)
+            # ── Use EXACT same chain slice as heatmap ─────────────────────
+            # Read strike range and DTE from the same attributes _make_heatmap uses.
+            _hm_lo  = getattr(_make_heatmap, "_strike_lo", spot - int(st.session_state.get("gex_strikes_each_side", 20)))
+            _hm_hi  = getattr(_make_heatmap, "_strike_hi", spot + int(st.session_state.get("gex_strikes_each_side", 20)))
+            _hm_dte = int(getattr(_make_heatmap, "_max_dte", st.session_state.get("gex_hm_dte", 30)))
+
+            # Filter chain to same DTE window as heatmap
+            _bar_chain = chain_df[chain_df["expiry_T"] <= _hm_dte / 365.0].copy()
+            if _bar_chain.empty:
+                _bar_chain = chain_df.copy()
+
+            # Aggregate net GEX by strike, same range as heatmap
+            _bar_gex = compute_gex_from_chain(_bar_chain, spot)
+            _bar_agg = (_bar_gex.groupby("strike")["net_gex"]
+                                .sum().reset_index())
+            _bar_agg = _bar_agg[(_bar_agg["strike"] >= _hm_lo) & (_bar_agg["strike"] <= _hm_hi)]
+            filtered = dict(zip(_bar_agg["strike"], _bar_agg["net_gex"]))
+
+            neg_frac = sum(1 for v in filtered.values() if v < 0) / max(len(filtered), 1)
             if neg_frac > 0.8:
-                regime_note = f"⚠ {neg_frac*100:.0f}% of strikes negative — heavy put positioning, dealers AMPLIFY moves."
+                regime_note = f"⚠ {neg_frac*100:.0f}% of strikes negative — heavy put positioning."
             elif neg_frac < 0.2:
-                regime_note = f"✓ {(1-neg_frac)*100:.0f}% of strikes positive — call-heavy, dealers PIN price."
+                regime_note = f"✓ {(1-neg_frac)*100:.0f}% of strikes positive — dealers PIN price."
             else:
-                regime_note = f"Mixed: {(1-neg_frac)*100:.0f}% positive / {neg_frac*100:.0f}% negative strikes."
-            st.caption(f"Green = positive GEX · Red = negative GEX · Yellow = gamma flip · {regime_note}")
-            n_side   = int(st.session_state["gex_strikes_each_side"])
-            bar_lo   = spot - n_side
-            bar_hi   = spot + n_side
-            filtered = {k: v for k, v in dg.gex_by_strike.items() if bar_lo <= k <= bar_hi}
-            # Show TWO bar charts: nearest expiry (0DTE-style) + all near-term
-            near0_chain = nearest_expiry_chain(chain_df)
+                regime_note = f"Mixed: {(1-neg_frac)*100:.0f}% pos / {neg_frac*100:.0f}% neg."
+            st.caption(f"Green = positive · Red = negative · Yellow = flip · {regime_note} · ${_hm_lo:.0f}–${_hm_hi:.0f} · ≤{_hm_dte}DTE")
+
+            # Nearest expiry (0DTE-style) using same chain slice
+            near0_chain = nearest_expiry_chain(_bar_chain)
             if near0_chain is not None and len(near0_chain) > 0:
-                from gex_engine import compute_gex_from_chain as _cgx
-                near0_gex = _cgx(near0_chain, spot)
-                near0_agg = near0_gex.groupby("strike")["net_gex"].sum()
-                near0_by_strike = near0_agg.to_dict()
-                near0_lo, near0_hi = spot - n_side, spot + n_side
-                near0_filtered = {k: v for k, v in near0_by_strike.items() if near0_lo <= k <= near0_hi}
-                import datetime as _dt2
+                near0_gex = compute_gex_from_chain(near0_chain, spot)
+                near0_agg = near0_gex.groupby("strike")["net_gex"].sum().reset_index()
+                near0_agg = near0_agg[(near0_agg["strike"] >= _hm_lo) & (near0_agg["strike"] <= _hm_hi)]
+                near0_filtered = dict(zip(near0_agg["strike"], near0_agg["net_gex"]))
                 min_dte = int(round(near0_chain["expiry_T"].min() * 365))
                 dte_label = "0DTE" if min_dte <= 1 else f"{min_dte}DTE"
                 fig_near0 = _greek_bar_chart(near0_filtered, spot,
                                              f"Net GEX · Nearest Expiry ({dte_label})",
                                              _C_POS, _C_NEG, gs.gamma_flip,
-                                             height=int(st.session_state["gex_hm_height"] // 2),
-                                             measure_label="GEX")
+                                             height=int(st.session_state["gex_hm_height"] // 2))
                 st.plotly_chart(fig_near0, use_container_width=True, key="gex_chart_bar_0dte")
-                st.caption(f"↑ Nearest expiry only ({dte_label}) — matches GEXBot/SpotGamma spot GEX view. ↓ All ≤{int(st.session_state.get('gex_hm_dte',45))}DTE combined.")
+                st.caption(f"↑ Nearest expiry ({dte_label}) — matches GEXBot. ↓ All ≤{_hm_dte}DTE combined.")
 
+            regime_str = REGIME_OPERATIONAL_LABEL.get(gs.regime, gs.regime.value)
             fig_gex = _greek_bar_chart(filtered, spot,
-                                       f"Net GEX · {regime_str} · ≤{int(st.session_state.get('gex_hm_dte',45))}DTE",
+                                       f"Net GEX · {regime_str} · ≤{_hm_dte}DTE · ${_hm_lo:.0f}–${_hm_hi:.0f}",
                                        _C_POS, _C_NEG, gs.gamma_flip,
-                                       height=int(st.session_state["gex_hm_height"] // 2),
-                                       measure_label="GEX")
+                                       height=int(st.session_state["gex_hm_height"] // 2))
             st.plotly_chart(fig_gex, use_container_width=True, key="gex_chart_bar")
 
-            # ── Cumulative GEX profile ────────────────────────────────────
             st.markdown(
                 "<div style='font-size:10px;color:rgba(255,255,255,0.4);margin:8px 0 2px;'>"
-                "CUMULATIVE GEX PROFILE — spatial context: where pinning is strongest "
-                "and where amplification begins · zero crossing = gamma flip</div>",
+                "CUMULATIVE GEX PROFILE — zero crossing = gamma flip</div>",
                 unsafe_allow_html=True
             )
             fig_cum = _cumulative_gex_chart(
-                chain_df, spot, gs.gamma_flip,
-                max_dte=int(st.session_state.get("gex_hm_dte", 45)),
+                _bar_chain, spot, gs.gamma_flip,
+                max_dte=_hm_dte,
                 height=int(st.session_state["gex_hm_height"] // 2),
             )
             st.plotly_chart(fig_cum, use_container_width=True, key="gex_chart_cumulative")
@@ -1119,9 +1108,9 @@ def render_gex_engine():
                                key=lambda x: -x[1])[:5]]
             if res_data:
                 df_r = pd.DataFrame(res_data, columns=["Strike", "GEX ($)"])
-                df_r["GEX"]        = df_r["GEX ($)"].apply(_format_exposure)
+                df_r["GEX ($M)"]   = (df_r["GEX ($)"] / 1e6).round(1)
                 df_r["Dist %"]     = ((df_r["Strike"] - spot) / spot * 100).round(2)
-                st.dataframe(df_r[["Strike","GEX","Dist %"]], hide_index=True)
+                st.dataframe(df_r[["Strike","GEX ($M)","Dist %"]], hide_index=True)
         with c2:
             st.markdown("**🔴 GEX Support Walls** (Dealers Amplify Falls)")
             sup_data = [(s, dg.gex_by_strike.get(s, 0)) for s, _ in
@@ -1129,9 +1118,9 @@ def render_gex_engine():
                                key=lambda x: x[1])[:5]]
             if sup_data:
                 df_s = pd.DataFrame(sup_data, columns=["Strike", "GEX ($)"])
-                df_s["GEX"]        = df_s["GEX ($)"].apply(_format_exposure)
+                df_s["GEX ($M)"]   = (df_s["GEX ($)"] / 1e6).round(1)
                 df_s["Dist %"]     = ((df_s["Strike"] - spot) / spot * 100).round(2)
-                st.dataframe(df_s[["Strike","GEX","Dist %"]], hide_index=True)
+                st.dataframe(df_s[["Strike","GEX ($M)","Dist %"]], hide_index=True)
 
         st.markdown("""
 **GEX = Reaction to Price**
@@ -1153,14 +1142,13 @@ def render_gex_engine():
             st.plotly_chart(fig_vex, use_container_width=True, key="gex_chart_vex_heatmap")
         else:
             fig_vex = _greek_bar_chart(dg.vex_by_strike, spot,
-                                       "Net VEX by Strike", _C_VEX, _C_NEG, gs.gamma_flip,
-                                       measure_label="VEX")
+                                       "Net VEX by Strike ($M)", _C_VEX, _C_NEG, gs.gamma_flip)
             st.plotly_chart(fig_vex, use_container_width=True, key="gex_chart_vex_bar")
 
         v1, v2 = st.columns(2)
         ntm_vex_val = sum(v for k,v in dg.vex_by_strike.items() if abs(k-spot)/spot < 0.02)
         with v1:
-            st.markdown(f"**Net Vanna near spot:** {_format_exposure(ntm_vex_val)} per 1 vol point")
+            st.markdown(f"**Net Vanna near spot:** ${ntm_vex_val/1e6:.1f}M")
             st.markdown(f"**Vanna Sign:** {dg.vanna_sign.upper()}")
         with v2:
             st.markdown("**Interpretation:**")
@@ -1202,13 +1190,12 @@ def render_gex_engine():
             st.plotly_chart(fig_cex, use_container_width=True, key="gex_chart_cex_heatmap")
         else:
             fig_cex = _greek_bar_chart(dg.cex_by_strike, spot,
-                                       "Net CEX by Strike", _C_CEX, _C_NEG, gs.gamma_flip,
-                                       measure_label="CEX")
+                                       "Net CEX by Strike ($M)", _C_CEX, _C_NEG, gs.gamma_flip)
             st.plotly_chart(fig_cex, use_container_width=True, key="gex_chart_cex_bar")
 
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown(f"**Net Charm near spot:** {_format_exposure(sum(v for k,v in dg.cex_by_strike.items() if abs(k-spot)/spot < 0.02))} per day")
+            st.markdown(f"**Net Charm near spot:** ${sum(v for k,v in dg.cex_by_strike.items() if abs(k-spot)/spot < 0.02)/1e6:.1f}M")
             st.markdown(f"**Direction:** {dg.charm_direction.upper()}")
         with c2:
             st.markdown("**Interpretation:**")
@@ -1276,8 +1263,8 @@ def render_gex_engine():
                        "Breakout level" if strike > spot and gex_val < 0 else "Reversal zone"
                 rows.append({
                     "Strike":    f"${strike:.1f}",
-                    "GEX":       _format_exposure(gex_val),
-                    "Abs Size":  _format_exposure(abs(gex_val)),
+                    "GEX ($M)":  f"${gex_val/1e6:.1f}M",
+                    "Abs Size":  f"${abs(gex_val)/1e6:.1f}M",
                     "Dist":      f"{dist_pct:+.2f}%",
                     "Side":      side,
                     "Weekly Bias": bias,

@@ -377,7 +377,12 @@ def schwab_get_options_chain(client, symbol: str = "SPY",
                                 "put_oi":       oi if right_char == "P" else 0,
                                 "call_volume":  vol if right_char == "C" else 0,
                                 "put_volume":   vol if right_char == "P" else 0,
-                                "schwab_gamma": gk,  # always positive from Schwab API — sign applied via call_oi/put_oi convention in gex_engine
+                                # Keep gamma separate per side — critical for GEX correctness.
+                                # OTM call gamma ≠ ITM put gamma at the same strike.
+                                # Averaging them produces wrong GEX for both legs.
+                                "call_gamma":   gk if right_char == "C" else 0.0,
+                                "put_gamma":    gk if right_char == "P" else 0.0,
+                                "schwab_gamma": gk,
                             })
                     except Exception:
                         continue
@@ -404,7 +409,11 @@ def schwab_get_options_chain(client, symbol: str = "SPY",
                     put_oi=("put_oi", "sum"),
                     call_volume=("call_volume", "sum"),
                     put_volume=("put_volume", "sum"),
-                    schwab_gamma=("schwab_gamma", "mean"),
+                    # Max is correct here: one side is 0.0, the other is the real gamma.
+                    # mean() would dilute a real gamma (e.g. 0.82) by averaging with 0.
+                    call_gamma=("call_gamma", "max"),
+                    put_gamma=("put_gamma", "max"),
+                    schwab_gamma=("schwab_gamma", "mean"),  # kept for fallback
                 )
                 .reset_index())
         return df

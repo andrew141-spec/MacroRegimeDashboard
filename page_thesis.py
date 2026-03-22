@@ -13,7 +13,8 @@ from utils import _to_1d, zscore, resample_ffill, current_pct_rank
 from ui_components import plotly_dark
 from data_loaders import load_macro, get_gex_from_yfinance
 from gex_engine import (build_gamma_state, compute_gwas, compute_gex_from_chain, compute_dealer_greeks,
-                         compute_gex_term_structure, compute_flow_imbalance)
+                         compute_gex_term_structure, compute_flow_imbalance,
+                         compute_cumulative_gex_profile)
 from schwab_api import get_schwab_client, schwab_get_spot, schwab_get_options_chain
 from signals import compute_leading_stack, compute_1d_prob
 from probability import (compute_prob_composite, get_session_context,
@@ -1176,6 +1177,52 @@ def _gex_histogram(chain_df, spot: float, flip: float,
         return fig
 
 
+
+def _intraday_bias(q: dict, gex_state) -> tuple:
+    """
+    Derive a quick intraday directional bias label from live quotes.
+    Uses SPX session change + VIX direction + credit spread.
+    Returns (label, color) e.g. ("BULL FLOW", "#10b981")
+    """
+    spx_pct  = q.get("SPX_pct", 0.0) or 0.0
+    vix_pct  = q.get("VIX_pct", 0.0) or 0.0
+    hyg_pct  = q.get("HYG_pct", 0.0) or 0.0
+    lqd_pct  = q.get("LQD_pct", 0.0) or 0.0
+
+    # Credit spread: HYG outperforming LQD = risk-on
+    credit_spread = hyg_pct - lqd_pct
+
+    bull_pts = 0
+    bear_pts = 0
+
+    if spx_pct > 0.3:  bull_pts += 2
+    elif spx_pct > 0:  bull_pts += 1
+    elif spx_pct < -0.3: bear_pts += 2
+    elif spx_pct < 0:    bear_pts += 1
+
+    if vix_pct < -3:   bull_pts += 2   # VIX crushing = risk-on
+    elif vix_pct < 0:  bull_pts += 1
+    elif vix_pct > 5:  bear_pts += 2
+    elif vix_pct > 0:  bear_pts += 1
+
+    if credit_spread > 0.2:  bull_pts += 1
+    elif credit_spread < -0.2: bear_pts += 1
+
+    # GEX context: near flip = compress signal
+    try:
+        dist = abs(float(gex_state.distance_to_flip_pct))
+        if dist < 0.3:
+            bull_pts = bear_pts = 0  # at flip = no directional edge
+    except Exception:
+        pass
+
+    net = bull_pts - bear_pts
+    if net >= 3:    return "BULL FLOW",   "#10b981"
+    elif net >= 1:  return "BIAS UP",     "#34d399"
+    elif net <= -3: return "BEAR FLOW",   "#ef4444"
+    elif net <= -1: return "BIAS DOWN",   "#f97316"
+    else:           return "NEUTRAL",     "#94a3b8"
+
 def render_thesis_page():
     st.markdown(CSS, unsafe_allow_html=True)
     st.markdown("## 📋 Daily Thesis Briefing")
@@ -1388,7 +1435,7 @@ def render_thesis_page():
     fear_z = _fear_raw_scalar
 
     vl=_sl(vix_s,20.0); sahmv=_sl(sahm,0.0) if sahm is not None else 0.0
-    hyv=_sl(hys,3.0)*100 if hys is not None else 300.0
+    hyv=_sl(hys,3.0) if hys is not None else 3.0   # in percent (e.g. 3.20 = 320bp)
     ur=_sl(unrate,4.0); cyi=_sl(cpi_yoy,2.5); gzv=_sl(gz,0.0); izv=_sl(iz,0.0)
     nl4wv=_sl(nl4w,0.0)
     liq_lab="Expanding" if nl4wv>=0 else "Contracting"
@@ -1407,7 +1454,7 @@ def render_thesis_page():
     trp=float(np.clip(50+20*float(tgadd.iloc[-1])+15*float(rrpd.iloc[-1])+15*float(nl4w.iloc[-1]>=0),0,100))
     threeP=float(np.clip(0.35*trp+0.35*fp+0.30*tp,0,100))
     _stress = _recession_stress(
-        sahmv, hyv, crl, icsa_4w_chg, vl,
+        sahmv, hyv*100, crl, icsa_4w_chg, vl,  # recession stress needs bp
         icsa_series=icsa,
         spx_dd=float(spydd.iloc[-1]),
         epu_z=float(epuz.dropna().iloc[-1]) if epuz.dropna().size > 0 else 0.0,
@@ -1625,8 +1672,9 @@ def render_thesis_page():
     fc="#ef4444" if fear_z>1.0 else "#f59e0b" if fear_z>0.0 else "#10b981"
 
     # ── 1. MARKET REGIME ──────────────────────────────────────────────────
+    intraday_label, intraday_col = _intraday_bias(q, gex_st)
     hdr=(f"<div style='display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px;'>"
-         +_pill(f"Market Regime: {macro_reg}",reg_col)
+         +_pill(f"Market Regime: {macro_reg} / {intraday_label}",reg_col)
          +_pill(f"Fear Level: {fl2} ({fear_z:+.2f}σ)",fc)
          +_pill(f"Liquidity: {liq_lab} (${abs(nl4wv):.0f}B)","#10b981" if nl4wv>=0 else "#ef4444")
          +_pill(f"Recession P(6m): {rec:.1f}%","#ef4444" if rec>50 else "#f59e0b" if rec>30 else "#10b981")
@@ -1722,12 +1770,53 @@ def render_thesis_page():
               +f"<span style='color:{gex_rc};font-weight:700;'>{gex_op_label}</span> — {narr}</div>")
     st.markdown(_card(gex_body),unsafe_allow_html=True)
 
-    # ── 3b. GEX HISTOGRAM ────────────────────────────────────────────────
-    st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>GEX HISTOGRAM — Net Gamma Exposure per Strike</div>",unsafe_allow_html=True)
-    st.plotly_chart(
-        _gex_histogram(chain_df if chain_df is not None else None, float(gex_spot), float(flip)),
-        use_container_width=True, key="th_gex_hist"
-    )
+    # ── 3b. GEX HISTOGRAM + CUMULATIVE PROFILE ──────────────────────────
+    _hist_col, _cum_col = st.columns(2)
+    with _hist_col:
+        st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>GEX HISTOGRAM — Net Gamma per Strike</div>",unsafe_allow_html=True)
+        st.plotly_chart(
+            _gex_histogram(chain_df if chain_df is not None else None, float(gex_spot), float(flip)),
+            use_container_width=True, key="th_gex_hist"
+        )
+    with _cum_col:
+        st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>CUMULATIVE GEX PROFILE — Spatial dealer exposure</div>",unsafe_allow_html=True)
+        st.caption("Zero crossing = gamma flip · Max pain = deepest negative · Max pin = highest positive")
+        if chain_df is not None and len(chain_df) > 0:
+            _cum_prof = compute_cumulative_gex_profile(chain_df, float(gex_spot), max_dte=45)
+            if not _cum_prof.empty:
+                _cum_scale = 1e9 if _cum_prof["cum_gex"].abs().max() >= 5e9 else 1e6
+                _cum_unit  = "$B" if _cum_scale == 1e9 else "$M"
+                _pos = _cum_prof[_cum_prof["cum_gex"] >= 0]
+                _neg = _cum_prof[_cum_prof["cum_gex"] < 0]
+                _cum_fig = go.Figure()
+                if not _pos.empty:
+                    _cum_fig.add_trace(go.Scatter(
+                        x=_pos["strike"], y=_pos["cum_gex"]/_cum_scale,
+                        fill="tozeroy", fillcolor="rgba(16,185,129,0.18)",
+                        line=dict(color="#10b981",width=1.5), name="Positive",
+                    ))
+                if not _neg.empty:
+                    _cum_fig.add_trace(go.Scatter(
+                        x=_neg["strike"], y=_neg["cum_gex"]/_cum_scale,
+                        fill="tozeroy", fillcolor="rgba(239,68,68,0.18)",
+                        line=dict(color="#ef4444",width=1.5), name="Negative",
+                    ))
+                _cum_fig.add_hline(y=0, line_color="rgba(255,255,255,0.3)", line_width=1)
+                _cum_fig.add_vline(x=float(gex_spot), line_dash="dot",
+                    line_color="rgba(255,255,255,0.7)", line_width=1.5,
+                    annotation_text=f"SPOT", annotation_font_size=9)
+                if flip and _cum_prof["strike"].min() < flip < _cum_prof["strike"].max():
+                    _cum_fig.add_vline(x=float(flip), line_dash="dash",
+                        line_color="#f59e0b", line_width=1.5,
+                        annotation_text="FLIP", annotation_font_size=9,
+                        annotation_font_color="#f59e0b")
+                _cum_fig.update_layout(yaxis_title=f"Cum GEX ({_cum_unit})", showlegend=True,
+                    legend=dict(orientation="h",y=1.02,x=0,font=dict(size=9)))
+                from ui_components import plotly_dark as _pd2
+                _pd2(_cum_fig, f"Cumulative GEX ≤45DTE", 360)
+                st.plotly_chart(_cum_fig, use_container_width=True, key="th_gex_cum")
+        else:
+            st.caption("No chain data available for cumulative profile.")
 
     # ── 4. PROBABILITY HEATMAP ────────────────────────────────────────────
     st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>4. SPX / NDX FORWARD PROBABILITY HEATMAP — 1-WEEK FORECAST</div>",unsafe_allow_html=True)
@@ -1844,7 +1933,7 @@ def render_thesis_page():
 
         # ── Supporting macro context ──────────────────────────────────────
         + _mcat("📉 Credit & Labor Context")
-        + _kv("HY OAS",    f"{hyv:.0f}bp",  "#ef4444" if hyv>450 else "#f59e0b" if hyv>350 else "#94a3b8")
+        + _kv("HY OAS",    f"{hyv:.2f}%",   "#ef4444" if hyv>4.5 else "#f59e0b" if hyv>3.5 else "#94a3b8")
         + _kv("Sahm Rule", f"{sahmv:.3f}",  "#ef4444" if sahmv>=0.5 else "#f59e0b" if sahmv>=0.3 else "#10b981")
         + _kv("SPY-TLT Corr", f"{stlc:.3f}" if np.isfinite(stlc) else "N/A",
                "#ef4444" if (np.isfinite(stlc) and stlc>0.2) else "#94a3b8")

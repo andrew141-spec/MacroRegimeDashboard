@@ -107,8 +107,9 @@ def compute_gex_from_chain(chain: pd.DataFrame, spot: float,
         call_gamma_col = np.where(call_g_valid, chain["call_gamma"].fillna(0), bs_g)
         put_gamma_col  = np.where(put_g_valid,  chain["put_gamma"].fillna(0),  bs_g)
 
-        chain["call_gex"] =  chain["call_oi"] * call_gamma_col * multiplier * (spot ** 2)
-        chain["put_gex"]  = -chain["put_oi"]  * put_gamma_col  * multiplier * (spot ** 2)
+        # GEX = Γ · OI · 100 · S² · 0.01  → dollar gamma per 1% spot move
+        chain["call_gex"] =  chain["call_oi"] * call_gamma_col * multiplier * (spot ** 2) * 0.01
+        chain["put_gex"]  = -chain["put_oi"]  * put_gamma_col  * multiplier * (spot ** 2) * 0.01
         chain["net_gex"]  =  chain["call_gex"] + chain["put_gex"]
 
         # VEX and CEX still use blended BS vanna/charm (no per-side Schwab vanna)
@@ -116,11 +117,11 @@ def compute_gex_from_chain(chain: pd.DataFrame, spot: float,
             lambda row: bs_vanna(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
         chain["charm"] = chain.apply(
             lambda row: bs_charm(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
-        chain["call_vex"] =  chain["call_oi"] * chain["vanna"] * multiplier * (spot ** 2)
-        chain["put_vex"]  = -chain["put_oi"]  * chain["vanna"] * multiplier * (spot ** 2)
+        chain["call_vex"] =  chain["call_oi"] * chain["vanna"] * multiplier
+        chain["put_vex"]  = -chain["put_oi"]  * chain["vanna"] * multiplier
         chain["net_vex"]  =  chain["call_vex"] + chain["put_vex"]
-        chain["call_cex"] =  chain["call_oi"] * chain["charm"] * multiplier * (spot ** 2)
-        chain["put_cex"]  = -chain["put_oi"]  * chain["charm"] * multiplier * (spot ** 2)
+        chain["call_cex"] =  chain["call_oi"] * chain["charm"] * multiplier
+        chain["put_cex"]  = -chain["put_oi"]  * chain["charm"] * multiplier
         chain["net_cex"]  =  chain["call_cex"] + chain["put_cex"]
         return chain
 
@@ -139,20 +140,21 @@ def compute_gex_from_chain(chain: pd.DataFrame, spot: float,
     chain["charm"] = chain.apply(
         lambda row: bs_charm(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
 
-    # GEX: use per-side gamma where available, else blended gamma
-    chain["call_gex"] =  chain["call_oi"] * chain["gamma"] * multiplier * (spot ** 2)
-    chain["put_gex"]  = -chain["put_oi"]  * chain["gamma"] * multiplier * (spot ** 2)
+    # GEX = Γ · OI · 100 · S² · 0.01  → dollar gamma per 1% spot move
+    chain["call_gex"] =  chain["call_oi"] * chain["gamma"] * multiplier * (spot ** 2) * 0.01
+    chain["put_gex"]  = -chain["put_oi"]  * chain["gamma"] * multiplier * (spot ** 2) * 0.01
     chain["net_gex"]  =  chain["call_gex"] + chain["put_gex"]
 
-    # VEX: positive vanna + rising IV → dealers buy (bullish pressure on IV spike)
-    #      positive vanna + falling IV → dealers sell (bearish on vol crush)
-    chain["call_vex"] =  chain["call_oi"] * chain["vanna"] * multiplier * (spot ** 2)
-    chain["put_vex"]  = -chain["put_oi"] * chain["vanna"] * multiplier * (spot ** 2)
+    # VEX = Vanna · OI · 100  (dimensionless vanna, no S factor)
+    # Dollarize separately when needed: VEX_dollar = VEX * S * 0.01 per 1vol pt
+    chain["call_vex"] =  chain["call_oi"] * chain["vanna"] * multiplier
+    chain["put_vex"]  = -chain["put_oi"]  * chain["vanna"] * multiplier
     chain["net_vex"]  =  chain["call_vex"] + chain["put_vex"]
 
-    # CEX: positive charm → time decay forces dealers to buy (upward drift)
-    chain["call_cex"] =  chain["call_oi"] * chain["charm"] * multiplier * (spot ** 2)
-    chain["put_cex"]  = -chain["put_oi"] * chain["charm"] * multiplier * (spot ** 2)
+    # CEX: Charm * OI * 100  (no S factor — charm is dDelta/dT, units = 1/time)
+    # Reference: Haug "The Complete Guide to Option Pricing Formulas" eq 2.20.
+    chain["call_cex"] =  chain["call_oi"] * chain["charm"] * multiplier
+    chain["put_cex"]  = -chain["put_oi"]  * chain["charm"] * multiplier
     chain["net_cex"]  =  chain["call_cex"] + chain["put_cex"]
 
     return chain
@@ -224,52 +226,86 @@ def compute_dealer_greeks(chain: pd.DataFrame, spot: float,
         data_source=source,
     )
 
-def find_gamma_flip(chain: pd.DataFrame) -> float:
+def _net_gamma_at_spot(chain: pd.DataFrame, x: float,
+                        multiplier: int = 100, r: float = 0.05) -> float:
     """
-    Gamma flip = the price where per-strike net GEX transitions from negative
-    to positive (or vice versa) — i.e. where the bars cross zero.
+    Compute total net dealer gamma if spot were at price x.
 
-    Method: aggregate by strike (sum across all expirations), then find the
-    adjacent pair of strikes where net_gex changes sign and interpolate.
+    Recomputes BS gamma for every strike using x as the spot price.
+    This is required for the TRUE gamma flip — the level where total
+    net gamma (as a function of hypothetical spot) equals zero.
 
-    Fallback: if net_gex is the same sign everywhere (common when put OI
-    heavily dominates, as in SPY), return the strike closest to zero — this
-    is the "vol trigger" level used by SpotGamma and GEXBot.
-
-    NOTE: the cumulative sum method was removed because it fails whenever
-    put OI dominates (the cumsum stays negative throughout, returning nan
-    even though there is a clear per-strike zero-crossing in the bars).
+    G_net(x) = Σ_calls[ Γ_i(x) · OI_i · 100 ] - Σ_puts[ Γ_i(x) · OI_i · 100 ]
     """
-    # Aggregate by strike across all expirations
-    by_strike = (chain.groupby("strike")["net_gex"]
-                      .sum()
-                      .reset_index()
-                      .sort_values("strike")
-                      .reset_index(drop=True))
+    total = 0.0
+    for _, row in chain.iterrows():
+        K, T, iv = float(row["strike"]), float(row["expiry_T"]), float(row["iv"])
+        if T <= 0 or iv <= 0:
+            continue
+        g = bs_gamma(x, K, T, iv, r)
+        c_oi = float(row.get("call_oi", 0))
+        p_oi = float(row.get("put_oi",  0))
+        total += g * multiplier * (c_oi - p_oi)
+    return total
 
-    if len(by_strike) < 2:
+
+def find_gamma_flip(chain: pd.DataFrame, spot: float = None,
+                    scan_pct: float = 0.10, n_points: int = 200) -> float:
+    """
+    True zero-gamma level: the spot price x where total net dealer gamma = 0.
+
+    Method (correct):
+        Scan a price grid x ∈ [spot*(1-scan_pct), spot*(1+scan_pct)] and
+        compute G_net(x) = Σ Γ_i(x)·OI_i·100 for calls minus puts at each x.
+        Find where G_net crosses zero and interpolate.
+
+    This is the proper definition: gamma at each strike changes as spot moves,
+    so the flip level requires recomputing greeks at each hypothetical price.
+
+    Fallback (when no zero crossing found):
+        Return the x with G_net closest to zero — the "vol trigger" / minimum
+        gamma level, equivalent to SpotGamma's zero-gamma fallback.
+
+    Reference: Carr & Madan (2001); SpotGamma methodology notes (2021).
+    """
+    if chain is None or len(chain) == 0:
         return np.nan
 
-    vals    = by_strike["net_gex"].values
-    strikes = by_strike["strike"].values
+    # Build a deduplicated chain for efficiency (aggregate OI by strike/expiry)
+    cols = [c for c in ["strike","expiry_T","iv","call_oi","put_oi"] if c in chain.columns]
+    chain_agg = (chain[cols]
+                 .groupby(["strike","expiry_T"])
+                 .agg({"iv":"mean","call_oi":"sum","put_oi":"sum"})
+                 .reset_index())
 
-    # Primary: find where per-strike net_gex changes sign (bar crosses zero)
-    bar_sign_changes = np.where(vals[:-1] * vals[1:] < 0)[0]
+    # Determine scan range
+    if spot is None or not np.isfinite(spot) or spot <= 0:
+        # Estimate spot from chain midpoint
+        spot = float(chain_agg["strike"].median())
 
-    if len(bar_sign_changes) > 0:
-        # If multiple sign changes, pick the one closest to ATM (largest |GEX| transition)
-        best_i = bar_sign_changes[
-            np.argmax([abs(vals[j+1] - vals[j]) for j in bar_sign_changes])
-        ]
-        s1, s2 = float(strikes[best_i]),  float(strikes[best_i + 1])
-        g1, g2 = float(vals[best_i]),     float(vals[best_i + 1])
-        return s1 + (s2 - s1) * (-g1) / (g2 - g1) if (g2 - g1) != 0 else s1
+    x_lo = spot * (1 - scan_pct)
+    x_hi = spot * (1 + scan_pct)
+    x_grid = np.linspace(x_lo, x_hi, n_points)
 
-    # Fallback: no sign change — all bars same sign (heavy put or call skew).
-    # Return the strike with net_gex closest to zero. This is still a valid
-    # "vol trigger" level — the point of minimum dealer net gamma.
-    nearest_idx = int(np.argmin(np.abs(vals)))
-    return float(strikes[nearest_idx])
+    # Vectorised computation of G_net at each grid point
+    g_vals = np.array([_net_gamma_at_spot(chain_agg, float(x)) for x in x_grid])
+
+    if not np.any(np.isfinite(g_vals)):
+        return float(spot)  # no valid data
+
+    # Find zero crossings
+    sign_changes = np.where(g_vals[:-1] * g_vals[1:] < 0)[0]
+
+    if len(sign_changes) > 0:
+        # Interpolate within the crossing interval with largest transition
+        best_i = sign_changes[np.argmax([abs(g_vals[j+1] - g_vals[j])
+                                          for j in sign_changes])]
+        x1, x2 = x_grid[best_i], x_grid[best_i + 1]
+        g1, g2 = g_vals[best_i], g_vals[best_i + 1]
+        return float(x1 + (x2 - x1) * (-g1) / (g2 - g1)) if (g2 - g1) != 0 else float(x1)
+
+    # No crossing: return x with G_net closest to zero
+    return float(x_grid[np.argmin(np.abs(g_vals))])
 
 def classify_gex_regime(spot: float, flip: float) -> Tuple[GammaRegime, float, float]:
     if not np.isfinite(flip): return GammaRegime.NEUTRAL, 0.0, 0.5
@@ -318,6 +354,131 @@ def compute_cumulative_gex_profile(chain: pd.DataFrame, spot: float,
     agg["regime"]  = np.where(agg["cum_gex"] >= 0, "positive", "negative")
     return agg
 
+
+
+def compute_max_pain(chain: pd.DataFrame) -> float:
+    """
+    Max Pain = candidate expiration price x that minimises total payout to holders.
+
+    Pain(x) = Σ_i[ OI^call_i · max(0, x - K_i) ]   ← calls ITM when x > K_i
+            + Σ_i[ OI^put_i  · max(0, K_i - x) ]    ← puts  ITM when x < K_i
+
+    x is searched over all listed strikes (standard industry convention).
+    Note: x is the HYPOTHETICAL expiration price, K_i are the fixed strikes.
+
+    Reference: Bollen & Whaley (2004); Avellaneda & Lipkin (2003).
+    """
+    if chain is None or chain.empty:
+        return float("nan")
+
+    by_strike = (chain.groupby("strike")
+                      .agg(call_oi=("call_oi","sum"), put_oi=("put_oi","sum"))
+                      .reset_index()
+                      .sort_values("strike"))
+
+    K_arr     = by_strike["strike"].values.astype(float)
+    call_ois  = by_strike["call_oi"].values.astype(float)
+    put_ois   = by_strike["put_oi"].values.astype(float)
+
+    min_pain  = float("inf")
+    best_x    = float("nan")
+
+    for x in K_arr:                            # search over listed strikes
+        call_pain = np.sum(call_ois * np.maximum(0.0, x - K_arr))  # calls ITM: x > K_i
+        put_pain  = np.sum(put_ois  * np.maximum(0.0, K_arr - x))  # puts  ITM: K_i > x
+        total = float(call_pain + put_pain)
+        if total < min_pain:
+            min_pain = total
+            best_x   = float(x)
+
+    return best_x
+
+
+def compute_volume_weighted_strike(chain: pd.DataFrame) -> dict:
+    """
+    Volume-weighted average strike (VWAS) — the options activity centre of mass.
+
+    K_vol = Σ(K_i * V_i) / Σ(V_i)
+
+    Computed separately for calls, puts, and combined.
+    Distinct from the gamma flip: VWAS shows WHERE trading is happening,
+    gamma flip shows WHERE dealer hedging regime changes.
+
+    Reference: standard VWAP calculation applied to strike space.
+    """
+    if chain is None or chain.empty or "call_volume" not in chain.columns:
+        return {"combined": float("nan"), "calls": float("nan"), "puts": float("nan")}
+
+    by_strike = (chain.groupby("strike")
+                      .agg(call_vol=("call_volume","sum"),
+                           put_vol=("put_volume","sum"))
+                      .reset_index())
+
+    K = by_strike["strike"].values
+    cv = by_strike["call_vol"].values.astype(float)
+    pv = by_strike["put_vol"].values.astype(float)
+
+    def _vwas(vols):
+        total = vols.sum()
+        return float((K * vols).sum() / total) if total > 0 else float("nan")
+
+    return {
+        "combined": _vwas(cv + pv),
+        "calls":    _vwas(cv),
+        "puts":     _vwas(pv),
+    }
+
+
+def compute_call_put_walls(chain: pd.DataFrame, spot: float,
+                            max_dte: int = 45) -> dict:
+    """
+    Call wall = strike with highest gamma-weighted call OI above spot.
+    Put wall  = strike with highest gamma-weighted put OI below spot.
+
+    Uses gamma-weighted OI (OI * gamma) rather than raw OI because a high-OI
+    strike at low gamma has minimal dealer hedging impact. The gamma-weighted
+    version matches the SpotGamma / GEXBot methodology.
+
+    Reference: SpotGamma SGVI methodology notes; Bollen & Whaley (2004).
+    """
+    if chain is None or chain.empty:
+        return {"call_wall": float("nan"), "put_wall": float("nan"),
+                "call_wall_gex": 0.0,     "put_wall_gex": 0.0}
+
+    near = chain[chain["expiry_T"] <= max_dte / 365.0].copy()
+    if near.empty:
+        near = chain.copy()
+
+    gex_chain = compute_gex_from_chain(near, spot)
+    agg = (gex_chain.groupby("strike")
+                    .agg(call_gex=("call_gex","sum"), put_gex=("put_gex","sum"))
+                    .reset_index())
+
+    # Call wall: highest positive (call) GEX above spot
+    above = agg[agg["strike"] > spot].copy()
+    if not above.empty:
+        idx = above["call_gex"].idxmax()
+        call_wall     = float(above.loc[idx, "strike"])
+        call_wall_gex = float(above.loc[idx, "call_gex"])
+    else:
+        call_wall, call_wall_gex = float("nan"), 0.0
+
+    # Put wall: most negative (put) GEX below spot
+    below = agg[agg["strike"] < spot].copy()
+    if not below.empty:
+        idx = below["put_gex"].idxmin()
+        put_wall     = float(below.loc[idx, "strike"])
+        put_wall_gex = float(below.loc[idx, "put_gex"])
+    else:
+        put_wall, put_wall_gex = float("nan"), 0.0
+
+    return {
+        "call_wall":     call_wall,
+        "put_wall":      put_wall,
+        "call_wall_gex": call_wall_gex,
+        "put_wall_gex":  put_wall_gex,
+    }
+
 def nearest_expiry_chain(chain: pd.DataFrame) -> pd.DataFrame:
     """Return only the nearest expiration — for 0DTE-style bar chart display."""
     if chain is None or chain.empty:
@@ -341,7 +502,7 @@ def build_gamma_state(chain: pd.DataFrame, spot: float, source: str = "yfinance"
     if near_chain.empty:
         near_chain = chain.copy()  # fallback: use all if filter removes everything
     gex_chain = compute_gex_from_chain(near_chain, spot)
-    flip = find_gamma_flip(gex_chain)
+    flip = find_gamma_flip(near_chain, spot=spot)  # true zero-gamma scan over spot grid
     regime, dist, stability = classify_gex_regime(spot, flip)
 
     # Aggregate net_gex BY STRIKE (sum across all expirations) before computing

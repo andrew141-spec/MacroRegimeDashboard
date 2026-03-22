@@ -145,36 +145,87 @@ def compute_gex_from_chain(chain: pd.DataFrame, spot: float,
 
 def _net_gamma_at_spot(chain: pd.DataFrame, x: float,
                         multiplier: int = 100, r: float = 0.05) -> float:
-    K      = chain["strike"].to_numpy(dtype=float)
-    T      = np.maximum(chain["expiry_T"].to_numpy(dtype=float), 1e-8)
-    iv     = np.maximum(chain["iv"].to_numpy(dtype=float), 1e-8)
-    net_oi = chain["call_oi"].to_numpy(dtype=float) - chain["put_oi"].to_numpy(dtype=float)
-    return float(np.sum(_vec_gamma(x, K, T, iv, r) * net_oi))
+    """
+    Net dealer gamma at hypothetical spot x.
+    Uses call_vol / put_vol columns when present (intraday flow).
+    Falls back to call_oi / put_oi (structural positioning) otherwise.
+    G_net(x) = Σ Γ_i(x) · (net_call_size_i - net_put_size_i)
+    """
+    K  = chain["strike"].to_numpy(dtype=float)
+    T  = np.maximum(chain["expiry_T"].to_numpy(dtype=float), 1e-8)
+    iv = np.maximum(chain["iv"].to_numpy(dtype=float), 1e-8)
+
+    # Volume takes priority — reflects real-time dealer hedging
+    has_vol = ("call_vol" in chain.columns and "put_vol" in chain.columns and
+               chain["call_vol"].sum() > 0)
+    if has_vol:
+        net_size = chain["call_vol"].to_numpy(dtype=float) - chain["put_vol"].to_numpy(dtype=float)
+    else:
+        net_size = chain["call_oi"].to_numpy(dtype=float) - chain["put_oi"].to_numpy(dtype=float)
+
+    return float(np.sum(_vec_gamma(x, K, T, iv, r) * net_size))
 
 
 def find_gamma_flip(chain: pd.DataFrame, spot: float = None,
                     scan_pct: float = 0.20, n_points: int = 400,
                     r: float = 0.05) -> float:
+    """
+    True zero-gamma level: spot x where net dealer gamma = 0.
+
+    Uses volume (call_volume / put_volume) when available — the flip then
+    reflects where intraday flow pressure neutralises, not just where
+    structural OI is balanced. Falls back to OI when volume absent.
+
+    Returns the zero crossing nearest to current spot, or the minimum-gamma
+    point if no crossing exists (vol trigger fallback).
+    """
     if chain is None or len(chain) == 0:
         return np.nan
-    cols = [c for c in ["strike","expiry_T","iv","call_oi","put_oi"] if c in chain.columns]
-    agg  = (chain[cols].groupby(["strike","expiry_T"])
-                       .agg({"iv":"mean","call_oi":"sum","put_oi":"sum"})
-                       .reset_index())
+
+    # Detect volume availability on the raw chain before aggregation
+    has_cv = ("call_volume" in chain.columns and
+               chain["call_volume"].fillna(0).sum() > 0)
+    has_pv = ("put_volume" in chain.columns and
+               chain["put_volume"].fillna(0).sum() > 0)
+    use_volume = has_cv and has_pv
+
+    # Build aggregation — include volume columns when present
+    base_cols = ["strike", "expiry_T", "iv", "call_oi", "put_oi"]
+    vol_cols  = ["call_volume", "put_volume"] if use_volume else []
+    cols = [c for c in base_cols + vol_cols if c in chain.columns]
+
+    agg_spec = {"iv": "mean", "call_oi": "sum", "put_oi": "sum"}
+    if use_volume:
+        agg_spec["call_volume"] = "sum"
+        agg_spec["put_volume"]  = "sum"
+
+    agg = (chain[cols].groupby(["strike", "expiry_T"])
+                      .agg(agg_spec)
+                      .reset_index())
+
+    # Rename to the short names _net_gamma_at_spot expects
+    if use_volume:
+        agg = agg.rename(columns={"call_volume": "call_vol", "put_volume": "put_vol"})
+
     if spot is None or not np.isfinite(spot) or spot <= 0:
         spot = float(agg["strike"].median())
+
     k_min, k_max = float(agg["strike"].min()), float(agg["strike"].max())
-    x_lo = min(spot*(1-scan_pct), k_min*0.98)
-    x_hi = max(spot*(1+scan_pct), k_max*1.02)
+    x_lo = min(spot*(1 - scan_pct), k_min*0.98)
+    x_hi = max(spot*(1 + scan_pct), k_max*1.02)
+
     x_grid = np.linspace(x_lo, x_hi, int(n_points))
     g_vals = np.array([_net_gamma_at_spot(agg, float(x), r=r) for x in x_grid])
+
     if not np.any(np.isfinite(g_vals)):
         return float(spot)
-    sc = np.where(g_vals[:-1]*g_vals[1:] < 0)[0]
+
+    sc = np.where(g_vals[:-1] * g_vals[1:] < 0)[0]
     if len(sc) > 0:
         i = sc[np.argmin(np.abs(x_grid[sc] - spot))]
-        x1,x2,g1,g2 = x_grid[i],x_grid[i+1],g_vals[i],g_vals[i+1]
-        return float(x1+(x2-x1)*(-g1)/(g2-g1)) if (g2-g1)!=0 else float(x1)
+        x1, x2, g1, g2 = x_grid[i], x_grid[i+1], g_vals[i], g_vals[i+1]
+        return float(x1 + (x2-x1)*(-g1)/(g2-g1)) if (g2-g1) != 0 else float(x1)
+
     return float(x_grid[np.argmin(np.abs(g_vals))])
 
 

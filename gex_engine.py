@@ -250,43 +250,45 @@ def compute_dealer_greeks(chain: pd.DataFrame, spot: float,
 def _net_gamma_at_spot(chain: pd.DataFrame, x: float,
                         multiplier: int = 100, r: float = 0.05) -> float:
     """
-    Compute total net dealer dollar GEX if spot were at price x.
+    Net dealer gamma exposure at hypothetical spot price x.
 
-    G_net(x) = Σ_calls[ Γ_i(x) · OI_i · x² · 100 ]
-             - Σ_puts [ Γ_i(x) · OI_i · x² · 100 ]
+    G_net(x) = Σ_calls[ Γ_i(x) · OI_i ] - Σ_puts[ Γ_i(x) · OI_i ]
 
-    Must include x² so the zero-crossing is found in dollar-GEX space,
-    consistent with how net_gex is computed in compute_gex_from_chain.
+    Note: x² · multiplier is a positive scalar that cancels out at the zero
+    crossing (G_net(x)=0 iff the unscaled sum = 0), so we omit it here for
+    efficiency. The sign profile — and therefore the flip level — is identical.
     """
     total = 0.0
-    x2 = x * x
     for _, row in chain.iterrows():
         K, T, iv = float(row["strike"]), float(row["expiry_T"]), float(row["iv"])
         if T <= 0 or iv <= 0:
             continue
-        g = bs_gamma(x, K, T, iv, r)
+        g    = bs_gamma(x, K, T, iv, r)
         c_oi = float(row.get("call_oi", 0))
         p_oi = float(row.get("put_oi",  0))
-        total += g * x2 * multiplier * (c_oi - p_oi)
+        total += g * (c_oi - p_oi)
     return total
 
 
 def find_gamma_flip(chain: pd.DataFrame, spot: float = None,
-                    scan_pct: float = 0.10, n_points: int = 200) -> float:
+                    scan_pct: float = 0.20, n_points: int = 400) -> float:
     """
-    True zero-gamma level: the spot price x where total net dealer dollar GEX = 0.
+    True zero-gamma level: the spot price x where net dealer gamma = 0.
 
-    Method:
-        Scan x ∈ [spot*(1-scan_pct), spot*(1+scan_pct)].
-        At each x recompute G_net(x) = Σ Γ_i(x)·OI_i·x²·100 (calls minus puts).
-        Find sign changes, interpolate to the crossing nearest to current spot.
+    Scans x ∈ [spot*(1-scan_pct), spot*(1+scan_pct)] at n_points resolution,
+    recomputing G_net(x) = Σ Γ_i(x)·(call_OI_i - put_OI_i) at each point.
+    Finds the zero crossing nearest to current spot and linear-interpolates.
 
-    Fallback: if no zero crossing exists, return x where |G_net| is minimised.
+    scan_pct=0.20 → ±20% range covers nearly all real-world flip distances.
+    n_points=400  → ~0.1% resolution at SPY/QQQ prices; fine enough for display.
+
+    Fallback: if no zero crossing found, returns x where |G_net| is minimised
+    (the "vol trigger" / closest-to-flat level).
     """
     if chain is None or len(chain) == 0:
         return np.nan
 
-    # Deduplicate — one row per (strike, expiry) for efficiency
+    # Deduplicate: one row per (strike, expiry) — aggregates multi-leg spreads
     cols = [c for c in ["strike", "expiry_T", "iv", "call_oi", "put_oi"] if c in chain.columns]
     chain_agg = (chain[cols]
                  .groupby(["strike", "expiry_T"])
@@ -296,26 +298,30 @@ def find_gamma_flip(chain: pd.DataFrame, spot: float = None,
     if spot is None or not np.isfinite(spot) or spot <= 0:
         spot = float(chain_agg["strike"].median())
 
-    x_lo   = spot * (1 - scan_pct)
-    x_hi   = spot * (1 + scan_pct)
-    x_grid = np.linspace(x_lo, x_hi, n_points)
+    # Extend scan to cover all listed strikes too — flip can be outside the
+    # ±20% band on very wide chains (LEAPS, post-crash environments)
+    k_min = float(chain_agg["strike"].min())
+    k_max = float(chain_agg["strike"].max())
+    x_lo  = min(spot * (1 - scan_pct), k_min * 0.98)
+    x_hi  = max(spot * (1 + scan_pct), k_max * 1.02)
 
-    g_vals = np.array([_net_gamma_at_spot(chain_agg, float(x)) for x in x_grid])
+    x_grid = np.linspace(x_lo, x_hi, int(n_points))
+    g_vals = np.array([_net_gamma_at_spot(chain_agg, float(x), r=r) for x in x_grid])
 
     if not np.any(np.isfinite(g_vals)):
         return float(spot)
 
-    # All zero crossings
+    # Find all zero crossings
     sign_changes = np.where(g_vals[:-1] * g_vals[1:] < 0)[0]
 
     if len(sign_changes) > 0:
-        # Pick the crossing nearest to current spot (not the largest jump)
+        # Pick the crossing nearest to current spot
         best_i = sign_changes[np.argmin(np.abs(x_grid[sign_changes] - spot))]
         x1, x2 = x_grid[best_i], x_grid[best_i + 1]
         g1, g2 = g_vals[best_i], g_vals[best_i + 1]
         return float(x1 + (x2 - x1) * (-g1) / (g2 - g1)) if (g2 - g1) != 0 else float(x1)
 
-    # No crossing: return x with G_net closest to zero
+    # No crossing: closest-to-zero point (vol trigger / minimum gamma level)
     return float(x_grid[np.argmin(np.abs(g_vals))])
 
 def classify_gex_regime(spot: float, flip: float) -> Tuple[GammaRegime, float, float]:

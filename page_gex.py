@@ -381,7 +381,7 @@ def _cumulative_gex_chart(chain_df: pd.DataFrame, spot: float,
         # Min/max annotations
         min_idx = prof["cum_gex"].idxmin()
         max_idx = prof["cum_gex"].idxmax()
-        for idx, label, col in [(min_idx, "MAX PAIN", _C_NEG),
+        for idx, label, col in [(min_idx, "MAX NEG GEX", _C_NEG),
                                  (max_idx, "MAX PIN",  _C_POS)]:
             fig.add_annotation(
                 x=float(prof.loc[idx, "strike"]),
@@ -409,10 +409,11 @@ def _cumulative_gex_chart(chain_df: pd.DataFrame, spot: float,
 def _greek_bar_chart(by_strike: dict, spot: float, title: str,
                      pos_color: str, neg_color: str,
                      flip_level: float = None, height=340) -> go.Figure:
-    strikes = sorted(by_strike.keys())
+    """Horizontal bar chart matching GEXBot layout: strike on Y-axis, GEX on X-axis."""
+    strikes = sorted(by_strike.keys(), reverse=True)   # high strike at top (GEXBot style)
     near    = [s for s in strikes if spot * 0.90 < s < spot * 1.10]
     if not near:
-        near = strikes  # fallback: show all if range filter removes everything
+        near = strikes
 
     # Auto-scale: $B if any value exceeds $5B, else $M
     raw_vals = [by_strike[s] / 1e6 for s in near]
@@ -424,38 +425,64 @@ def _greek_bar_chart(by_strike: dict, spot: float, title: str,
     vals   = [v / scale for v in raw_vals]
     colors = [pos_color if v > 0 else neg_color for v in vals]
 
+    # Strike labels — format as "$587"
+    y_labels = [f"${s:.0f}" for s in near]
+
     fig = go.Figure(go.Bar(
-        x=near, y=vals,
+        x=vals,
+        y=y_labels,
+        orientation="h",          # horizontal — matches GEXBot
         marker_color=colors,
         marker_line_width=0,
-        opacity=0.85,
+        opacity=0.88,
         name=title,
     ))
 
-    # Zero line — prominent horizontal reference
-    fig.add_hline(y=0, line_color="rgba(255,255,255,0.35)", line_width=1)
+    # Zero line (vertical for horizontal bars)
+    fig.add_vline(x=0, line_color="rgba(255,255,255,0.35)", line_width=1)
 
-    # Spot line
-    fig.add_vline(x=spot, line_dash="dot", line_color="rgba(255,255,255,0.70)", line_width=1.5,
-                  annotation_text=f"SPOT ${spot:.0f}",
-                  annotation_font_size=10, annotation_font_color="rgba(255,255,255,0.8)",
-                  annotation_position="top right")
+    # Spot and flip lines — use paper-fraction y coords for categorical axis
+    n_cats = len(near)
+    def _cat_y(target_strike):
+        """Return 0..1 paper fraction for a given strike on the categorical axis."""
+        if n_cats <= 1: return 0.5
+        nearest = min(near, key=lambda s: abs(s - target_strike))
+        # near is sorted high→low, index 0 = top. Paper y: 0=bottom, 1=top.
+        idx = near.index(nearest)
+        return 1.0 - (idx / (n_cats - 1))
+
+    spot_y = _cat_y(spot)
+    fig.add_shape(type="line", xref="paper", yref="paper",
+                  x0=0, x1=1, y0=spot_y, y1=spot_y,
+                  line=dict(dash="dot", color="rgba(255,255,255,0.70)", width=1.5))
+    fig.add_annotation(xref="paper", yref="paper",
+                       x=1.01, y=spot_y,
+                       text=f"SPOT ${spot:.0f}",
+                       showarrow=False, xanchor="left",
+                       font=dict(size=10, color="rgba(255,255,255,0.85)"))
 
     # Flip line
     if flip_level and abs(flip_level - spot) / max(spot, 1) < 0.20:
-        fig.add_vline(x=flip_level, line_dash="dash", line_color=_C_FLIP, line_width=1.5,
-                      annotation_text=f"FLIP ${flip_level:.0f}",
-                      annotation_font_size=10, annotation_font_color=_C_FLIP,
-                      annotation_position="top left")
+        flip_y = _cat_y(flip_level)
+        fig.add_shape(type="line", xref="paper", yref="paper",
+                      x0=0, x1=1, y0=flip_y, y1=flip_y,
+                      line=dict(dash="dash", color=_C_FLIP, width=1.5))
+        fig.add_annotation(xref="paper", yref="paper",
+                           x=1.01, y=flip_y,
+                           text=f"FLIP ${flip_level:.0f}",
+                           showarrow=False, xanchor="left",
+                           font=dict(size=10, color=_C_FLIP))
 
-    # X-axis: centre on spot with equal padding
-    if near:
-        x_pad = max(abs(max(near) - spot), abs(spot - min(near))) * 1.05
-        fig.update_layout(xaxis=dict(range=[spot - x_pad, spot + x_pad]))
-
+    # Y-axis: show all strike labels, tight range
     fig.update_layout(
-        yaxis_title=f"Net GEX ({unit})",
-        bargap=0.15,
+        xaxis_title=f"Net GEX ({unit})",
+        yaxis=dict(
+            title="Strike",
+            categoryorder="array",
+            categoryarray=y_labels,   # maintains high-to-low order
+            tickfont=dict(size=10),
+        ),
+        bargap=0.12,
         showlegend=False,
     )
     return plotly_dark(fig, title, height)
@@ -1011,29 +1038,40 @@ def render_gex_engine():
                                     f"{symbol} GEX", int(hm_height))
             st.plotly_chart(fig_gex, use_container_width=True, key="gex_chart_heatmap")
         else:
-            regime_str = REGIME_OPERATIONAL_LABEL.get(gs.regime, gs.regime.value)
-            neg_frac = sum(1 for v in dg.gex_by_strike.values() if v < 0) / max(len(dg.gex_by_strike), 1)
+            # ── Use EXACT same chain slice as heatmap ─────────────────────
+            # Read strike range and DTE from the same attributes _make_heatmap uses.
+            _hm_lo  = getattr(_make_heatmap, "_strike_lo", spot - int(st.session_state.get("gex_strikes_each_side", 20)))
+            _hm_hi  = getattr(_make_heatmap, "_strike_hi", spot + int(st.session_state.get("gex_strikes_each_side", 20)))
+            _hm_dte = int(getattr(_make_heatmap, "_max_dte", st.session_state.get("gex_hm_dte", 30)))
+
+            # Filter chain to same DTE window as heatmap
+            _bar_chain = chain_df[chain_df["expiry_T"] <= _hm_dte / 365.0].copy()
+            if _bar_chain.empty:
+                _bar_chain = chain_df.copy()
+
+            # Aggregate net GEX by strike, same range as heatmap
+            _bar_gex = compute_gex_from_chain(_bar_chain, spot)
+            _bar_agg = (_bar_gex.groupby("strike")["net_gex"]
+                                .sum().reset_index())
+            _bar_agg = _bar_agg[(_bar_agg["strike"] >= _hm_lo) & (_bar_agg["strike"] <= _hm_hi)]
+            filtered = dict(zip(_bar_agg["strike"], _bar_agg["net_gex"]))
+
+            neg_frac = sum(1 for v in filtered.values() if v < 0) / max(len(filtered), 1)
             if neg_frac > 0.8:
-                regime_note = f"⚠ {neg_frac*100:.0f}% of strikes negative — heavy put positioning, dealers AMPLIFY moves."
+                regime_note = f"⚠ {neg_frac*100:.0f}% of strikes negative — heavy put positioning."
             elif neg_frac < 0.2:
-                regime_note = f"✓ {(1-neg_frac)*100:.0f}% of strikes positive — call-heavy, dealers PIN price."
+                regime_note = f"✓ {(1-neg_frac)*100:.0f}% of strikes positive — dealers PIN price."
             else:
-                regime_note = f"Mixed: {(1-neg_frac)*100:.0f}% positive / {neg_frac*100:.0f}% negative strikes."
-            st.caption(f"Green = positive GEX · Red = negative GEX · Yellow = gamma flip · {regime_note}")
-            n_side   = int(st.session_state["gex_strikes_each_side"])
-            bar_lo   = spot - n_side
-            bar_hi   = spot + n_side
-            filtered = {k: v for k, v in dg.gex_by_strike.items() if bar_lo <= k <= bar_hi}
-            # Show TWO bar charts: nearest expiry (0DTE-style) + all near-term
-            near0_chain = nearest_expiry_chain(chain_df)
+                regime_note = f"Mixed: {(1-neg_frac)*100:.0f}% pos / {neg_frac*100:.0f}% neg."
+            st.caption(f"Green = positive · Red = negative · Yellow = flip · {regime_note} · ${_hm_lo:.0f}–${_hm_hi:.0f} · ≤{_hm_dte}DTE")
+
+            # Nearest expiry (0DTE-style) using same chain slice
+            near0_chain = nearest_expiry_chain(_bar_chain)
             if near0_chain is not None and len(near0_chain) > 0:
-                from gex_engine import compute_gex_from_chain as _cgx
-                near0_gex = _cgx(near0_chain, spot)
-                near0_agg = near0_gex.groupby("strike")["net_gex"].sum()
-                near0_by_strike = near0_agg.to_dict()
-                near0_lo, near0_hi = spot - n_side, spot + n_side
-                near0_filtered = {k: v for k, v in near0_by_strike.items() if near0_lo <= k <= near0_hi}
-                import datetime as _dt2
+                near0_gex = compute_gex_from_chain(near0_chain, spot)
+                near0_agg = near0_gex.groupby("strike")["net_gex"].sum().reset_index()
+                near0_agg = near0_agg[(near0_agg["strike"] >= _hm_lo) & (near0_agg["strike"] <= _hm_hi)]
+                near0_filtered = dict(zip(near0_agg["strike"], near0_agg["net_gex"]))
                 min_dte = int(round(near0_chain["expiry_T"].min() * 365))
                 dte_label = "0DTE" if min_dte <= 1 else f"{min_dte}DTE"
                 fig_near0 = _greek_bar_chart(near0_filtered, spot,
@@ -1041,24 +1079,23 @@ def render_gex_engine():
                                              _C_POS, _C_NEG, gs.gamma_flip,
                                              height=int(st.session_state["gex_hm_height"] // 2))
                 st.plotly_chart(fig_near0, use_container_width=True, key="gex_chart_bar_0dte")
-                st.caption(f"↑ Nearest expiry only ({dte_label}) — matches GEXBot/SpotGamma spot GEX view. ↓ All ≤{int(st.session_state.get('gex_hm_dte',45))}DTE combined.")
+                st.caption(f"↑ Nearest expiry ({dte_label}) — matches GEXBot. ↓ All ≤{_hm_dte}DTE combined.")
 
+            regime_str = REGIME_OPERATIONAL_LABEL.get(gs.regime, gs.regime.value)
             fig_gex = _greek_bar_chart(filtered, spot,
-                                       f"Net GEX · {regime_str} · ≤{int(st.session_state.get('gex_hm_dte',45))}DTE",
+                                       f"Net GEX · {regime_str} · ≤{_hm_dte}DTE · ${_hm_lo:.0f}–${_hm_hi:.0f}",
                                        _C_POS, _C_NEG, gs.gamma_flip,
                                        height=int(st.session_state["gex_hm_height"] // 2))
             st.plotly_chart(fig_gex, use_container_width=True, key="gex_chart_bar")
 
-            # ── Cumulative GEX profile ────────────────────────────────────
             st.markdown(
                 "<div style='font-size:10px;color:rgba(255,255,255,0.4);margin:8px 0 2px;'>"
-                "CUMULATIVE GEX PROFILE — spatial context: where pinning is strongest "
-                "and where amplification begins · zero crossing = gamma flip</div>",
+                "CUMULATIVE GEX PROFILE — zero crossing = gamma flip</div>",
                 unsafe_allow_html=True
             )
             fig_cum = _cumulative_gex_chart(
-                chain_df, spot, gs.gamma_flip,
-                max_dte=int(st.session_state.get("gex_hm_dte", 45)),
+                _bar_chain, spot, gs.gamma_flip,
+                max_dte=_hm_dte,
                 height=int(st.session_state["gex_hm_height"] // 2),
             )
             st.plotly_chart(fig_cum, use_container_width=True, key="gex_chart_cumulative")

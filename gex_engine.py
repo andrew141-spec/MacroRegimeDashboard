@@ -166,6 +166,57 @@ def _net_gamma_at_spot(chain: pd.DataFrame, x: float,
     return float(np.sum(_vec_gamma(x, K, T, iv, r) * net_size))
 
 
+def gex_zero_crossing(chain: pd.DataFrame, spot: float,
+                       max_dte: int = 45) -> Optional[float]:
+    """
+    Find the exact price where per-strike net GEX crosses zero.
+
+    This is the VISUAL flip level — the price between the last negative-GEX
+    strike and the first positive-GEX strike (or vice-versa). It is the
+    boundary between red and green bars on the GEX chart.
+
+    Method: aggregate net_gex by strike, sort ascending, find adjacent pair
+    with opposite signs, linear-interpolate to the zero crossing.
+
+    This is distinct from find_gamma_flip() which recomputes greeks at each
+    hypothetical spot price (vol-trigger style). Both are valid; this one
+    matches exactly what the bar chart shows.
+
+    Returns None if no sign change exists in the chain.
+    """
+    if chain is None or chain.empty:
+        return None
+
+    near = chain[chain["expiry_T"] <= max_dte / 365.0].copy()
+    if near.empty:
+        near = chain.copy()
+
+    gc  = compute_gex_from_chain(near, spot)
+    agg = (gc.groupby("strike")["net_gex"]
+             .sum()
+             .reset_index()
+             .sort_values("strike")
+             .reset_index(drop=True))
+
+    strikes = agg["strike"].to_numpy(dtype=float)
+    gex_vals = agg["net_gex"].to_numpy(dtype=float)
+
+    # Find adjacent pairs with sign change
+    sign_changes = np.where(gex_vals[:-1] * gex_vals[1:] < 0)[0]
+    if len(sign_changes) == 0:
+        return None
+
+    # Pick the crossing nearest to spot
+    best_i = sign_changes[np.argmin(np.abs(strikes[sign_changes] - spot))]
+    k1, k2 = strikes[best_i], strikes[best_i + 1]
+    g1, g2 = gex_vals[best_i], gex_vals[best_i + 1]
+
+    # Linear interpolation: price where GEX = 0 between k1 and k2
+    if (g2 - g1) == 0:
+        return float(k1)
+    return float(k1 + (k2 - k1) * (-g1) / (g2 - g1))
+
+
 def find_gamma_flip(chain: pd.DataFrame, spot: float = None,
                     scan_pct: float = 0.20, n_points: int = 400,
                     r: float = 0.05) -> float:
@@ -320,10 +371,18 @@ def compute_dealer_greeks(chain: pd.DataFrame, spot: float,
 def build_gamma_state(chain: pd.DataFrame, spot: float, source: str = "yfinance",
                       max_dte: int = 45) -> GammaState:
     import datetime as _dt
-    near = chain[chain["expiry_T"]<=max_dte/365.0].copy()
+    near = chain[chain["expiry_T"] <= max_dte / 365.0].copy()
     if near.empty: near = chain.copy()
-    gc   = compute_gex_from_chain(near, spot)
-    flip = find_gamma_flip(near, spot=spot)
+    gc = compute_gex_from_chain(near, spot)
+
+    # Primary: direct zero-crossing of per-strike net GEX — this is exactly
+    # where the bar chart transitions from red to green, so the flip line
+    # will sit precisely at the visual boundary.
+    # Fallback: vol-trigger scan (find_gamma_flip) when no sign change exists.
+    flip = gex_zero_crossing(near, spot, max_dte=max_dte)
+    if flip is None or not np.isfinite(flip):
+        flip = find_gamma_flip(near, spot=spot)
+
     regime, dist, stability = classify_gex_regime(spot, flip)
     agg  = gc.groupby("strike")["net_gex"].sum().reset_index().sort_values("strike")
     bys  = dict(zip(agg["strike"].tolist(), agg["net_gex"].tolist()))

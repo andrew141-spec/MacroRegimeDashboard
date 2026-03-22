@@ -60,17 +60,6 @@ def bs_vanna(S, K, T, sigma, r=0.05) -> float:
     return -scipy_norm.pdf(d1) * d2 / sigma
 
 
-def bs_vega(S, K, T, sigma, r=0.05) -> float:
-    """True Vega = dPrice/dIV = S * phi(d1) * sqrt(T).
-    Dollar sensitivity of option price to a 1-unit (100%) change in IV.
-    VEX = OI * vega * multiplier  →  dollar gamma per 1-vol move (matches Doc 1 definition).
-    For per-1-vol-point (1%), divide by 100 at display time.
-    """
-    if T <= 0 or sigma <= 0: return 0.0
-    d1, _ = _d1d2(S, K, T, sigma, r)
-    return S * scipy_norm.pdf(d1) * math.sqrt(T)
-
-
 def bs_charm(S, K, T, sigma, r=0.05, option_type: str = "call") -> float:
     """Charm = dDelta/dTime (annualised rate of delta decay).
     Full per-side formula (matches Doc 1):
@@ -98,10 +87,9 @@ def compute_gex_from_chain(chain: pd.DataFrame, spot: float,
                          puts sold by dealers = negative (destabilizing)
 
     Formulas (Doc 1 standard — no 0.01 baked in):
-      GEX  = OI × Γ × S² × multiplier          (raw dollar gamma)
-      VEX  = OI × vega × multiplier             (true vega exposure, Doc 1 definition)
-      CEX  = OI × charm × multiplier            (per-side charm, full r-correction)
-      VNNX = OI × vanna × multiplier            (vanna exposure — separate from VEX)
+      GEX = OI × Γ × S² × multiplier          (raw dollar gamma)
+      VEX = OI × vanna × multiplier            (vanna exposure = dDelta/dIV)
+      CEX = OI × charm × multiplier            (per-side charm, full r-correction)
 
     The 0.01 per-1%-move normalisation belongs at the DISPLAY layer, not here.
     """
@@ -175,19 +163,13 @@ def compute_gex_from_chain(chain: pd.DataFrame, spot: float,
     )
     chain["net_vol_gex"] = chain["call_vol_gex"] + chain["put_vol_gex"]
 
-    # ── Vanna (dDelta/dIV) — kept as VNNX, separate from VEX ─────────────
+    # ── VEX: Vanna exposure (dDelta/dIV) — OI × vanna × multiplier ───────
+    # Vanna = -phi(d1) * d2 / sigma
+    # Positive vanna: IV rises → dealers BUY. Negative: IV rises → dealers SELL.
     chain["vanna"] = chain.apply(
         lambda row: bs_vanna(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
-    chain["call_vnnx"] =  chain["call_oi"] * chain["vanna"] * multiplier
-    chain["put_vnnx"]  = -chain["put_oi"]  * chain["vanna"] * multiplier
-    chain["net_vnnx"]  =  chain["call_vnnx"] + chain["put_vnnx"]
-
-    # ── VEX: TRUE Vega exposure (Doc 1: OI × vega × multiplier) ──────────
-    # vega = S × phi(d1) × sqrt(T)  — dollar price sensitivity to IV
-    chain["vega"] = chain.apply(
-        lambda row: bs_vega(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
-    chain["call_vex"] =  chain["call_oi"] * chain["vega"] * multiplier
-    chain["put_vex"]  = -chain["put_oi"]  * chain["vega"] * multiplier
+    chain["call_vex"] =  chain["call_oi"] * chain["vanna"] * multiplier
+    chain["put_vex"]  = -chain["put_oi"]  * chain["vanna"] * multiplier
     chain["net_vex"]  =  chain["call_vex"] + chain["put_vex"]
 
     # ── CEX: Charm with full per-side r-correction (Doc 1 formula) ────────
@@ -214,16 +196,14 @@ def compute_dealer_greeks(chain: pd.DataFrame, spot: float,
 
     # Aggregate by strike (sum across expirations)
     agg = gex_chain.groupby("strike").agg(
-        net_gex=("net_gex",  "sum"),
-        net_vex=("net_vex",  "sum"),   # true vega exposure (Doc 1 definition)
-        net_vnnx=("net_vnnx", "sum"),  # vanna exposure (dDelta/dIV — direction signal)
-        net_cex=("net_cex",  "sum"),
+        net_gex=("net_gex", "sum"),
+        net_vex=("net_vex", "sum"),   # vanna exposure (dDelta/dIV)
+        net_cex=("net_cex", "sum"),
     ).reset_index()
 
-    gex_by_strike  = dict(zip(agg["strike"], agg["net_gex"]))
-    vex_by_strike  = dict(zip(agg["strike"], agg["net_vex"]))   # true vega
-    vnnx_by_strike = dict(zip(agg["strike"], agg["net_vnnx"]))  # vanna
-    cex_by_strike  = dict(zip(agg["strike"], agg["net_cex"]))
+    gex_by_strike = dict(zip(agg["strike"], agg["net_gex"]))
+    vex_by_strike = dict(zip(agg["strike"], agg["net_vex"]))  # vanna
+    cex_by_strike = dict(zip(agg["strike"], agg["net_cex"]))
 
     # Key nodes = largest ABSOLUTE value (per Module 2: size matters most)
     def _key_nodes(by_strike: dict, n=5) -> List[Tuple[float, float]]:
@@ -238,13 +218,12 @@ def compute_dealer_greeks(chain: pd.DataFrame, spot: float,
     otm = {k: v for k, v in gex_by_strike.items() if abs(k - spot) > otm_threshold}
     otm_anchors = sorted(otm.items(), key=lambda x: abs(x[1]), reverse=True)[:10]
 
-    # Vanna direction: use NET VNNX (true vanna) near spot (within 2%)
-    # Convention:
-    #   Positive vanna: IV rises → dealers BUY, IV falls → dealers SELL
-    #   Negative vanna: IV rises → dealers SELL, IV falls → dealers BUY
-    ntm_vnnx = sum(v for k, v in vnnx_by_strike.items() if abs(k - spot) / spot < 0.02)
-    vanna_direction = "bullish" if ntm_vnnx > 0 else ("bearish" if ntm_vnnx < 0 else "neutral")
-    vanna_sign      = "positive" if ntm_vnnx > 0 else ("negative" if ntm_vnnx < 0 else "neutral")
+    # Vanna direction: net VEX (vanna) near spot (within 2%)
+    # Positive vanna: IV rises → dealers BUY, IV falls → dealers SELL
+    # Negative vanna: IV rises → dealers SELL, IV falls → dealers BUY
+    ntm_vex = sum(v for k, v in vex_by_strike.items() if abs(k - spot) / spot < 0.02)
+    vanna_direction = "bullish" if ntm_vex > 0 else ("bearish" if ntm_vex < 0 else "neutral")
+    vanna_sign      = "positive" if ntm_vex > 0 else ("negative" if ntm_vex < 0 else "neutral")
 
     # Charm direction: net CEX near spot
     ntm_cex = sum(v for k, v in cex_by_strike.items() if abs(k - spot) / spot < 0.02)

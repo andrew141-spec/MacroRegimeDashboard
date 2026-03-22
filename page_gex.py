@@ -18,7 +18,8 @@ from data_loaders import get_gex_from_yfinance
 from gex_engine import (build_gamma_state, compute_gex_from_chain, find_gamma_flip,
                         nearest_expiry_chain, compute_cumulative_gex_profile,
                         classify_gex_regime, compute_dealer_greeks, DealerGreeks,
-                        compute_gwas, compute_gex_term_structure, compute_flow_imbalance)
+                        compute_gwas, compute_gex_term_structure, compute_flow_imbalance,
+                        gex_zero_crossing)
 from schwab_api import (get_schwab_client, schwab_get_spot, schwab_get_options_chain,
                         SCHWAB_AVAILABLE)
 # OI source priority: Schwab/TOS (live IV + volume) → yfinance fallback (OI only)
@@ -1336,9 +1337,19 @@ def render_gex_engine():
                 "🔴🟢 NET 0DTE GEX — OTM calls (right) vs OTM puts (left) — volume = real-time dealer flow</div>",
                 unsafe_allow_html=True
             )
+            # Compute flip directly from the same chain slice each chart uses
+            # so the line sits exactly at the red→green boundary in the bars
+            _near_chain_0dte = chain_df[chain_df["expiry_T"] <= int(near_dte) / 365.0].copy()
+            if _near_chain_0dte.empty:
+                min_T = chain_df["expiry_T"].min()
+                _near_chain_0dte = chain_df[chain_df["expiry_T"] <= min_T + 1/365.0].copy()
+            _flip_0dte = gex_zero_crossing(_near_chain_0dte, spot, max_dte=int(near_dte))
+            if _flip_0dte is None:
+                _flip_0dte = gs.gamma_flip  # fallback to vol-trigger
+
             fig_twosided = _two_sided_gex_chart(
                 chain_df, spot,
-                flip_level=gs.gamma_flip,
+                flip_level=_flip_0dte,
                 use_volume=use_vol_toggle,
                 max_dte=int(near_dte),
                 height=int(st.session_state["gex_hm_height"] // 2),
@@ -1347,10 +1358,11 @@ def render_gex_engine():
             st.plotly_chart(fig_twosided, use_container_width=True, key="gex_chart_bar_twosided")
 
             flow_src = "volume" if use_vol_toggle else "OI"
+            flip_disp = f"${_flip_0dte:.2f}" if _flip_0dte else "N/A"
             st.caption(
                 f"Calls OTM (K≥spot) positive · Puts OTM (K≤spot) negative · "
                 f"{flow_src}-weighted · ≤{near_dte}DTE · ±{range_pct*100:.0f}% strike range · "
-                f"Volume = intraday hedging flow / OI = structural positioning"
+                f"Flip: {flip_disp} (net GEX = 0 crossing)"
             )
 
             st.markdown("---")
@@ -1364,6 +1376,11 @@ def render_gex_engine():
             _bar_agg = (_bar_gex.groupby("strike")["net_gex"].sum().reset_index())
             _bar_agg = _bar_agg[(_bar_agg["strike"] >= _hm_lo) & (_bar_agg["strike"] <= _hm_hi)]
             filtered = dict(zip(_bar_agg["strike"], _bar_agg["net_gex"]))
+
+            # Flip for the all-expiry bar — computed from same chain slice
+            _flip_bar = gex_zero_crossing(_bar_chain, spot, max_dte=_hm_dte)
+            if _flip_bar is None:
+                _flip_bar = gs.gamma_flip
 
             neg_frac = sum(1 for v in filtered.values() if v < 0) / max(len(filtered), 1)
             if neg_frac > 0.8:
@@ -1381,7 +1398,7 @@ def render_gex_engine():
             regime_str = REGIME_OPERATIONAL_LABEL.get(gs.regime, gs.regime.value)
             fig_gex = _greek_bar_chart(filtered, spot,
                                        f"Net GEX (OI) · {regime_str} · ≤{_hm_dte}DTE",
-                                       _C_POS, _C_NEG, gs.gamma_flip,
+                                       _C_POS, _C_NEG, _flip_bar,
                                        height=int(st.session_state["gex_hm_height"] // 2))
             st.plotly_chart(fig_gex, use_container_width=True, key="gex_chart_bar")
 
@@ -1391,7 +1408,7 @@ def render_gex_engine():
                 unsafe_allow_html=True
             )
             fig_cum = _cumulative_gex_chart(
-                _bar_chain, spot, gs.gamma_flip,
+                _bar_chain, spot, _flip_bar,
                 max_dte=_hm_dte,
                 height=int(st.session_state["gex_hm_height"] // 2),
             )

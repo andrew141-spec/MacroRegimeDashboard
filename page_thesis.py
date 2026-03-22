@@ -15,7 +15,7 @@ from data_loaders import load_macro, get_gex_from_yfinance
 from gex_engine import (build_gamma_state, compute_gwas, compute_gex_from_chain, compute_dealer_greeks,
                          compute_gex_term_structure, compute_flow_imbalance,
                          compute_cumulative_gex_profile, gex_zero_crossing)
-from schwab_api import get_schwab_client, schwab_get_spot, schwab_get_options_chain
+from schwab_api import get_schwab_client, schwab_get_spot, schwab_get_options_chain, get_intraday_signals
 from signals import compute_leading_stack, compute_1d_prob
 from probability import (compute_prob_composite, get_session_context,
                           classify_macro_regime_abs, regime_transition_prob)
@@ -982,7 +982,7 @@ def _medium_term_engine(
     """
     # 1. Macro regime quadrant
     regime_base = {
-        "Goldilocks":   +2.0,
+        "Goldilocks":   +1.0,  # reduced: avoid systematic bull tilt on regime label alone
         "Overheating":  +0.5,
         "Disinflation": -0.5,
         "Stagflation":  -2.0,
@@ -1099,13 +1099,15 @@ def _composite(prob: dict, vrp_val: float,
     s = s * _SCALE
 
     # ── NO EDGE state: at flip or both score and momentum weak ───────────────
+    # Exception: VTS backwardation is a genuine contrarian signal — preserve it.
     mom_abs = abs(intra.get("mom_spx", 0)) + abs(intra.get("mom_credit", 0))
-    if at_flip or (abs(s) < 1.5 and mom_abs < 0.5):
-        s = 0.0   # explicitly zero — _verdict3 will label "NO TRADE"
+    _vts_contrarian = (vts_shape == "BACKWARDATION") and not at_flip
+    if at_flip or (abs(s) < 1.5 and mom_abs < 0.5 and not _vts_contrarian):
+        s = 0.0
 
     return float(np.clip(s, -10.0, 10.0))
 
-def _verdict(c: int, gex: GammaRegime) -> Tuple[str,str,str]:
+def _verdict(c: float, gex: GammaRegime) -> Tuple[str,str,str]:
     """
     Map composite score to verdict label.
 
@@ -1923,6 +1925,13 @@ def render_thesis_page():
     _rv5  = float(_spy_rets.rolling(5,  min_periods=3).std().dropna().iloc[-1] * np.sqrt(252) * 100) if len(_spy_rets) > 5  else float("nan")
     _rv20 = float(_spy_rets.rolling(20, min_periods=10).std().dropna().iloc[-1] * np.sqrt(252) * 100) if len(_spy_rets) > 20 else float("nan")
 
+    # Override stale daily closes with live Schwab session data during market hours
+    _intraday_live = get_intraday_signals(client) if client else {}
+    if _intraday_live:
+        _spx_1d_ret = _intraday_live.get("SPY_pct", _spx_1d_ret)
+        _hyg_1d_ret = _intraday_live.get("HYG_pct", _hyg_1d_ret)
+        _lqd_1d_ret = _intraday_live.get("LQD_pct", _lqd_1d_ret)
+
     comp=_composite(prob, vrp["val"],
                     leading=leading,
                     gex_regime=gex_st.regime,
@@ -1961,7 +1970,14 @@ def render_thesis_page():
     fc="#ef4444" if fear_z>1.0 else "#f59e0b" if fear_z>0.0 else "#10b981"
 
     # ── 1. MARKET REGIME ──────────────────────────────────────────────────
-    intraday_label, intraday_col = _intraday_bias(q, gex_st)
+    _q_live = dict(q)
+    if _intraday_live:
+        # Schwab returns fractions; _intraday_bias uses percent
+        _q_live["SPX_pct"] = _intraday_live.get("SPY_pct", q.get("SPX_pct", 0.0)) * 100
+        _q_live["VIX_pct"] = _intraday_live.get("VIX_pct", q.get("VIX_pct", 0.0))
+        _q_live["HYG_pct"] = _intraday_live.get("HYG_pct", q.get("HYG_pct", 0.0)) * 100
+        _q_live["LQD_pct"] = _intraday_live.get("LQD_pct", q.get("LQD_pct", 0.0)) * 100
+    intraday_label, intraday_col = _intraday_bias(_q_live, gex_st)
     hdr=(f"<div style='display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px;'>"
          +_pill(f"Market Regime: {macro_reg} / {intraday_label}",reg_col)
          +_pill(f"Fear Level: {fl2} ({fear_z:+.2f}σ)",fc)

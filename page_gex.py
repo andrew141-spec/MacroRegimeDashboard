@@ -1024,6 +1024,7 @@ def render_gex_engine():
 
     if st.sidebar.button("🔄 Refresh now", use_container_width=True, key="gex_manual_refresh"):
         st.cache_data.clear()
+        st.session_state["_autorefresh_last"] = __import__("time").time()
         st.rerun()
 
     if auto_refresh:

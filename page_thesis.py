@@ -14,7 +14,7 @@ from ui_components import plotly_dark
 from data_loaders import load_macro, get_gex_from_yfinance
 from gex_engine import (build_gamma_state, compute_gwas, compute_gex_from_chain, compute_dealer_greeks,
                          compute_gex_term_structure, compute_flow_imbalance,
-                         compute_cumulative_gex_profile)
+                         compute_cumulative_gex_profile, gex_zero_crossing)
 from schwab_api import get_schwab_client, schwab_get_spot, schwab_get_options_chain
 from signals import compute_leading_stack, compute_1d_prob
 from probability import (compute_prob_composite, get_session_context,
@@ -1095,7 +1095,8 @@ def _gl(term,defn):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def _gex_histogram(chain_df, spot: float, flip: float,
-                   max_dte: int = 45, height: int = 360) -> go.Figure:
+                   max_dte: int = 45, height: int = 360,
+                   flip_src: str = "OI") -> go.Figure:
     _C_POS  = "#10b981"
     _C_NEG  = "#ef4444"
     _C_FLIP = "#f59e0b"
@@ -1112,7 +1113,13 @@ def _gex_histogram(chain_df, spot: float, flip: float,
 
         gex_chain = compute_gex_from_chain(near_chain, spot)
 
-        agg = (gex_chain.groupby("strike")["net_gex"]
+        # Volume GEX when available — matches the bar chart and flip line
+        _vol_avail = ("net_vol_gex" in gex_chain.columns and
+                      gex_chain["net_vol_gex"].abs().sum() > 0)
+        _gex_col = "net_vol_gex" if _vol_avail else "net_gex"
+        _src_label = "Volume flow" if _vol_avail else "OI"
+
+        agg = (gex_chain.groupby("strike")[_gex_col]
                         .sum()
                         .reset_index()
                         .sort_values("strike"))
@@ -1123,8 +1130,8 @@ def _gex_histogram(chain_df, spot: float, flip: float,
         if agg.empty:
             raise ValueError("No strikes in ±10% range")
 
-        strikes = agg["strike"].tolist()
-        vals_m  = (agg["net_gex"] / 1e6).tolist()
+        strikes   = agg["strike"].tolist()
+        vals_m    = (agg[_gex_col] / 1e6).tolist()
 
         max_abs = max(abs(v) for v in vals_m)
         if max_abs >= 5000:
@@ -1139,24 +1146,25 @@ def _gex_histogram(chain_df, spot: float, flip: float,
         fig = go.Figure(go.Bar(
             x=strikes, y=vals_display,
             marker_color=colors, marker_line_width=0,
-            opacity=0.88, name="Net GEX",
+            opacity=0.88, name=f"Net GEX ({_src_label})",
         ))
 
         fig.add_hline(y=0, line_color="rgba(255,255,255,0.30)", line_width=1)
         fig.add_vline(
             x=spot, line_dash="dot",
             line_color="rgba(255,255,255,0.75)", line_width=1.5,
-            annotation_text=f"SPOT {spot:.0f}",
+            annotation_text=f"SPOT {spot:.2f}",
             annotation_font_size=10,
             annotation_font_color="rgba(255,255,255,0.85)",
             annotation_position="top right",
         )
 
-        if flip and lo < flip < hi:
+        # Flip line — exact price at net GEX = 0 crossing
+        if flip and np.isfinite(flip) and lo <= flip <= hi:
             fig.add_vline(
                 x=flip, line_dash="dash",
-                line_color=_C_FLIP, line_width=1.5,
-                annotation_text=f"FLIP {flip:.0f}",
+                line_color=_C_FLIP, line_width=2,
+                annotation_text=f"⚡ FLIP {flip:.2f} ({flip_src})",
                 annotation_font_size=10,
                 annotation_font_color=_C_FLIP,
                 annotation_position="top left",
@@ -1168,7 +1176,7 @@ def _gex_histogram(chain_df, spot: float, flip: float,
             yaxis_title=f"Net GEX ({unit})",
             bargap=0.12, showlegend=False,
         )
-        plotly_dark(fig, title=f"GEX Histogram — {unit} per Strike (≤{max_dte} DTE)", height=height)
+        plotly_dark(fig, title=f"GEX Histogram ({_src_label}) — {unit} per Strike (≤{max_dte} DTE)", height=height)
         return fig
 
     except Exception as exc:
@@ -1603,7 +1611,18 @@ def render_thesis_page():
             qqq_chain_df = chain_df
             qqq_spot = gex_spot   # already correct ETF price
 
-    flip=gex_st.gamma_flip or gex_spot
+    # Flip: use volume-based zero crossing (sits at visual red/green boundary)
+    _vol_flip = gex_zero_crossing(chain_df, float(gex_spot), max_dte=45) if chain_df is not None else None
+    if _vol_flip is not None and np.isfinite(_vol_flip):
+        flip = _vol_flip
+        if hasattr(gex_st, 'gamma_flip'):
+            gex_st.gamma_flip = _vol_flip
+    else:
+        flip = gex_st.gamma_flip or gex_spot
+    _has_vol_flip = (chain_df is not None and
+                     "call_volume" in chain_df.columns and
+                     chain_df["call_volume"].fillna(0).sum() > 0)
+    _flip_src_label = "vol-flow" if _has_vol_flip else "OI"
     upper=gex_st.key_resistance[0] if gex_st.key_resistance else gex_spot*1.03
     lower=gex_st.key_support[0] if gex_st.key_support else gex_spot*0.97
     gex_reg=gex_st.regime.value if hasattr(gex_st.regime,"value") else str(gex_st.regime)
@@ -1739,7 +1758,7 @@ def render_thesis_page():
     gleft=("<div>"
            +f"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>GEX LEVELS ({gex_sym} → {_g3_label})</div>"
            +_kv(f"{_g3_label} Spot",f"{spx:,.2f}","#fff")
-           +_kv("GEX Flip",f"{flip*_g3_mult:,.2f}","#f59e0b")
+           +_kv(f"GEX Flip ({_flip_src_label})",f"{flip*_g3_mult:,.2f}","#f59e0b")
            +_kv("GEX Upper",f"{upper*_g3_mult:,.2f}","#10b981")
            +_kv("GEX Lower",f"{lower*_g3_mult:,.2f}","#ef4444")
            +_kv("GWAS Above",f"{gwas_a*_g3_mult:,.2f}" if gwas_a else "N/A","#6366f1")
@@ -1757,7 +1776,7 @@ def render_thesis_page():
         gright+=("<div style='margin-top:8px;border-top:1px solid rgba(255,255,255,0.08);padding-top:6px;'>"
                  +f"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>{ua} EQUIVALENT</div>"
                  +_kv(f"{ua} Spot",_ua(float(gex_spot)))
-                 +_kv(f"{ua} Flip",_ua(flip),"#f59e0b")
+                 +_kv(f"{ua} Flip ({_flip_src_label})",_ua(flip),"#f59e0b")
                  +_kv(f"{ua} Upper",_ua(upper),"#10b981")
                  +_kv(f"{ua} Lower",_ua(lower),"#ef4444")
                  +"</div>")
@@ -1775,7 +1794,8 @@ def render_thesis_page():
     with _hist_col:
         st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>GEX HISTOGRAM — Net Gamma per Strike</div>",unsafe_allow_html=True)
         st.plotly_chart(
-            _gex_histogram(chain_df if chain_df is not None else None, float(gex_spot), float(flip)),
+            _gex_histogram(chain_df if chain_df is not None else None, float(gex_spot), float(flip),
+                           flip_src=_flip_src_label),
             use_container_width=True, key="th_gex_hist"
         )
     with _cum_col:
@@ -1807,8 +1827,9 @@ def render_thesis_page():
                     annotation_text=f"SPOT", annotation_font_size=9)
                 if flip and _cum_prof["strike"].min() < flip < _cum_prof["strike"].max():
                     _cum_fig.add_vline(x=float(flip), line_dash="dash",
-                        line_color="#f59e0b", line_width=1.5,
-                        annotation_text="FLIP", annotation_font_size=9,
+                        line_color="#f59e0b", line_width=2,
+                        annotation_text=f"⚡ FLIP {flip:.2f} ({_flip_src_label})",
+                        annotation_font_size=9,
                         annotation_font_color="#f59e0b")
                 _cum_fig.update_layout(yaxis_title=f"Cum GEX ({_cum_unit})", showlegend=True,
                     legend=dict(orientation="h",y=1.02,x=0,font=dict(size=9)))
@@ -1961,7 +1982,7 @@ def render_thesis_page():
     _upper_disp = upper * _kls_mult if gex_sym in ("SPY","QQQ") else upper
     _lower_disp = lower * _kls_mult if gex_sym in ("SPY","QQQ") else lower
     kls=(_kv("SPX Spot",f"{spx:,.2f}","#fff")
-         +_kv("GEX Flip",f"{_flip_disp:,.2f}","#f59e0b")
+         +_kv(f"GEX Flip ({_flip_src_label})",f"{_flip_disp:,.2f}","#f59e0b")
          +_kv("GEX Upper",f"{_upper_disp:,.2f}","#10b981")
          +_kv("GEX Lower",f"{_lower_disp:,.2f}","#ef4444")
          +_kv("1σ Daily",f"{b['d1lo']:,.2f} — {b['d1hi']:,.2f}")

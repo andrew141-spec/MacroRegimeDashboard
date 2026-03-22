@@ -253,6 +253,42 @@ def classify_gex_regime(spot: float, flip: float) -> Tuple[GammaRegime, float, f
     stability = float(np.clip(min(abs(dist_pct - 0.5), abs(dist_pct + 0.5)) / 2.0, 0, 1))
     return regime, dist_pct, stability
 
+
+def compute_cumulative_gex_profile(chain: pd.DataFrame, spot: float,
+                                    max_dte: int = 45) -> pd.DataFrame:
+    """
+    Cumulative GEX profile — how total dealer gamma exposure changes as spot
+    moves through each strike level.
+
+    Method: for each strike K (sorted low→high), compute the cumulative sum of
+    net_gex for all strikes <= K.  The result tells you:
+      - Where cumulative GEX is most negative  → max pain / highest amplification zone
+      - Where it crosses zero                  → the gamma flip (same as find_gamma_flip)
+      - Where it peaks positive                → strongest pinning / resistance wall
+      - Shape of curve                         → steep = sharp regime change at that level
+
+    This is the profile shown by SpotGamma's "GEX Profile" chart and GEXBot's
+    cumulative view — it gives spatial context that individual strike bars lack.
+
+    Returns DataFrame with columns: strike, net_gex, cum_gex, regime
+      regime: "negative" | "positive" (sign of cum_gex at each strike)
+    """
+    near = chain[chain["expiry_T"] <= max_dte / 365.0].copy()
+    if near.empty:
+        near = chain.copy()
+
+    gex_chain = compute_gex_from_chain(near, spot)
+
+    agg = (gex_chain.groupby("strike")["net_gex"]
+                    .sum()
+                    .reset_index()
+                    .sort_values("strike")
+                    .reset_index(drop=True))
+
+    agg["cum_gex"] = agg["net_gex"].cumsum()
+    agg["regime"]  = np.where(agg["cum_gex"] >= 0, "positive", "negative")
+    return agg
+
 def nearest_expiry_chain(chain: pd.DataFrame) -> pd.DataFrame:
     """Return only the nearest expiration — for 0DTE-style bar chart display."""
     if chain is None or chain.empty:

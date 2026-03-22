@@ -864,13 +864,12 @@ def _composite(prob: dict, vrp_val: float,
                spx_dd: float = 0.0,
                macro_reg: str = "Goldilocks",
                growth_score: int = 0,
-               # Fix 6: short-term momentum inputs
-               spx_5d_ret: float = 0.0,      # SPX 5-day return (fraction)
-               hyg_1d_ret: float = 0.0,       # HYG 1-day return (fraction)
-               lqd_1d_ret: float = 0.0,       # LQD 1-day return (fraction)
-               dist_to_flip_pct: float = 5.0, # distance to GEX flip (%)
-               hy_oas_pct: float = 3.0,        # HY OAS in percent (e.g. 3.20 = 320bp)
-               ) -> int:
+               spx_5d_ret: float = 0.0,
+               hyg_1d_ret: float = 0.0,
+               lqd_1d_ret: float = 0.0,
+               dist_to_flip_pct: float = 5.0,
+               hy_oas_pct: float = 3.0,
+               ) -> float:  # float — rounding deferred to display layer
     """
     Composite directional score −10 to +10.
 
@@ -890,9 +889,29 @@ def _composite(prob: dict, vrp_val: float,
     # ── 1. Fear signal (−3.5 to +3.5) ────────────────────────────────────
     fear_sig = float(np.clip(-fear_z * 1.5, -3.5, 3.5))
 
-    # ── 2. Recession stress (−2.5 to +1.0) — orthogonal to fear ──────────
-    # rec_score now uses only Sahm+HY+curve+ICSA (no VIX/EPU overlap)
-    rec_sig = float(np.clip(-(rec_score - 40.0) / 20.0, -2.5, 1.0))
+    # ── 2. Recession stress — slow filter, not daily directional driver ────
+    # Recession variables (Sahm, yield curve, ICSA) move over weeks-months,
+    # not days. Using rec_score as a direct additive signal creates false
+    # bearishness on noisy but non-recessionary days.
+    #
+    # New role: rec_score controls THREE structural adjustments only:
+    #   (a) Upside cap: high recession stress compresses bullish headroom
+    #   (b) Conviction multiplier: high stress widens uncertainty → shrink signal
+    #   (c) Small baseline drag: non-zero but much smaller than before
+    #
+    # rec_score 0-100. Below 30 = benign, 30-60 = building, above 60 = stressed.
+    rec_drag     = float(np.clip(-(rec_score - 30.0) / 120.0, -0.5, 0.1))  # tiny drag, max ±0.5
+    rec_upside_cap = (                 # tighten bullish ceiling as stress builds
+        4.5 if rec_score < 30 else     # benign: full upside
+        3.5 if rec_score < 50 else     # moderate: trim ceiling
+        2.5 if rec_score < 70 else     # stressed: significant cap
+        1.5                            # severe: near-neutral ceiling
+    )
+    rec_conviction = (                 # shrink all signals when uncertain
+        1.0 if rec_score < 40 else
+        0.9 if rec_score < 60 else
+        0.8                            # high stress → compress signal ±20%
+    )
 
     # ── 3. Drawdown signal (−3.0 to +1.0) ────────────────────────────────
     dd_sig = float(np.clip(spx_dd / 0.07, -3.0, 1.0))
@@ -956,13 +975,22 @@ def _composite(prob: dict, vrp_val: float,
     ))
 
     # ── Weighted primary sum ──────────────────────────────────────────────
-    s = (0.30 * fear_sig    +
-         0.15 * rec_sig     +
-         0.15 * dd_sig      +
-         0.15 * regime_sig  +
-         0.10 * growth_sig  +
-         0.10 * momentum_sig +
-         0.05 * prob_sig)
+    # rec_sig removed from additive weights — it now acts as structural filter.
+    # Freed 15% weight redistributed: fear +5%, dd +5%, momentum +5%.
+    # Rationale: fear_sig and momentum_sig are genuinely daily signals;
+    # recession stress is a slow structural context, not a daily direction vote.
+    s = (0.35 * fear_sig    +   # +5%: real-time, most responsive
+         0.20 * dd_sig      +   # +5%: price-level trend (weeks)
+         0.15 * regime_sig  +   # unchanged
+         0.10 * growth_sig  +   # unchanged
+         0.15 * momentum_sig +  # +5%: credit/GEX/mom (days)
+         0.05 * prob_sig)       # unchanged
+
+    # Apply recession conviction multiplier BEFORE overlays
+    s = s * rec_conviction
+
+    # Apply recession baseline drag (tiny — structural headwind, not reversal)
+    s += rec_drag
 
     # ── Fix 2: VRP overlay — CORRECTED sign ──────────────────────────────
     # High VRP (IV >> RV) predicts POSITIVE returns next 1-4 weeks (Bollerslev
@@ -981,9 +1009,7 @@ def _composite(prob: dict, vrp_val: float,
     # directional penalty.
     stress_count = 0
     if leading is not None:
-        sahm_triggered = leading.get("sahm_triggered",  False)
-        # hy_stress_gate was never written to leading — compute from hy_oas_pct directly
-        # hy_oas_pct is passed as a parameter; >4.0% (400bp) = stress territory
+        sahm_triggered = leading.get("sahm_triggered", False)
         hy_stress      = (hy_oas_pct > 4.0) if np.isfinite(hy_oas_pct) else False
         corr_systemic  = leading.get("corr_regime", "NORMAL") == "SYSTEMIC"
         stress_count   = sum([bool(sahm_triggered), bool(hy_stress), bool(corr_systemic)])
@@ -998,45 +1024,52 @@ def _composite(prob: dict, vrp_val: float,
         if neg_gex:  s -= 0.4
         elif pos_gex: s += 0.3
 
-    # ── Hard structural caps — applied PRE-scale so they map to intended ±10 values
-    # Cap pre-scale values then multiply, so "cap at -2 post-scale" means
-    # pre-scale cap = -2/2.2 = -0.909, which after *2.2 gives exactly -2.0.
-    _SCALE = 2.2
-    if stress_count >= 2:
-        s = min(s, -2.0 / _SCALE)   # ≥2 stress flags → post-scale max = -2
-    elif stress_count == 1:
-        s = min(s,  3.0 / _SCALE)   # 1 stress flag → post-scale max = +3
+    # ── Recession upside cap (pre-scale) ─────────────────────────────────
+    # Prevents bullish verdict when recession stress is building, without
+    # making the model bearish just because stress exists.
+    s = min(s, rec_upside_cap / 2.2)   # divide by scale so post-scale = rec_upside_cap
 
     # ── Scale to ±10 range ────────────────────────────────────────────────
-    s = s * _SCALE
+    s = s * 2.2
 
-    return int(np.clip(round(s), -10, 10))
+    # ── Hard caps — stress flags cap post-scale values (already scaled above)
+    if stress_count >= 2:
+        s = min(s, -2.0)   # ≥2 flags: ceiling at -2 post-scale
+    elif stress_count == 1:
+        s = min(s,  3.0)   # 1 flag: ceiling at +3 post-scale
 
-def _verdict(c: int, gex: GammaRegime) -> Tuple[str,str,str]:
+    return float(np.clip(s, -10.0, 10.0))  # float — bin in _verdict, display to 1dp
+
+def _verdict(c: float, gex: GammaRegime) -> Tuple[str,str,str]:
     """
-    Map composite score to verdict label.
+    Map continuous composite score to verdict label.
 
-    With the recalibrated _composite (divisor=8, no ×3 multiplier):
-      Typical neutral day (probs ~50%): s ≈ 0 ± overlays → −2 to +1
-      Mild conviction (probs ~58%):     s ≈ ±1 + overlays
-      Strong conviction (probs ~70%):   s ≈ ±2.5 + overlays
-      Max theoretical:                  s ≈ ±8
+    Takes float score — rounding happens here, not in _composite.
+    Thresholds have 0.25-point hysteresis band around integer boundaries
+    to prevent label flipping from tiny numeric noise.
 
-    Thresholds scaled accordingly — BEARISH requires genuine bearish
-    probability signal OR strong probability signal + structural stress.
+    Bands (post-scale, ±10 range):
+      ≤ -3.0              → BEARISH
+      -3.0 to -1.75       → BEARISH (neg gamma) or LEANING BEARISH
+      -1.75 to +0.75      → CAUTIOUS / NEUTRAL / NEUTRAL RANGE
+      +0.75 to +2.5       → LEANING BULLISH
+      > +2.5              → BULLISH
     """
-    neg=gex in (GammaRegime.NEGATIVE,GammaRegime.STRONG_NEGATIVE)
-    pos=gex in (GammaRegime.POSITIVE,GammaRegime.STRONG_POSITIVE)
-    if c<=-3: return "BEARISH","#ef4444","Multiple signals aligned bearish."
-    if c<=-2:
-        return (("BEARISH","#ef4444","Negative macro + negative gamma.") if neg
-                else ("LEANING BEARISH","#f97316","Modest bearish lean."))
-    if c<=0:
-        if neg: return "CAUTIOUS","#f59e0b","Neutral signals but negative gamma — tail risk elevated."
-        if pos: return "NEUTRAL / RANGE","#6366f1","Positive gamma → compression and pin."
-        return "NEUTRAL","#94a3b8","No strong conviction."
-    if c<=2: return "LEANING BULLISH","#10b981","Bullish lean. Credit and liquidity constructive."
-    return "BULLISH","#10b981","Broad bullish alignment."
+    neg = gex in (GammaRegime.NEGATIVE, GammaRegime.STRONG_NEGATIVE)
+    pos = gex in (GammaRegime.POSITIVE, GammaRegime.STRONG_POSITIVE)
+
+    if c <= -3.0:
+        return "BEARISH", "#ef4444", "Multiple signals aligned bearish."
+    if c <= -1.75:
+        return (("BEARISH", "#ef4444", "Negative macro + negative gamma.") if neg
+                else ("LEANING BEARISH", "#f97316", "Modest bearish lean."))
+    if c <= 0.75:
+        if neg: return "CAUTIOUS", "#f59e0b", "Neutral signals but negative gamma — tail risk elevated."
+        if pos: return "NEUTRAL / RANGE", "#6366f1", "Positive gamma → compression and pin."
+        return "NEUTRAL", "#94a3b8", "No strong conviction."
+    if c <= 2.5:
+        return "LEANING BULLISH", "#10b981", "Bullish lean. Credit and liquidity constructive."
+    return "BULLISH", "#10b981", "Broad bullish alignment."
 
 def _bands(spot: float, vix: float) -> Dict:
     dv=vix/100/np.sqrt(252); wv=vix/100/np.sqrt(52)
@@ -1756,7 +1789,7 @@ def render_thesis_page():
     else:
         narr=f"Neutral dealer positioning ({gex_score:+d}): Near gamma flip — binary risk, reduce size."
 
-    _g3_mult = 10.0 if gex_sym in ("SPY","SPX") else 40.0 if gex_sym in ("QQQ","NDX") else 1.0
+    _g3_mult = 10.0 if gex_sym in ("SPY",) else 40.0 if gex_sym in ("QQQ",) else 1.0
     _g3_label = "SPX" if gex_sym in ("SPY","SPX") else "NDX" if gex_sym in ("QQQ","NDX") else gex_sym
     gleft=("<div>"
            +f"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>GEX LEVELS ({gex_sym} → {_g3_label})</div>"
@@ -1973,26 +2006,17 @@ def render_thesis_page():
     st.markdown(_card(macro_body), unsafe_allow_html=True)
 
     # ── 10. THESIS VERDICT ────────────────────────────────────────────────
-    cc="#10b981" if comp>0 else "#ef4444" if comp<0 else "#94a3b8"
-    _vrp_v = vrp["val"] if np.isfinite(vrp.get("val", float("nan"))) else float("nan")
-    vs2    = f"{_vrp_v:+.4f}" if np.isfinite(_vrp_v) else "N/A"
-    # Match the actual scoring thresholds in _composite (±2 and ±4)
-    if not np.isfinite(_vrp_v):  _vrp_icon, _vrp_desc = "⚫", f"VRP N/A"
-    elif _vrp_v > 4:   _vrp_icon, _vrp_desc = "✅", f"VRP strongly positive ({vs2}) — +0.30 to score"
-    elif _vrp_v > 2:   _vrp_icon, _vrp_desc = "✅", f"VRP positive ({vs2}) — +0.15 to score"
-    elif _vrp_v < -4:  _vrp_icon, _vrp_desc = "🔴", f"VRP strongly negative ({vs2}) — −0.30 to score"
-    elif _vrp_v < -2:  _vrp_icon, _vrp_desc = "⚠️", f"VRP negative ({vs2}) — −0.15 to score"
-    else:              _vrp_icon, _vrp_desc = "⚫", f"VRP neutral ({vs2}) — no scoring impact (thresholds ±2/±4)"
-    sigs=(_sig(_vrp_icon, _vrp_desc)
+    cc="#10b981" if comp>0.75 else "#ef4444" if comp<-0.75 else "#94a3b8"
+    vp=np.isfinite(vrp["val"]) and vrp["val"]>0
+    vs2=f"{vrp['val']:+.4f}" if np.isfinite(vrp["val"]) else "N/A"
+    sigs=(_sig("✅" if vp else "⚠️",f"VRP {'positive' if vp else 'negative'} ({vs2})")
           +_sig("⚠️" if fear_z>0.5 else "✅",f"Fear composite {fl2} ({fear_z:+.2f}σ)")
           +_sig("🔴" if rec>60 else "🟡" if rec>35 else "🟢",
                 f"Recession risk {'elevated' if rec>60 else 'moderate' if rec>35 else 'low'} ({rec:.1f}%)"))
-    # _kls_mult converts ETF-strike → index level for display.
-    # Apply uniformly: if sym is SPY/SPX → *10, QQQ/NDX → *40, else *1.
-    _kls_mult   = 10.0 if gex_sym in ("SPY","SPX") else 40.0 if gex_sym in ("QQQ","NDX") else 1.0
-    _flip_disp  = flip  * _kls_mult
-    _upper_disp = upper * _kls_mult
-    _lower_disp = lower * _kls_mult
+    _kls_mult = 10.0 if gex_sym in ("SPY","SPX") else 40.0 if gex_sym in ("QQQ","NDX") else 1.0
+    _flip_disp  = flip  * _kls_mult if gex_sym in ("SPY","QQQ") else flip
+    _upper_disp = upper * _kls_mult if gex_sym in ("SPY","QQQ") else upper
+    _lower_disp = lower * _kls_mult if gex_sym in ("SPY","QQQ") else lower
     kls=(_kv("SPX Spot",f"{spx:,.2f}","#fff")
          +_kv(f"GEX Flip ({_flip_src_label})",f"{_flip_disp:,.2f}","#f59e0b")
          +_kv("GEX Upper",f"{_upper_disp:,.2f}","#10b981")
@@ -2014,7 +2038,7 @@ def render_thesis_page():
     vbd=(_sh(10,f"THESIS VERDICT: {vrd}")
          +f"<div style='display:flex;align-items:baseline;gap:16px;margin-bottom:8px;'>"
          +f"<div style='font-size:26px;font-weight:800;color:{vc};'>{vrd}</div>"
-         +f"<div style='font-size:13px;color:rgba(255,255,255,0.5);'>Composite Score: <span style='font-family:monospace;font-weight:700;color:{cc};'>{comp:+d}</span> / ±10</div>"
+         +f"<div style='font-size:13px;color:rgba(255,255,255,0.5);'>Composite Score: <span style='font-family:monospace;font-weight:700;color:{cc};'>{comp:+.1f}</span> / ±10</div>"
          +f"<div style='font-size:12px;color:rgba(255,255,255,0.35);'>Date: {dt.date.today().strftime('%A, %B %d, %Y')}</div></div>"
          +f"<div style='font-size:12px;color:rgba(255,255,255,0.55);margin-bottom:10px;font-style:italic;'>{ve}</div>"
          +"<div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px 24px;'>"

@@ -116,11 +116,11 @@ def compute_gex_from_chain(chain: pd.DataFrame, spot: float,
             lambda row: bs_vanna(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
         chain["charm"] = chain.apply(
             lambda row: bs_charm(spot, row["strike"], row["expiry_T"], row["iv"], r), axis=1)
-        chain["call_vex"] =  chain["call_oi"] * chain["vanna"] * multiplier * spot
-        chain["put_vex"]  = -chain["put_oi"]  * chain["vanna"] * multiplier * spot
+        chain["call_vex"] =  chain["call_oi"] * chain["vanna"] * multiplier * (spot ** 2)
+        chain["put_vex"]  = -chain["put_oi"]  * chain["vanna"] * multiplier * (spot ** 2)
         chain["net_vex"]  =  chain["call_vex"] + chain["put_vex"]
-        chain["call_cex"] =  chain["call_oi"] * chain["charm"] * multiplier
-        chain["put_cex"]  = -chain["put_oi"]  * chain["charm"] * multiplier
+        chain["call_cex"] =  chain["call_oi"] * chain["charm"] * multiplier * (spot ** 2)
+        chain["put_cex"]  = -chain["put_oi"]  * chain["charm"] * multiplier * (spot ** 2)
         chain["net_cex"]  =  chain["call_cex"] + chain["put_cex"]
         return chain
 
@@ -144,17 +144,15 @@ def compute_gex_from_chain(chain: pd.DataFrame, spot: float,
     chain["put_gex"]  = -chain["put_oi"]  * chain["gamma"] * multiplier * (spot ** 2)
     chain["net_gex"]  =  chain["call_gex"] + chain["put_gex"]
 
-    # VEX: Vanna * OI * 100 * S  (one S factor — vanna is dDelta/dSigma, dimensionless)
-    # GEX uses S² (dollar gamma per 1% move); VEX uses S (dollar vanna).
-    # Reference: Hull "Options, Futures, and Other Derivatives" eq for vanna exposure.
-    chain["call_vex"] =  chain["call_oi"] * chain["vanna"] * multiplier * spot
-    chain["put_vex"]  = -chain["put_oi"]  * chain["vanna"] * multiplier * spot
+    # VEX: positive vanna + rising IV → dealers buy (bullish pressure on IV spike)
+    #      positive vanna + falling IV → dealers sell (bearish on vol crush)
+    chain["call_vex"] =  chain["call_oi"] * chain["vanna"] * multiplier * (spot ** 2)
+    chain["put_vex"]  = -chain["put_oi"] * chain["vanna"] * multiplier * (spot ** 2)
     chain["net_vex"]  =  chain["call_vex"] + chain["put_vex"]
 
-    # CEX: Charm * OI * 100  (no S factor — charm is dDelta/dT, units = 1/time)
-    # Reference: Haug "The Complete Guide to Option Pricing Formulas" eq 2.20.
-    chain["call_cex"] =  chain["call_oi"] * chain["charm"] * multiplier
-    chain["put_cex"]  = -chain["put_oi"]  * chain["charm"] * multiplier
+    # CEX: positive charm → time decay forces dealers to buy (upward drift)
+    chain["call_cex"] =  chain["call_oi"] * chain["charm"] * multiplier * (spot ** 2)
+    chain["put_cex"]  = -chain["put_oi"] * chain["charm"] * multiplier * (spot ** 2)
     chain["net_cex"]  =  chain["call_cex"] + chain["put_cex"]
 
     return chain
@@ -319,135 +317,6 @@ def compute_cumulative_gex_profile(chain: pd.DataFrame, spot: float,
     agg["cum_gex"] = agg["net_gex"].cumsum()
     agg["regime"]  = np.where(agg["cum_gex"] >= 0, "positive", "negative")
     return agg
-
-
-
-def compute_max_pain(chain: pd.DataFrame) -> float:
-    """
-    Max Pain = strike K that minimises total dollar payout to option holders.
-
-    Pain(K) = Σ_i[ call_OI_i * max(0, K - K_i) ]   ← calls ITM when K > K_i
-            + Σ_i[ put_OI_i  * max(0, K_i - K) ]    ← puts ITM when K_i > K
-
-    Intuition: if spot expires at K, option writers (typically dealers) pay out
-    the least. Spot tends to drift toward this level into expiry due to dealer
-    hedging flows reducing as OTM options lose value.
-
-    Reference: Bollen & Whaley (2004), Avellaneda & Lipkin (2003).
-    """
-    if chain is None or chain.empty:
-        return float("nan")
-
-    # Aggregate OI by strike across all expirations
-    by_strike = (chain.groupby("strike")
-                      .agg(call_oi=("call_oi","sum"), put_oi=("put_oi","sum"))
-                      .reset_index()
-                      .sort_values("strike"))
-
-    strikes   = by_strike["strike"].values
-    call_ois  = by_strike["call_oi"].values
-    put_ois   = by_strike["put_oi"].values
-
-    min_pain  = float("inf")
-    max_pain_strike = float("nan")
-
-    for K in strikes:
-        # Call payout: all calls with strike < K are ITM at expiry K
-        call_pain = float(np.sum(call_ois * np.maximum(0.0, K - strikes)))
-        # Put payout: all puts with strike > K are ITM at expiry K
-        put_pain  = float(np.sum(put_ois  * np.maximum(0.0, strikes - K)))
-        total     = call_pain + put_pain
-        if total < min_pain:
-            min_pain = total
-            max_pain_strike = float(K)
-
-    return max_pain_strike
-
-
-def compute_volume_weighted_strike(chain: pd.DataFrame) -> dict:
-    """
-    Volume-weighted average strike (VWAS) — the options activity centre of mass.
-
-    K_vol = Σ(K_i * V_i) / Σ(V_i)
-
-    Computed separately for calls, puts, and combined.
-    Distinct from the gamma flip: VWAS shows WHERE trading is happening,
-    gamma flip shows WHERE dealer hedging regime changes.
-
-    Reference: standard VWAP calculation applied to strike space.
-    """
-    if chain is None or chain.empty or "call_volume" not in chain.columns:
-        return {"combined": float("nan"), "calls": float("nan"), "puts": float("nan")}
-
-    by_strike = (chain.groupby("strike")
-                      .agg(call_vol=("call_volume","sum"),
-                           put_vol=("put_volume","sum"))
-                      .reset_index())
-
-    K = by_strike["strike"].values
-    cv = by_strike["call_vol"].values.astype(float)
-    pv = by_strike["put_vol"].values.astype(float)
-
-    def _vwas(vols):
-        total = vols.sum()
-        return float((K * vols).sum() / total) if total > 0 else float("nan")
-
-    return {
-        "combined": _vwas(cv + pv),
-        "calls":    _vwas(cv),
-        "puts":     _vwas(pv),
-    }
-
-
-def compute_call_put_walls(chain: pd.DataFrame, spot: float,
-                            max_dte: int = 45) -> dict:
-    """
-    Call wall = strike with highest gamma-weighted call OI above spot.
-    Put wall  = strike with highest gamma-weighted put OI below spot.
-
-    Uses gamma-weighted OI (OI * gamma) rather than raw OI because a high-OI
-    strike at low gamma has minimal dealer hedging impact. The gamma-weighted
-    version matches the SpotGamma / GEXBot methodology.
-
-    Reference: SpotGamma SGVI methodology notes; Bollen & Whaley (2004).
-    """
-    if chain is None or chain.empty:
-        return {"call_wall": float("nan"), "put_wall": float("nan"),
-                "call_wall_gex": 0.0,     "put_wall_gex": 0.0}
-
-    near = chain[chain["expiry_T"] <= max_dte / 365.0].copy()
-    if near.empty:
-        near = chain.copy()
-
-    gex_chain = compute_gex_from_chain(near, spot)
-    agg = (gex_chain.groupby("strike")
-                    .agg(call_gex=("call_gex","sum"), put_gex=("put_gex","sum"))
-                    .reset_index())
-
-    # Call wall: highest positive (call) GEX above spot
-    above = agg[agg["strike"] > spot].copy()
-    if not above.empty:
-        idx = above["call_gex"].idxmax()
-        call_wall     = float(above.loc[idx, "strike"])
-        call_wall_gex = float(above.loc[idx, "call_gex"])
-    else:
-        call_wall, call_wall_gex = float("nan"), 0.0
-
-    # Put wall: most negative (put) GEX below spot
-    below = agg[agg["strike"] < spot].copy()
-    if not below.empty:
-        idx = below["put_gex"].idxmin()
-        put_wall     = float(below.loc[idx, "strike"])
-        put_wall_gex = float(below.loc[idx, "put_gex"])
-    else:
-        put_wall, put_wall_gex = float("nan"), 0.0
-
-    return {
-        "call_wall":     call_wall,
-        "put_wall":      put_wall,
-        "call_wall_gex": call_wall_gex,
-        "put_wall_gex":  put_wall_gex,
-    }
 
 def nearest_expiry_chain(chain: pd.DataFrame) -> pd.DataFrame:
     """Return only the nearest expiration — for 0DTE-style bar chart display."""

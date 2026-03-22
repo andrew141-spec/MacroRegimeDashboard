@@ -103,11 +103,14 @@ def _fetch_rvol_surface(symbol: str = "SPY") -> dict:
 def _make_heatmap(chain_df: pd.DataFrame, spot: float,
                   greek: str = "net_gex",
                   title: str = "GEX Heatmap",
-                  height: int = 580) -> go.Figure:
+                  height: int = 580,
+                  use_volume: bool = False) -> go.Figure:
     """
     Strike × Expiry heatmap.
     Uses NUMERIC y-axis (actual strike prices) so shapes/lines work correctly.
-    Spot is always centred by filtering ±pct% symmetrically.
+
+    use_volume: if True and net_vol_gex column exists, use volume-based GEX
+                instead of OI-based GEX (only applies when greek="net_gex").
     """
     from gex_engine import compute_gex_from_chain
 
@@ -118,7 +121,18 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
         return fig
 
     gex_chain = compute_gex_from_chain(chain_df, spot)
-    greek_col = {"net_gex":"net_gex","net_vex":"net_vex","net_cex":"net_cex"}.get(greek,"net_gex")
+
+    # Volume vs OI routing for GEX column
+    _vol_gex_available = (
+        "net_vol_gex" in gex_chain.columns and
+        (gex_chain["net_vol_gex"].abs() > 0).any()
+    )
+    if greek == "net_gex" and use_volume and _vol_gex_available:
+        greek_col  = "net_vol_gex"
+        _flow_note = " [VOLUME]"
+    else:
+        greek_col  = {"net_gex": "net_gex", "net_vex": "net_vex", "net_cex": "net_cex"}.get(greek, "net_gex")
+        _flow_note = " [OI]" if greek == "net_gex" else ""
 
     # ── Expiry labels ─────────────────────────────────────────────────────
     gex_chain["exp_label"] = (gex_chain["expiry_T"] * 365).round(0).astype(int).apply(
@@ -270,7 +284,7 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
 
     fig.update_layout(
         title=dict(
-            text=f"{title} — {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} — Current Price: ${spot:.2f}",
+            text=f"{title}{_flow_note} — {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} — Current Price: ${spot:.2f}",
             font=dict(size=11, color="rgba(255,255,255,0.65)"), x=0.5,
         ),
         paper_bgcolor="#0d0d0d", plot_bgcolor="#0d0d0d",
@@ -1158,9 +1172,7 @@ def render_gex_engine():
         if view_mode == "Heatmap":
             st.caption("Strike × Expiry matrix · Green = positive GEX (dealers stabilize) · Red = negative GEX (dealers amplify) · → = spot price · TOTAL = net across all expiries")
 
-            # Settings already initialised at top of render_gex_engine
-
-            sc1, sc2, sc3 = st.columns(3)
+            sc1, sc2, sc3, sc4 = st.columns(4)
             with sc1:
                 strikes_each_side = st.number_input(
                     "Strikes each side of spot",
@@ -1181,9 +1193,14 @@ def render_gex_engine():
                     step=50, format="%d",
                     key="gex_hm_height",
                 )
+            with sc4:
+                hm_use_volume = st.toggle(
+                    "Use Volume (flow)",
+                    value=False,
+                    key="gex_hm_use_volume",
+                    help="ON = volume-weighted intraday flow. OFF = OI-based structural positioning.",
+                )
 
-            # Compute symmetric bounds centred on spot
-            # Round to nearest $1 so they align with actual option strikes
             strike_lo = float(spot - int(strikes_each_side))
             strike_hi = float(spot + int(strikes_each_side))
 
@@ -1191,15 +1208,16 @@ def render_gex_engine():
             _make_heatmap._strike_hi = strike_hi
             _make_heatmap._max_dte   = int(max_dte)
 
-            # Show the computed range as info text
+            src_label = "VOLUME (intraday flow)" if hm_use_volume else "OI (structural)"
             st.caption(
                 f"Showing strikes ${strike_lo:.0f} – ${strike_hi:.0f} "
                 f"({int(strikes_each_side)} each side of spot ${spot:.2f}) · "
-                f"Max DTE: {int(max_dte)}d · Height: {int(hm_height)}px"
+                f"Max DTE: {int(max_dte)}d · Source: {src_label}"
             )
 
             fig_gex = _make_heatmap(chain_df, spot, "net_gex",
-                                    f"{symbol} GEX", int(hm_height))
+                                    f"{symbol} GEX", int(hm_height),
+                                    use_volume=hm_use_volume)
             st.plotly_chart(fig_gex, use_container_width=True, key="gex_chart_heatmap")
         else:
             # ── Use EXACT same chain slice as heatmap ─────────────────────

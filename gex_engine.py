@@ -271,7 +271,8 @@ def _net_gamma_at_spot(chain: pd.DataFrame, x: float,
 
 
 def find_gamma_flip(chain: pd.DataFrame, spot: float = None,
-                    scan_pct: float = 0.20, n_points: int = 400) -> float:
+                    scan_pct: float = 0.20, n_points: int = 400,
+                    r: float = 0.05) -> float:
     """
     True zero-gamma level: the spot price x where net dealer gamma = 0.
 

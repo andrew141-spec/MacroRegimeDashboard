@@ -2399,15 +2399,14 @@ def render_thesis_page():
                  "high for months (the old global mean would absorb the spike and understate fear). "
                  ">+1.0σ = ELEVATED. <−1.0σ = COMPLACENT. Mapped 0–100 via logistic.")
             +_gl("Composite Score",
-                 "7 independent signal groups: fear z-score (30%), orthogonal recession stress (15%, "
-                 "Sahm+HY+curve+ICSA only — VIX/EPU removed to avoid multicollinearity with fear), "
-                 "SPX 6M drawdown (15%), macro regime quadrant (15%), economic breadth from 7 metrics (10%), "
-                 "short-term momentum (10%: 5D SPX mean-reversion + HYG/LQD credit lead + GEX flip proximity), "
-                 "external prob buckets capped ±1 (5%). "
-                 "VRP sign corrected: high VRP = bullish carry (Bollerslev et al. 2009), not bearish. "
-                 "VTS backwardation = contrarian +0.2 (vol mean-reverts ~60% within 3 weeks). "
-                 "Stress flags (Sahm triggered + HY stress + systemic correlation): "
-                 "≥2 flags → hard cap at −2; 1 flag → cap at +3. Final ×2.2 scale → ±10.")),
+                 "Three-horizon engine system. "
+                 "Intraday: GEX momentum, multi-horizon SPY/credit (1d/3d/5d), vol-trend. "
+                 "Short-term 1-5d: VRP carry, fear composite, drawdown, tactical probs. "
+                 "Medium-term 2-4w: macro regime, economic breadth (7 metrics), medium probs. "
+                 "Regime-conditional blending: neg-gamma (trending) → 40/40/20, "
+                 "pos-gamma (mean-rev) → 20/40/40, neutral → 30/40/30. "
+                 "Smooth sigmoid recession filter. Backwardation contrarian preserved. "
+                 "NO EDGE fires when score + momentum both weak.")),
             unsafe_allow_html=True)
 
     st.markdown(

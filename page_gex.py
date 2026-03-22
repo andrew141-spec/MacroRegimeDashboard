@@ -1157,13 +1157,18 @@ def render_gex_engine():
     rvol      = _fetch_rvol_surface(symbol)
 
     # ── Header ────────────────────────────────────────────────────────────
+    _flip_vol = (("call_volume" in chain_df.columns and chain_df["call_volume"].fillna(0).sum() > 0) and
+                 ("put_volume"  in chain_df.columns and chain_df["put_volume"].fillna(0).sum()  > 0))
+    _flip_src = "vol-flow" if _flip_vol else "OI"
+
     m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Spot",          f"{spot:.2f}")
-    m2.metric("Gamma Flip",    f"{gs.gamma_flip:.2f}" if gs.gamma_flip else "N/A",
-                               f"{gs.distance_to_flip_pct:+.2f}%")
-    m3.metric("Net GEX",       f"${gs.total_gex/1e6:.1f}M")
-    m4.metric("Vanna Dir",     dg.vanna_direction.upper())
-    m5.metric("Charm Dir",     dg.charm_direction.upper())
+    m1.metric("Spot",       f"{spot:.2f}")
+    m2.metric(f"Gamma Flip ({_flip_src})",
+              f"{gs.gamma_flip:.2f}" if gs.gamma_flip else "N/A",
+              f"{gs.distance_to_flip_pct:+.2f}%")
+    m3.metric("Net GEX",   f"${gs.total_gex/1e6:.1f}M")
+    m4.metric("Vanna Dir",  dg.vanna_direction.upper())
+    m5.metric("Charm Dir",  dg.charm_direction.upper())
 
     st.markdown(f"**Regime:** {regime_chip(gs.regime)} &nbsp; **Source:** {source} &nbsp; **As of:** {gs.timestamp}",
                 unsafe_allow_html=True)
@@ -1366,9 +1371,9 @@ def render_gex_engine():
 
         st.markdown("""
 **GEX = Reaction to Price**
-- **Green (positive)**: Long gamma dealers buy dips, sell rips → mean reversion, range compression
-- **Red (negative)**: Short gamma dealers amplify → trend days, gap-and-go, cascades
-- **Flip zone**: Where regime transitions from stabilizing to destabilizing
+- **Green (positive)**: Long gamma — dealers buy dips, sell rips → mean reversion, range compression
+- **Red (negative)**: Short gamma — dealers amplify moves → trend days, gap-and-go, cascades
+- **Gamma Flip**: Price where net GEX crosses zero. Spot **above** flip = positive gamma (dealers stabilize). Spot **below** flip = negative gamma (dealers amplify). Not the other way around.
 """)
 
     with tab_vex:

@@ -16,7 +16,8 @@ from config import _get_secret
 from ui_components import pill, pbar, sec_hdr, plotly_dark, regime_chip, autorefresh_js, colored, gauge
 from data_loaders import get_gex_from_yfinance
 from gex_engine import (build_gamma_state, compute_gex_from_chain, find_gamma_flip,
-                        nearest_expiry_chain, classify_gex_regime, compute_dealer_greeks, DealerGreeks,
+                        nearest_expiry_chain, compute_cumulative_gex_profile,
+                        classify_gex_regime, compute_dealer_greeks, DealerGreeks,
                         compute_gwas, compute_gex_term_structure, compute_flow_imbalance)
 from schwab_api import (get_schwab_client, schwab_get_spot, schwab_get_options_chain,
                         SCHWAB_AVAILABLE)
@@ -297,6 +298,113 @@ def _make_heatmap(chain_df: pd.DataFrame, spot: float,
 
 
 
+
+
+def _cumulative_gex_chart(chain_df: pd.DataFrame, spot: float,
+                           flip: float, max_dte: int = 45,
+                           height: int = 320) -> go.Figure:
+    """
+    Cumulative GEX profile chart.
+    Shows how total dealer gamma exposure accumulates from lowest to highest strike.
+    Zero crossing = gamma flip. Slope = regime sensitivity at each level.
+    """
+    _C_POS  = "#10b981"
+    _C_NEG  = "#ef4444"
+    _C_FLIP = "#f59e0b"
+
+    if chain_df is None or len(chain_df) == 0:
+        fig = go.Figure()
+        plotly_dark(fig, "Cumulative GEX Profile (no data)", height)
+        return fig
+
+    try:
+        prof = compute_cumulative_gex_profile(chain_df, spot, max_dte)
+        if prof.empty:
+            raise ValueError("Empty profile")
+
+        # Auto-scale
+        max_abs = prof["cum_gex"].abs().max() / 1e6
+        if max_abs >= 5000:
+            scale, unit = 1e9, "$B"
+        else:
+            scale, unit = 1e6, "$M"
+
+        pos_mask = prof["cum_gex"] >= 0
+        neg_mask = ~pos_mask
+
+        fig = go.Figure()
+
+        # Filled area: positive (green)
+        if pos_mask.any():
+            fig.add_trace(go.Scatter(
+                x=prof.loc[pos_mask, "strike"],
+                y=prof.loc[pos_mask, "cum_gex"] / scale,
+                fill="tozeroy",
+                fillcolor="rgba(16,185,129,0.18)",
+                line=dict(color=_C_POS, width=1.5),
+                name="Positive (dealers pin)",
+                showlegend=True,
+            ))
+        # Filled area: negative (red)
+        if neg_mask.any():
+            fig.add_trace(go.Scatter(
+                x=prof.loc[neg_mask, "strike"],
+                y=prof.loc[neg_mask, "cum_gex"] / scale,
+                fill="tozeroy",
+                fillcolor="rgba(239,68,68,0.18)",
+                line=dict(color=_C_NEG, width=1.5),
+                name="Negative (dealers amplify)",
+                showlegend=True,
+            ))
+
+        # Zero line
+        fig.add_hline(y=0, line_color="rgba(255,255,255,0.30)", line_width=1)
+
+        # Spot line
+        fig.add_vline(x=spot, line_dash="dot",
+                      line_color="rgba(255,255,255,0.70)", line_width=1.5,
+                      annotation_text=f"SPOT ${spot:.0f}",
+                      annotation_font_size=10,
+                      annotation_position="top right")
+
+        # Flip line
+        x_range_lo = prof["strike"].min()
+        x_range_hi = prof["strike"].max()
+        if flip and x_range_lo < flip < x_range_hi:
+            fig.add_vline(x=flip, line_dash="dash",
+                          line_color=_C_FLIP, line_width=1.5,
+                          annotation_text=f"FLIP ${flip:.0f}",
+                          annotation_font_size=10,
+                          annotation_font_color=_C_FLIP,
+                          annotation_position="top left")
+
+        # Min/max annotations
+        min_idx = prof["cum_gex"].idxmin()
+        max_idx = prof["cum_gex"].idxmax()
+        for idx, label, col in [(min_idx, "MAX PAIN", _C_NEG),
+                                 (max_idx, "MAX PIN",  _C_POS)]:
+            fig.add_annotation(
+                x=float(prof.loc[idx, "strike"]),
+                y=float(prof.loc[idx, "cum_gex"] / scale),
+                text=f"{label}<br>${prof.loc[idx,'strike']:.0f}",
+                showarrow=True, arrowhead=2, arrowcolor=col,
+                font=dict(size=9, color=col),
+                bgcolor="rgba(0,0,0,0.6)", bordercolor=col,
+            )
+
+        fig.update_layout(
+            xaxis_title="Strike",
+            yaxis_title=f"Cumulative Net GEX ({unit})",
+            showlegend=True,
+            legend=dict(orientation="h", y=1.02, x=0, font=dict(size=10)),
+        )
+        plotly_dark(fig, f"Cumulative GEX Profile — ≤{max_dte}DTE", height)
+        return fig
+
+    except Exception as exc:
+        fig = go.Figure()
+        plotly_dark(fig, f"Cumulative GEX Profile (error: {exc})", height)
+        return fig
 
 def _greek_bar_chart(by_strike: dict, spot: float, title: str,
                      pos_color: str, neg_color: str,
@@ -940,6 +1048,20 @@ def render_gex_engine():
                                        _C_POS, _C_NEG, gs.gamma_flip,
                                        height=int(st.session_state["gex_hm_height"] // 2))
             st.plotly_chart(fig_gex, use_container_width=True, key="gex_chart_bar")
+
+            # ── Cumulative GEX profile ────────────────────────────────────
+            st.markdown(
+                "<div style='font-size:10px;color:rgba(255,255,255,0.4);margin:8px 0 2px;'>"
+                "CUMULATIVE GEX PROFILE — spatial context: where pinning is strongest "
+                "and where amplification begins · zero crossing = gamma flip</div>",
+                unsafe_allow_html=True
+            )
+            fig_cum = _cumulative_gex_chart(
+                chain_df, spot, gs.gamma_flip,
+                max_dte=int(st.session_state.get("gex_hm_dte", 45)),
+                height=int(st.session_state["gex_hm_height"] // 2),
+            )
+            st.plotly_chart(fig_cum, use_container_width=True, key="gex_chart_cumulative")
 
         c1, c2 = st.columns(2)
         with c1:

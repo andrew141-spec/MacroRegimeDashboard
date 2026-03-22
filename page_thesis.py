@@ -864,12 +864,12 @@ def _composite(prob: dict, vrp_val: float,
                spx_dd: float = 0.0,
                macro_reg: str = "Goldilocks",
                growth_score: int = 0,
-               spx_5d_ret: float = 0.0,
-               hyg_1d_ret: float = 0.0,
-               lqd_1d_ret: float = 0.0,
-               dist_to_flip_pct: float = 5.0,
-               hy_oas_pct: float = 3.0,
-               ) -> float:  # float — rounding deferred to display layer
+               # Fix 6: short-term momentum inputs
+               spx_5d_ret: float = 0.0,      # SPX 5-day return (fraction)
+               hyg_1d_ret: float = 0.0,       # HYG 1-day return (fraction)
+               lqd_1d_ret: float = 0.0,       # LQD 1-day return (fraction)
+               dist_to_flip_pct: float = 5.0, # distance to GEX flip (%)
+               ) -> int:
     """
     Composite directional score −10 to +10.
 
@@ -889,29 +889,9 @@ def _composite(prob: dict, vrp_val: float,
     # ── 1. Fear signal (−3.5 to +3.5) ────────────────────────────────────
     fear_sig = float(np.clip(-fear_z * 1.5, -3.5, 3.5))
 
-    # ── 2. Recession stress — slow filter, not daily directional driver ────
-    # Recession variables (Sahm, yield curve, ICSA) move over weeks-months,
-    # not days. Using rec_score as a direct additive signal creates false
-    # bearishness on noisy but non-recessionary days.
-    #
-    # New role: rec_score controls THREE structural adjustments only:
-    #   (a) Upside cap: high recession stress compresses bullish headroom
-    #   (b) Conviction multiplier: high stress widens uncertainty → shrink signal
-    #   (c) Small baseline drag: non-zero but much smaller than before
-    #
-    # rec_score 0-100. Below 30 = benign, 30-60 = building, above 60 = stressed.
-    rec_drag     = float(np.clip(-(rec_score - 30.0) / 120.0, -0.5, 0.1))  # tiny drag, max ±0.5
-    rec_upside_cap = (                 # tighten bullish ceiling as stress builds
-        4.5 if rec_score < 30 else     # benign: full upside
-        3.5 if rec_score < 50 else     # moderate: trim ceiling
-        2.5 if rec_score < 70 else     # stressed: significant cap
-        1.5                            # severe: near-neutral ceiling
-    )
-    rec_conviction = (                 # shrink all signals when uncertain
-        1.0 if rec_score < 40 else
-        0.9 if rec_score < 60 else
-        0.8                            # high stress → compress signal ±20%
-    )
+    # ── 2. Recession stress (−2.5 to +1.0) — orthogonal to fear ──────────
+    # rec_score now uses only Sahm+HY+curve+ICSA (no VIX/EPU overlap)
+    rec_sig = float(np.clip(-(rec_score - 40.0) / 20.0, -2.5, 1.0))
 
     # ── 3. Drawdown signal (−3.0 to +1.0) ────────────────────────────────
     dd_sig = float(np.clip(spx_dd / 0.07, -3.0, 1.0))
@@ -975,22 +955,13 @@ def _composite(prob: dict, vrp_val: float,
     ))
 
     # ── Weighted primary sum ──────────────────────────────────────────────
-    # rec_sig removed from additive weights — it now acts as structural filter.
-    # Freed 15% weight redistributed: fear +5%, dd +5%, momentum +5%.
-    # Rationale: fear_sig and momentum_sig are genuinely daily signals;
-    # recession stress is a slow structural context, not a daily direction vote.
-    s = (0.35 * fear_sig    +   # +5%: real-time, most responsive
-         0.20 * dd_sig      +   # +5%: price-level trend (weeks)
-         0.15 * regime_sig  +   # unchanged
-         0.10 * growth_sig  +   # unchanged
-         0.15 * momentum_sig +  # +5%: credit/GEX/mom (days)
-         0.05 * prob_sig)       # unchanged
-
-    # Apply recession conviction multiplier BEFORE overlays
-    s = s * rec_conviction
-
-    # Apply recession baseline drag (tiny — structural headwind, not reversal)
-    s += rec_drag
+    s = (0.30 * fear_sig    +
+         0.15 * rec_sig     +
+         0.15 * dd_sig      +
+         0.15 * regime_sig  +
+         0.10 * growth_sig  +
+         0.10 * momentum_sig +
+         0.05 * prob_sig)
 
     # ── Fix 2: VRP overlay — CORRECTED sign ──────────────────────────────
     # High VRP (IV >> RV) predicts POSITIVE returns next 1-4 weeks (Bollerslev
@@ -1009,10 +980,10 @@ def _composite(prob: dict, vrp_val: float,
     # directional penalty.
     stress_count = 0
     if leading is not None:
-        sahm_triggered = leading.get("sahm_triggered", False)
-        hy_stress      = (hy_oas_pct > 4.0) if np.isfinite(hy_oas_pct) else False
+        sahm_triggered = leading.get("sahm_triggered",  False)
+        hy_stress      = leading.get("hy_stress_gate",  False)
         corr_systemic  = leading.get("corr_regime", "NORMAL") == "SYSTEMIC"
-        stress_count   = sum([bool(sahm_triggered), bool(hy_stress), bool(corr_systemic)])
+        stress_count   = sum([sahm_triggered, hy_stress, corr_systemic])
         s -= stress_count * 0.3
 
     # Fix 3: VTS backwardation → contrarian positive overlay
@@ -1024,52 +995,213 @@ def _composite(prob: dict, vrp_val: float,
         if neg_gex:  s -= 0.4
         elif pos_gex: s += 0.3
 
-    # ── Recession upside cap (pre-scale) ─────────────────────────────────
-    # Prevents bullish verdict when recession stress is building, without
-    # making the model bearish just because stress exists.
-    s = min(s, rec_upside_cap / 2.2)   # divide by scale so post-scale = rec_upside_cap
-
     # ── Scale to ±10 range ────────────────────────────────────────────────
     s = s * 2.2
 
-    # ── Hard caps — stress flags cap post-scale values (already scaled above)
+    # ── Fix 5: Hard structural cap (implemented, not just documented) ─────
+    # When 2+ binary stress flags are active simultaneously (Sahm + HY stress
+    # + systemic correlation), the composite cannot read bullish regardless of
+    # what other signals say. Divide by 2.2 to pre-compensate for the scale.
+    _PRE_SCALE = 2.2
     if stress_count >= 2:
-        s = min(s, -2.0)   # ≥2 flags: ceiling at -2 post-scale
+        s = min(s, -2.0)    # hard cap at -2 post-scale
     elif stress_count == 1:
-        s = min(s,  3.0)   # 1 flag: ceiling at +3 post-scale
+        s = min(s, +3.0)    # one flag: cap bullish at +3 (not neutralised, just limited)
 
-    return float(np.clip(s, -10.0, 10.0))  # float — bin in _verdict, display to 1dp
+    return int(np.clip(round(s), -10, 10))
 
 def _verdict(c: float, gex: GammaRegime) -> Tuple[str,str,str]:
+    """Legacy single-label verdict — kept for backward compat. Use _verdict3 for full output."""
+    neg = gex in (GammaRegime.NEGATIVE, GammaRegime.STRONG_NEGATIVE)
+    pos = gex in (GammaRegime.POSITIVE, GammaRegime.STRONG_POSITIVE)
+    if c <= -3.0: return "BEARISH","#ef4444","Multiple signals aligned bearish."
+    if c <= -1.75:
+        return (("BEARISH","#ef4444","Negative macro + negative gamma.") if neg
+                else ("LEANING BEARISH","#f97316","Modest bearish lean."))
+    if c <= 0.75:
+        if neg: return "CAUTIOUS","#f59e0b","Neutral signals but negative gamma — tail risk elevated."
+        if pos: return "NEUTRAL / RANGE","#6366f1","Positive gamma → compression and pin."
+        return "NEUTRAL","#94a3b8","No strong conviction."
+    if c <= 2.5: return "LEANING BULLISH","#10b981","Bullish lean. Credit and liquidity constructive."
+    return "BULLISH","#10b981","Broad bullish alignment."
+
+
+def _verdict3(c: float, gex: GammaRegime, vrp_val: float,
+              vts_shape: str, fear_z: float, rec_score: float,
+              macro_reg: str, dist_flip_pct: float,
+              leading: dict = None) -> dict:
     """
-    Map continuous composite score to verdict label.
+    3-layer verdict: BIAS + STRUCTURE + STRATEGY + conflict detection.
 
-    Takes float score — rounding happens here, not in _composite.
-    Thresholds have 0.25-point hysteresis band around integer boundaries
-    to prevent label flipping from tiny numeric noise.
-
-    Bands (post-scale, ±10 range):
-      ≤ -3.0              → BEARISH
-      -3.0 to -1.75       → BEARISH (neg gamma) or LEANING BEARISH
-      -1.75 to +0.75      → CAUTIOUS / NEUTRAL / NEUTRAL RANGE
-      +0.75 to +2.5       → LEANING BULLISH
-      > +2.5              → BULLISH
+    Returns dict with:
+      bias        — directional bias label
+      bias_color  — hex color
+      bias_type   — kind of bearish/bullish (trend / mean-rev / event)
+      confidence  — LOW / MEDIUM / HIGH
+      structure   — market structure label (TREND/VOLATILE/PINNED/CHOP)
+      strategy    — actionable "how to trade this" sentence
+      conflicts   — list of (icon, description) signal disagreements
+      how_to      — list of (icon, instruction) tactical notes
     """
     neg = gex in (GammaRegime.NEGATIVE, GammaRegime.STRONG_NEGATIVE)
     pos = gex in (GammaRegime.POSITIVE, GammaRegime.STRONG_POSITIVE)
+    at_flip = abs(dist_flip_pct) < 0.5 if np.isfinite(dist_flip_pct) else False
+    vrp_high   = np.isfinite(vrp_val) and vrp_val > 2.0
+    vrp_low    = np.isfinite(vrp_val) and vrp_val < -2.0
+    backw      = vts_shape == "BACKWARDATION"
+    corr_stress = (leading or {}).get("corr_regime", "NORMAL") in ("STRESS","SYSTEMIC")
+    vts_regime  = (leading or {}).get("vix_ts_regime", "N/A")
 
-    if c <= -3.0:
-        return "BEARISH", "#ef4444", "Multiple signals aligned bearish."
-    if c <= -1.75:
-        return (("BEARISH", "#ef4444", "Negative macro + negative gamma.") if neg
-                else ("LEANING BEARISH", "#f97316", "Modest bearish lean."))
-    if c <= 0.75:
-        if neg: return "CAUTIOUS", "#f59e0b", "Neutral signals but negative gamma — tail risk elevated."
-        if pos: return "NEUTRAL / RANGE", "#6366f1", "Positive gamma → compression and pin."
-        return "NEUTRAL", "#94a3b8", "No strong conviction."
-    if c <= 2.5:
-        return "LEANING BULLISH", "#10b981", "Bullish lean. Credit and liquidity constructive."
-    return "BULLISH", "#10b981", "Broad bullish alignment."
+    # ── BIAS ─────────────────────────────────────────────────────────────────
+    if c <= -3.0:   bias, bias_color = "BEARISH",       "#ef4444"
+    elif c <= -1.75: bias, bias_color = "LEANING BEARISH","#f97316"
+    elif c <= 0.75:
+        if neg:     bias, bias_color = "CAUTIOUS",      "#f59e0b"
+        elif pos:   bias, bias_color = "NEUTRAL / RANGE","#6366f1"
+        else:       bias, bias_color = "NEUTRAL",       "#94a3b8"
+    elif c <= 2.5:  bias, bias_color = "LEANING BULLISH","#34d399"
+    else:           bias, bias_color = "BULLISH",        "#10b981"
+
+    # ── CONFIDENCE ────────────────────────────────────────────────────────────
+    # Low conviction = near flip, mixed signals, high fear, stressed correlations
+    n_weak = sum([at_flip, corr_stress, abs(c) < 1.5, fear_z > 1.5])
+    confidence = "LOW" if n_weak >= 2 else "HIGH" if (abs(c) > 3.0 and not at_flip) else "MEDIUM"
+
+    # ── BIAS TYPE (what KIND of directional bias) ─────────────────────────────
+    if "BEARISH" in bias or "CAUTIOUS" in bias:
+        if neg and fear_z > 0.5:
+            bias_type = "TREND BEARISH"
+            bias_type_note = "Dealers amplify moves + fear elevated → trending, not mean-reverting"
+        elif vrp_high and pos:
+            bias_type = "MEAN-REVERSION BEARISH"
+            bias_type_note = "High VRP + positive GEX → fade rallies, not chase breakdowns"
+        elif backw or rec_score > 60:
+            bias_type = "EVENT-DRIVEN BEARISH"
+            bias_type_note = "Vol backwardation or macro stress → risk of sharp gap, not grind"
+        else:
+            bias_type = "STRUCTURAL BEARISH"
+            bias_type_note = "Macro headwinds dominant — slow deterioration, not crash"
+    elif "BULLISH" in bias:
+        if pos and vrp_high:
+            bias_type = "MEAN-REVERSION BULLISH"
+            bias_type_note = "Positive GEX + high VRP → buy dips, fade overshoots"
+        elif neg:
+            bias_type = "MOMENTUM BULLISH"
+            bias_type_note = "Negative GEX means dealers amplify — trend follows through"
+        else:
+            bias_type = "STRUCTURAL BULLISH"
+            bias_type_note = "Macro + liquidity aligned — hold, not chase"
+    else:
+        bias_type = "NO DIRECTIONAL EDGE"
+        bias_type_note = "Conflicting inputs — position sizing should reflect uncertainty"
+
+    # ── MARKET STRUCTURE ──────────────────────────────────────────────────────
+    if at_flip:
+        structure = "⚡ NEAR FLIP"
+        structure_note = "At gamma flip — binary outcome, no mechanical edge"
+    elif neg and fear_z > 0.5:
+        structure = "📉 TREND / VOLATILE"
+        structure_note = "Negative gamma + fear → dealers amplify, trending behavior"
+    elif pos:
+        structure = "📌 PINNED / RANGE"
+        structure_note = "Positive gamma → dealers suppress moves, mean-reversion dominant"
+    elif backw:
+        structure = "⚠️ STRESS / EVENT"
+        structure_note = "Vol backwardation — near-term uncertainty elevated"
+    else:
+        structure = "〰️ CHOP"
+        structure_note = "No clear mechanical bias — random walk likely"
+
+    # ── STRATEGY (how to trade it) ────────────────────────────────────────────
+    if at_flip:
+        strategy = "🚫 NO TRADE — at gamma flip. Mechanical edge is zero. Wait for resolution."
+    elif bias_type == "TREND BEARISH":
+        strategy = "📉 SELL RALLIES — not breakdowns. Negative GEX amplifies, don't chase."
+    elif bias_type == "MEAN-REVERSION BEARISH":
+        strategy = "🔁 FADE RALLIES — sell into strength. High VRP + positive GEX pins range."
+    elif bias_type == "EVENT-DRIVEN BEARISH":
+        strategy = "🛡 BUY PROTECTION — vol cheap relative to stress. Put spreads over shorts."
+    elif bias_type == "STRUCTURAL BEARISH":
+        strategy = "⬇ REDUCE LONGS — slow grind. No urgency, reduce on bounces."
+    elif bias_type == "MEAN-REVERSION BULLISH":
+        strategy = "🔁 BUY DIPS — positive GEX supports. Fade overshoots, don't chase."
+    elif bias_type == "MOMENTUM BULLISH":
+        strategy = "📈 BUY BREAKOUTS — negative GEX amplifies. Trend follows through."
+    elif bias_type == "STRUCTURAL BULLISH":
+        strategy = "📈 HOLD / ADD — macro aligned. Wait for pullbacks, don't chase."
+    else:
+        strategy = "⚖️ STAY FLAT / REDUCE SIZE — no clear edge. Preserve capital."
+
+    # ── SIGNAL CONFLICTS ──────────────────────────────────────────────────────
+    conflicts = []
+    signals_direction = {}  # label → "bullish" / "bearish" / "neutral"
+
+    if vrp_high:   signals_direction["Vol (VRP)"] = "bullish"   # high VRP = sell vol = bullish
+    elif vrp_low:  signals_direction["Vol (VRP)"] = "bearish"
+
+    if neg:        signals_direction["Flow (GEX)"] = "bearish"
+    elif pos:      signals_direction["Flow (GEX)"] = "bullish"
+
+    if macro_reg in ("Goldilocks",):      signals_direction["Macro"] = "bullish"
+    elif macro_reg in ("Stagflation","Deflation","Disinflation"): signals_direction["Macro"] = "bearish"
+
+    if fear_z > 0.8:   signals_direction["Fear"] = "bearish"
+    elif fear_z < -0.5: signals_direction["Fear"] = "bullish"
+
+    if backw:      signals_direction["Vol TS"] = "bullish"  # backwardation = mean-rev buy
+    if corr_stress: signals_direction["Credit Corr"] = "bearish"
+
+    bull_sigs = [k for k,v in signals_direction.items() if v == "bullish"]
+    bear_sigs = [k for k,v in signals_direction.items() if v == "bearish"]
+
+    if bull_sigs and bear_sigs:
+        conflicts.append(("⚠️",
+            f"SIGNAL CONFLICT: {' + '.join(bull_sigs)} says bullish | "
+            f"{' + '.join(bear_sigs)} says bearish → expect chop / false moves"))
+
+    if vrp_high and neg:
+        conflicts.append(("⚠️","Vol says fade (VRP high) but GEX says trend (neg gamma) — size down"))
+    if pos and fear_z > 1.0:
+        conflicts.append(("⚠️","GEX says pin (pos gamma) but fear elevated — dealers may unwind, not stabilise"))
+    if macro_reg in ("Stagflation","Deflation") and vrp_high:
+        conflicts.append(("⚠️","Macro bearish but vol richly priced — selling premium here has macro risk"))
+
+    # ── HOW TO TRADE (tactical notes) ────────────────────────────────────────
+    how_to = []
+
+    if at_flip:
+        how_to.append(("🚫", "At gamma flip — no mechanical edge. Sit out or go to 25% size."))
+    elif neg:
+        how_to.append(("📉", "Negative gamma: dealers AMPLIFY moves. Follow trend, don't fade."))
+    elif pos:
+        how_to.append(("📌", "Positive gamma: dealers SUPPRESS moves. Fade extremes, trade the range."))
+
+    if vrp_high:
+        how_to.append(("💰", f"VRP rich (+{vrp_val:.2f}): sell vol / fade extremes. Vol sellers have edge."))
+    elif vrp_low:
+        how_to.append(("🛡", f"VRP cheap ({vrp_val:.2f}): buy protection cheap. Tail risk underpriced."))
+
+    if backw:
+        how_to.append(("⏳", "Vol backwardation: near-term fear. Mean-reversion likely within 1-3 weeks."))
+
+    if corr_stress:
+        how_to.append(("🔴", "Credit leading equity lower. Reduce size, monitor HYG/SPY divergence."))
+
+    if confidence == "LOW":
+        how_to.append(("⚖️", "Low confidence signal. Use 50% of normal position size."))
+
+    return {
+        "bias":         bias,
+        "bias_color":   bias_color,
+        "bias_type":    bias_type,
+        "bias_type_note": bias_type_note,
+        "confidence":   confidence,
+        "structure":    structure,
+        "structure_note": structure_note,
+        "strategy":     strategy,
+        "conflicts":    conflicts,
+        "how_to":       how_to,
+    }
 
 def _bands(spot: float, vix: float) -> Dict:
     dv=vix/100/np.sqrt(252); wv=vix/100/np.sqrt(52)
@@ -1714,9 +1846,15 @@ def render_thesis_page():
                     spx_5d_ret=_spx_5d_ret,
                     hyg_1d_ret=_hyg_1d_ret,
                     lqd_1d_ret=_lqd_1d_ret,
-                    dist_to_flip_pct=_dist_flip,
-                    hy_oas_pct=hyv)
+                    dist_to_flip_pct=_dist_flip)
     vrd,vc,ve=_verdict(comp,gex_st.regime)
+    v3 = _verdict3(
+        c=comp, gex=gex_st.regime,
+        vrp_val=vrp["val"], vts_shape=vts.get("shape","MIXED"),
+        fear_z=fear_z, rec_score=rec, macro_reg=macro_reg,
+        dist_flip_pct=float(gex_st.distance_to_flip_pct) if gex_st.distance_to_flip_pct else 5.0,
+        leading=leading,
+    )
     news=_news_cats(cat_intel)
     ua="NQ" if gex_sym in ("QQQ","NDX") else "ES"
     um=40.0 if ua=="NQ" else 10.0
@@ -2005,48 +2143,90 @@ def render_thesis_page():
     )
     st.markdown(_card(macro_body), unsafe_allow_html=True)
 
-    # ── 10. THESIS VERDICT ────────────────────────────────────────────────
-    cc="#10b981" if comp>0.75 else "#ef4444" if comp<-0.75 else "#94a3b8"
-    vp=np.isfinite(vrp["val"]) and vrp["val"]>0
-    vs2=f"{vrp['val']:+.4f}" if np.isfinite(vrp["val"]) else "N/A"
-    sigs=(_sig("✅" if vp else "⚠️",f"VRP {'positive' if vp else 'negative'} ({vs2})")
-          +_sig("⚠️" if fear_z>0.5 else "✅",f"Fear composite {fl2} ({fear_z:+.2f}σ)")
-          +_sig("🔴" if rec>60 else "🟡" if rec>35 else "🟢",
-                f"Recession risk {'elevated' if rec>60 else 'moderate' if rec>35 else 'low'} ({rec:.1f}%)"))
+    # ── 10. THESIS VERDICT — 3-layer output ─────────────────────────────────
+    cc = v3["bias_color"]
+    vc = v3["bias_color"]
+
+    # HERO ROW: BIAS · STRUCTURE · STRATEGY
+    conf_col = {"HIGH":"#10b981","MEDIUM":"#f59e0b","LOW":"#ef4444"}.get(v3["confidence"],"#94a3b8")
+    hero = (
+        f"<div style='display:flex;flex-wrap:wrap;align-items:flex-start;gap:20px;margin-bottom:14px;'>"
+        f"<div style='min-width:200px;'>"
+        f"<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;margin-bottom:4px;'>BIAS</div>"
+        f"<div style='font-size:40px;font-weight:900;color:{vc};line-height:1;'>{v3['bias']}</div>"
+        f"<div style='font-size:12px;color:rgba(255,255,255,0.55);margin-top:4px;font-style:italic;'>{v3['bias_type']}</div>"
+        f"<div style='font-size:11px;color:rgba(255,255,255,0.30);margin-top:2px;'>{v3['bias_type_note']}</div>"
+        f"</div>"
+        f"<div style='min-width:200px;border-left:1px solid rgba(255,255,255,0.08);padding-left:20px;'>"
+        f"<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;margin-bottom:6px;'>STRUCTURE</div>"
+        f"<div style='font-size:18px;font-weight:700;color:rgba(255,255,255,0.85);'>{v3['structure']}</div>"
+        f"<div style='font-size:11px;color:rgba(255,255,255,0.40);margin-top:2px;'>{v3['structure_note']}</div>"
+        f"<div style='margin-top:10px;font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;'>CONFIDENCE</div>"
+        f"<div style='font-size:16px;font-weight:700;color:{conf_col};margin-top:2px;'>{v3['confidence']}</div>"
+        f"<div style='font-size:10px;color:rgba(255,255,255,0.30);margin-top:2px;'>Score: {comp:+.1f} / ±10 · {dt.date.today().strftime('%b %d, %Y')}</div>"
+        f"</div>"
+        f"<div style='flex:1;min-width:220px;border-left:1px solid rgba(255,255,255,0.08);padding-left:20px;'>"
+        f"<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;margin-bottom:6px;'>STRATEGY</div>"
+        f"<div style='font-size:15px;font-weight:700;color:rgba(255,255,255,0.90);line-height:1.4;'>{v3['strategy']}</div>"
+        f"</div>"
+        f"</div>"
+    )
+
+    # SIGNAL CONFLICTS
+    conflict_html = ""
+    if v3["conflicts"]:
+        conflict_html = (
+            "<div style='background:rgba(245,158,11,0.07);border:1px solid rgba(245,158,11,0.25);"
+            "border-radius:8px;padding:10px 14px;margin-bottom:10px;'>"
+            "<div style='font-size:10px;font-weight:700;color:#f59e0b;letter-spacing:0.12em;margin-bottom:6px;'>⚠️ SIGNAL CONFLICTS</div>"
+        )
+        for icon, txt in v3["conflicts"]:
+            conflict_html += f"<div style='font-size:12px;color:rgba(255,255,255,0.70);margin-bottom:4px;'>{icon} {txt}</div>"
+        conflict_html += "</div>"
+
+    # HOW TO TRADE
+    how_html = ""
+    if v3["how_to"]:
+        how_html = (
+            "<div style='background:rgba(99,102,241,0.07);border:1px solid rgba(99,102,241,0.20);"
+            "border-radius:8px;padding:10px 14px;margin-bottom:10px;'>"
+            "<div style='font-size:10px;font-weight:700;color:#6366f1;letter-spacing:0.12em;margin-bottom:6px;'>HOW TO TRADE THIS</div>"
+        )
+        for icon, txt in v3["how_to"]:
+            how_html += f"<div style='font-size:12px;color:rgba(255,255,255,0.70);margin-bottom:4px;'>{icon} {txt}</div>"
+        how_html += "</div>"
+
+    # KEY LEVELS + RISK FLAGS (compact, secondary)
     _kls_mult = 10.0 if gex_sym in ("SPY","SPX") else 40.0 if gex_sym in ("QQQ","NDX") else 1.0
-    _flip_disp  = flip  * _kls_mult if gex_sym in ("SPY","QQQ") else flip
-    _upper_disp = upper * _kls_mult if gex_sym in ("SPY","QQQ") else upper
-    _lower_disp = lower * _kls_mult if gex_sym in ("SPY","QQQ") else lower
-    kls=(_kv("SPX Spot",f"{spx:,.2f}","#fff")
-         +_kv(f"GEX Flip ({_flip_src_label})",f"{_flip_disp:,.2f}","#f59e0b")
-         +_kv("GEX Upper",f"{_upper_disp:,.2f}","#10b981")
-         +_kv("GEX Lower",f"{_lower_disp:,.2f}","#ef4444")
-         +_kv("1σ Daily",f"{b['d1lo']:,.2f} — {b['d1hi']:,.2f}")
-         +_kv("2σ Daily",f"{b['d2lo']:,.2f} — {b['d2hi']:,.2f}")
-         +_kv("1σ Weekly",f"{b['w1lo']:,.2f} — {b['w1hi']:,.2f}")
-         +_kv("2σ Weekly",f"{b['w2lo']:,.2f} — {b['w2hi']:,.2f}"))
-    risks=[]
-    if fear_z>1.0: risks.append(("⚠️","Elevated fear composite — potential for sharp moves"))
-    if rec>50: risks.append(("⚠️",f"Recession probability at {rec:.1f}% — monitor labor data"))
-    if np.isfinite(stlc) and stlc>0.2: risks.append(("⚠️","Positive stock-bond correlation — diversification impaired"))
-    if "SELL" in gex_op_label or "NEGATIVE" in gex_reg.upper(): risks.append(("🔴","Negative gamma regime — dealer hedging amplifies moves. No fading."))
-    if dur=="FRAGILE": risks.append(("⚠️",f"GEX regime fragile — {frag:.0f}% of gamma ≤7 DTE. Levels expire by Friday."))
-    if leading.get("corr_regime") in ("STRESS","SYSTEMIC"): risks.append(("🔴",f"Cross-asset correlation: {leading.get('corr_regime')} — credit leading equity lower"))
-    if vts["shape"]=="BACKWARDATION": risks.append(("⚠️","VIX backwardation — near-term stress priced above medium-term"))
-    if not risks: risks.append(("✅","No major risk flags. Conditions broadly constructive."))
-    rr="".join(_sig(e,t) for e,t in risks)
-    vbd=(_sh(10,f"THESIS VERDICT: {vrd}")
-         +f"<div style='display:flex;align-items:baseline;gap:16px;margin-bottom:8px;'>"
-         +f"<div style='font-size:26px;font-weight:800;color:{vc};'>{vrd}</div>"
-         +f"<div style='font-size:13px;color:rgba(255,255,255,0.5);'>Composite Score: <span style='font-family:monospace;font-weight:700;color:{cc};'>{comp:+.1f}</span> / ±10</div>"
-         +f"<div style='font-size:12px;color:rgba(255,255,255,0.35);'>Date: {dt.date.today().strftime('%A, %B %d, %Y')}</div></div>"
-         +f"<div style='font-size:12px;color:rgba(255,255,255,0.55);margin-bottom:10px;font-style:italic;'>{ve}</div>"
-         +"<div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px 24px;'>"
-         +"<div><div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>SIGNAL BREAKDOWN</div>"+sigs+"</div>"
-         +"<div><div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>KEY LEVELS</div>"+kls+"</div>"
-         +"<div><div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>RISK FACTORS</div>"+rr+"</div>"
-         +"</div>")
-    st.markdown(_card(vbd,bg=f"{vc}08",border=f"{vc}30"),unsafe_allow_html=True)
+    _flip_disp  = flip  * _kls_mult
+    _upper_disp = upper * _kls_mult
+    _lower_disp = lower * _kls_mult
+    kls = (_kv("Spot",   f"{spx:,.2f}",  "#fff")
+         + _kv("Flip",   f"{_flip_disp:,.2f}",  "#f59e0b")
+         + _kv("Resist", f"{_upper_disp:,.2f}", "#10b981")
+         + _kv("Support",f"{_lower_disp:,.2f}", "#ef4444")
+         + _kv("1σ Day",  f"{b['d1lo']:,.0f}–{b['d1hi']:,.0f}")
+         + _kv("1σ Week", f"{b['w1lo']:,.0f}–{b['w1hi']:,.0f}"))
+
+    risks = []
+    if fear_z > 1.0:  risks.append(("⚠️", f"Fear elevated ({fear_z:+.2f}σ)"))
+    if rec > 50:      risks.append(("⚠️", f"Rec stress {rec:.0f}%"))
+    if np.isfinite(stlc) and stlc > 0.2: risks.append(("⚠️", "Bond hedge impaired"))
+    if "NEGATIVE" in gex_reg.upper():    risks.append(("🔴", "Neg gamma — amplifies"))
+    if dur == "FRAGILE": risks.append(("⚠️", f"GEX fragile ({frag:.0f}% ≤7d)"))
+    if vts["shape"] == "BACKWARDATION":  risks.append(("⚠️", "Vol backwardation"))
+    if not risks: risks.append(("✅", "No major flags"))
+    rr = "".join(_sig(e, t) for e, t in risks)
+
+    support_grid = (
+        "<div style='display:grid;grid-template-columns:1fr 1fr;gap:6px 24px;margin-top:10px;'>"
+        + "<div><div style='font-size:10px;color:rgba(255,255,255,0.35);margin-bottom:4px;letter-spacing:0.1em;'>KEY LEVELS</div>" + kls + "</div>"
+        + "<div><div style='font-size:10px;color:rgba(255,255,255,0.35);margin-bottom:4px;letter-spacing:0.1em;'>RISK FLAGS</div>" + rr + "</div>"
+        + "</div>"
+    )
+
+    vbd = _sh(10, "THESIS VERDICT") + hero + conflict_html + how_html + support_grid
+    st.markdown(_card(vbd, bg=f"{vc}08", border=f"{vc}30"), unsafe_allow_html=True)
 
     # ── 11-13. GLOSSARIES ─────────────────────────────────────────────────
     g11,g12,g13=st.tabs(["📖 Glossary: Vol","📖 Glossary: Macro","📖 Glossary: Charts"])

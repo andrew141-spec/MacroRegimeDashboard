@@ -18,7 +18,8 @@ from config import GammaState, GammaRegime, FeedItem, SetupScore, REGIME_COLORS,
 from utils import _to_1d, zscore, resample_ffill, yf_close, kelly, current_pct_rank
 from config import _get_secret
 from ui_components import pill, pbar, sec_hdr, plotly_dark, regime_chip, autorefresh_js, colored, gauge
-from gex_engine import build_gamma_state, compute_gex_from_chain
+from gex_engine import (build_gamma_state, compute_gex_from_chain,
+                        gex_zero_crossing, compute_dealer_greeks)
 from schwab_api import get_schwab_client, schwab_get_spot, schwab_get_options_chain, schwab_run_auth_flow, schwab_complete_auth, _get_supabase, SCHWAB_AVAILABLE, SUPABASE_AVAILABLE, get_intraday_signals
 from data_loaders import load_macro, get_gex_from_yfinance, get_fwd_pe
 from intel_monitor import load_feeds, geo_shock_score, score_relevance, categorise_items, category_shock_score, _all_feeds_flat, INTEL_CATEGORIES
@@ -169,10 +170,34 @@ def render_dashboard():
     stealth_score = 35*(1 if tga_4w<-50 else 0)+35*(1 if np.isfinite(rrp_level) and rrp_level<100 else 0)+30*(1 if bs_4w>0 else 0)
     stealth_label = "Active" if stealth_score>=60 else ("Mild" if stealth_score>=30 else "Off")
 
-    # ── GEX ──
-    chain_df, spot, gex_source = get_gex_from_yfinance(gex_symbol)
-    if chain_df is not None:
+    # ── GEX — Schwab primary (live IV + volume), yfinance fallback ───────
+    _dash_client = get_schwab_client()
+    chain_df, spot, gex_source = None, None, "unknown"
+    if _dash_client:
+        chain_df = schwab_get_options_chain(_dash_client, gex_symbol, spot=None)
+        gex_source = "Schwab API (live)"
+        if chain_df is not None and len(chain_df) > 0:
+            _live_spot = schwab_get_spot(_dash_client, gex_symbol)
+            if _live_spot and _live_spot > 0:
+                spot = _live_spot
+            else:
+                spot = float(chain_df["strike"].median())
+        else:
+            chain_df = None
+    if chain_df is None or len(chain_df) == 0:
+        chain_df, spot, gex_source = get_gex_from_yfinance(gex_symbol)
+
+    if chain_df is not None and spot:
         gex_state = build_gamma_state(chain_df, spot, gex_source, max_dte=45)
+        # Volume-based flip — sits at the visual red/green boundary
+        _vol_flip = gex_zero_crossing(chain_df, spot, max_dte=45)
+        if _vol_flip is not None and np.isfinite(_vol_flip):
+            gex_state.gamma_flip = _vol_flip
+        # Detect if volume data available for source label
+        _has_vol = (chain_df is not None and
+                    "call_volume" in chain_df.columns and
+                    chain_df["call_volume"].fillna(0).sum() > 0)
+        _flip_src = "vol-flow" if _has_vol else "OI"
         st.session_state["_last_good_gex"] = {
             "state": gex_state,
             "spot":  spot,
@@ -180,6 +205,7 @@ def render_dashboard():
         }
         gex_stale = False
     else:
+        _flip_src = "OI"
         cached = st.session_state.get("_last_good_gex")
         if cached:
             gex_state = cached["state"]
@@ -187,6 +213,7 @@ def render_dashboard():
             gex_stale = cached["saved_at"]
         else:
             gex_state = GammaState(data_source="unavailable", timestamp=dt.datetime.now().strftime("%H:%M:%S"))
+            spot = float(st.session_state.get("_last_known_spot", 500.0))
             gex_stale = False
 
     # ── GEX debug (remove once working) ──────────────────────────────────
@@ -614,11 +641,12 @@ def render_dashboard():
             flip_disp = f"{gex_state.gamma_flip:.2f}" if gex_state.gamma_flip else "N/A"
             dist_c = "var(--green)" if gex_state.distance_to_flip_pct > 1 else ("var(--red)" if gex_state.distance_to_flip_pct < -1 else "var(--yellow)")
             st.markdown(f"""<div class='panel'>
-              <div class='panel-title'>Gamma Flip Level</div>
+              <div class='panel-title'>Gamma Flip ({_flip_src})</div>
               <div style='font-size:24px;font-weight:700;font-family:var(--mono);color:var(--yellow);'>{flip_disp}</div>
               <div class='small'>Distance: <span style='color:{dist_c};font-weight:700;'>{gex_state.distance_to_flip_pct:+.2f}%</span></div>
               <div style='margin-top:6px;'>{pbar(50+gex_state.distance_to_flip_pct*5, "var(--yellow)")}</div>
               <div class='small' style='margin-top:4px;'>Stability: {gex_state.regime_stability:.2f} · Source: {gex_state.data_source}</div>
+              <div class='small' style='color:var(--dim);'>Net GEX=0 crossing · {"volume-weighted" if _flip_src=="vol-flow" else "OI-based"}</div>
             </div>""", unsafe_allow_html=True)
         with gx2:
             res_str = " · ".join([f"{r:.0f}" for r in gex_state.key_resistance[:3]]) or "N/A"
@@ -643,22 +671,54 @@ def render_dashboard():
               </div>
             </div>""", unsafe_allow_html=True)
 
-        # GEX by strike chart
-        if gex_state.gex_by_strike:
-            strikes = sorted(gex_state.gex_by_strike.keys())
-            near = [s for s in strikes if spot * 0.93 < s < spot * 1.07]
-            if near:
-                vals = [gex_state.gex_by_strike[s] for s in near]
-                colors_gex = ["#10b981" if v > 0 else "#ef4444" for v in vals]
-                fig_gex = go.Figure(go.Bar(x=near, y=vals, marker_color=colors_gex, opacity=0.80,
-                                           name="Net GEX"))
-                if gex_state.gamma_flip:
-                    fig_gex.add_vline(x=gex_state.gamma_flip, line_dash="dash",
-                                      line_color="#f59e0b", annotation_text="FLIP", annotation_font_size=10)
-                fig_gex.add_vline(x=spot, line_dash="dot", line_color="rgba(255,255,255,0.5)",
-                                  annotation_text="SPOT", annotation_font_size=10)
-                fig_gex = plotly_dark(fig_gex, "GEX by Strike (near-the-money)", 240)
-                st.plotly_chart(fig_gex, use_container_width=True)
+        # GEX by strike chart — volume-based when available
+        if gex_state.gex_by_strike and chain_df is not None:
+            from gex_engine import compute_gex_from_chain
+            strikes_all = sorted(gex_state.gex_by_strike.keys())
+            near_s = [s for s in strikes_all if spot * 0.93 < s < spot * 1.07]
+            if near_s:
+                # Use volume GEX if available, OI otherwise
+                _gc = compute_gex_from_chain(
+                    chain_df[chain_df["expiry_T"] <= 45/365.0].copy()
+                    if not chain_df.empty else chain_df, spot)
+                _vol_avail = ("net_vol_gex" in _gc.columns and
+                              _gc["net_vol_gex"].abs().sum() > 0)
+                _gex_col = "net_vol_gex" if _vol_avail else "net_gex"
+                _agg = (_gc.groupby("strike")[_gex_col].sum().reset_index())
+                _agg = _agg[_agg["strike"].between(spot*0.93, spot*1.07)]
+                _bar_src = "Volume flow" if _vol_avail else "OI"
+
+                if not _agg.empty:
+                    vals = (_agg[_gex_col] / 1e6).tolist()
+                    xs   = _agg["strike"].tolist()
+                    colors_gex = ["#10b981" if v > 0 else "#ef4444" for v in vals]
+                    fig_gex = go.Figure(go.Bar(
+                        x=xs, y=vals,
+                        marker_color=colors_gex, opacity=0.85,
+                        marker_line_width=0, name=f"Net GEX ({_bar_src})"))
+                    fig_gex.add_hline(y=0, line_color="rgba(255,255,255,0.25)", line_width=1)
+                    # Flip line — exact price from gex_zero_crossing
+                    _flip_val = gex_state.gamma_flip
+                    if _flip_val and np.isfinite(_flip_val) and near_s[0] <= _flip_val <= near_s[-1]:
+                        fig_gex.add_vline(x=_flip_val, line_dash="dash",
+                                          line_color="#f59e0b", line_width=2,
+                                          annotation_text=f"⚡ FLIP ${_flip_val:.2f} ({_flip_src})",
+                                          annotation_font_size=10,
+                                          annotation_font_color="#f59e0b",
+                                          annotation_position="top left")
+                    fig_gex.add_vline(x=spot, line_dash="dot",
+                                      line_color="rgba(255,255,255,0.6)",
+                                      annotation_text=f"SPOT ${spot:.2f}",
+                                      annotation_font_size=10,
+                                      annotation_position="top right")
+                    fig_gex = plotly_dark(
+                        fig_gex,
+                        f"Net GEX by Strike ({_bar_src}) — ±7% of spot", 260)
+                    fig_gex.update_layout(
+                        xaxis_title="Strike",
+                        yaxis_title="Net GEX ($M)",
+                        bargap=0.08)
+                    st.plotly_chart(fig_gex, use_container_width=True)
 
         st.markdown("<hr/>", unsafe_allow_html=True)
 
@@ -681,7 +741,7 @@ def render_dashboard():
             for item in [
                 f"Fear {'high' if fear_score>=70 else 'elevated' if fear_score>=55 else 'contained'} ({fear_score:.0f}/100)",
                 f"Three Puts {'strong' if three_puts>=65 else 'mixed' if three_puts>=45 else 'weak'} ({three_puts:.0f}/100)",
-                f"GEX Regime: {gex_state.regime.value} · dist to flip: {gex_state.distance_to_flip_pct:+.2f}%",
+                f"GEX Regime: {gex_state.regime.value} · flip: {gex_state.gamma_flip:.2f} ({_flip_src}) · dist: {gex_state.distance_to_flip_pct:+.2f}%",
                 f"Bubble: {bubble_label} · Mag7 PE: {'N/A' if not np.isfinite(mag7_pe) else f'{mag7_pe:.1f}x'}",
                 f"Stealth QE: {stealth_label} · TGA 4W: {tga_4w:+.0f}B",
                 f"Liq Anxiety: {'high' if liq_anxiety>=70 else 'elevated' if liq_anxiety>=55 else 'contained'} ({liq_anxiety:.0f})",

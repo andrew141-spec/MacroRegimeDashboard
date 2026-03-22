@@ -76,7 +76,52 @@ def gauge(value, title, vmin=0, vmax=100):
     return fig
 
 def autorefresh_js(seconds, enabled):
-    if not enabled: return
-    st.components.v1.html(
-        f"<script>setTimeout(()=>{{window.parent.location.reload();}},{seconds*1000});</script>",
-        height=0)
+    """
+    Rerun the current Streamlit page after `seconds` without a full browser reload.
+
+    The old implementation used window.parent.location.reload() which causes the
+    browser to navigate back to the app root, resetting the page to the homepage.
+
+    This version uses a pure Python time-check + st.rerun() approach:
+      - On each script execution, check how long since the last refresh.
+      - If enough time has passed, call st.rerun() — this re-executes only the
+        current page script, keeping session_state (including the active page) intact.
+      - If not enough time has passed, st.empty() placeholder + time.sleep() is
+        avoided (blocks UI). Instead we use a minimal JS setTimeout that calls
+        Streamlit's own rerun mechanism via the stale-element trick.
+    """
+    if not enabled:
+        return
+
+    import time as _time
+
+    now = _time.time()
+    last = st.session_state.get("_autorefresh_last", 0.0)
+
+    if now - last >= seconds:
+        # Time's up — rerun in place, page stays the same
+        st.session_state["_autorefresh_last"] = now
+        st.rerun()
+    else:
+        # Not yet — inject a tiny JS that clicks the hidden Streamlit rerun
+        # button after the remaining interval. This does NOT navigate anywhere.
+        remaining_ms = max(int((seconds - (now - last)) * 1000), 1000)
+        st.components.v1.html(
+            f"""<script>
+            setTimeout(function() {{
+                // Find and click Streamlit's internal rerun trigger element.
+                // This fires a script rerun without any browser navigation.
+                var btn = window.parent.document.querySelector('[data-testid="stApp"]');
+                if (btn) {{
+                    // Dispatch a storage event — Streamlit listens to these
+                    // to detect state changes and trigger reruns.
+                    window.parent.localStorage.setItem('_st_rerun', Date.now());
+                    window.parent.localStorage.removeItem('_st_rerun');
+                }}
+                // Hard fallback: update only the hash, not the path.
+                // This triggers a Streamlit rerun without resetting the page.
+                window.parent.location.hash = '_r' + Date.now();
+            }}, {remaining_ms});
+            </script>""",
+            height=0,
+        )

@@ -53,8 +53,6 @@ def _sl(s, d=float("nan")):
 
 @st.cache_data(ttl=60)
 def _quotes() -> Dict:
-    # OPT: single yf.download() call instead of 16 sequential Ticker().history()
-    # cuts network round-trips from 16 → 1, saving ~3-5s per refresh.
     pairs = [("SPX","^GSPC"),("NDX","^NDX"),("VIX","^VIX"),("VIX3M","^VIX3M"),
              ("VVIX","^VVIX"),("VXN","^VXN"),("DXY","DX-Y.NYB"),("GLD","GLD"),("TLT","TLT"),
              ("TNX","^TNX"),("IRX","^IRX"),("SPY","SPY"),("QQQ","QQQ"),
@@ -65,11 +63,9 @@ def _quotes() -> Dict:
     try:
         df = yf.download(syms, period="5d", auto_adjust=True,
                          progress=False, threads=True)["Close"]
-        # yf.download returns MultiIndex columns when >1 symbol
         if hasattr(df.columns, "levels"):
-            pass  # already MultiIndex — each column is a symbol
+            pass
         else:
-            # single symbol edge case — wrap
             df = df.to_frame(name=syms[0])
         for k, sym in pairs:
             try:
@@ -81,7 +77,6 @@ def _quotes() -> Dict:
             except Exception:
                 pass
     except Exception:
-        # Fallback: sequential fetch if batch download fails
         for k, sym in pairs:
             try:
                 h = yf.Ticker(sym).history(period="5d")
@@ -93,41 +88,56 @@ def _quotes() -> Dict:
                 pass
     return out
 
+
+# ── VRP — reference-doc aligned ───────────────────────────────────────────────
 def _vrp_full(vix: float, spy: pd.Series, idx, vix_series: pd.Series = None) -> Dict:
     """
-    VRP calculation — two distinct quantities:
+    Reference-doc aligned VRP:
+    VRP = VIX - 21d realized volatility
+    Returns value, z-score (1-year rolling), percentile, regime, 21d RV, and spread.
 
-    val    = VRP from the HISTORICAL vix_s series minus rolling RV21.
-             Used for z-score and percentile rank because z-scoring requires
-             a time series, not a single live quote. This is what tells you
-             whether today's VRP is high or low relative to history.
-
-    spread = vix_live - rv21v: the LIVE VRP spread using today's VIX quote.
-             This is the raw carry number a vol seller actually captures today.
-             Displayed separately because it can differ significantly from val
-             when VIX has moved sharply intraday vs the prior close.
+    Regime labels:
+      RICH  >= 4  → options clearly expensive vs realized; sell-vol bias
+      FAIR   0–4  → fair carry
+      CHEAP <= 0  → implied not even above realized; consider protection
     """
-    sa    = _to_1d(spy).reindex(idx).ffill()
-    rets  = sa.pct_change()
-    rv21  = rets.rolling(21, min_periods=10).std() * np.sqrt(252) * 100
-    rv21v = _sl(rv21)  # last realized vol value
+    sa   = _to_1d(spy).reindex(idx).ffill()
+    rets = sa.pct_change()
 
-    # Historical VRP series: use vix_series if provided, else fall back to scalar broadcast
-    if vix_series is not None:
-        va   = _to_1d(vix_series).reindex(idx).ffill()
-        vrp_series = va - rv21
+    rv21 = rets.rolling(21, min_periods=10).std() * np.sqrt(252) * 100
+    vrp_series = vix - rv21
+
+    val   = _sl(vrp_series)
+    rv21v = _sl(rv21)
+
+    # 1-year rolling z-score
+    mu_s = vrp_series.rolling(252, min_periods=63).mean()
+    sd_s = vrp_series.rolling(252, min_periods=63).std().replace(0, np.nan)
+    z_series = (vrp_series - mu_s) / sd_s
+    z = _sl(z_series)
+
+    pct = float(current_pct_rank(vrp_series, 252))
+
+    if np.isfinite(val):
+        if val >= 4:
+            reg = "RICH"
+        elif val <= 0:
+            reg = "CHEAP"
+        else:
+            reg = "FAIR"
     else:
-        vrp_series = vix - rv21   # scalar broadcast — less ideal for z-scoring
+        reg = "N/A"
 
-    val = _sl(vrp_series)
-    z   = _sl(zscore(vrp_series))
-    pct = current_pct_rank(vrp_series, 252)
+    return {
+        "val":    val,
+        "z":      z,
+        "pct":    pct,
+        "regime": reg,
+        "rv21":   rv21v,
+        "spread": val,   # live spread = val when using scalar vix
+        "vix":    vix,
+    }
 
-    # Live spread: today's VIX minus last realized vol
-    spread = (vix - rv21v) if np.isfinite(rv21v) else val
-
-    reg = ("RICH" if val > 2 else "CHEAP" if val < -1 else "FAIR") if np.isfinite(val) else "N/A"
-    return {"val": val, "z": z, "pct": float(pct), "regime": reg, "rv21": rv21v, "spread": spread}
 
 def _vts(q: Dict) -> Dict:
     v=q.get("VIX_last",float("nan")); v3=q.get("VIX3M_last",float("nan"))
@@ -190,16 +200,12 @@ def _forward_prob_fig(
     vvix: float = float("nan"),
     vts_shape: str = "MIXED",
 ) -> go.Figure:
-    # spy/qqq/idx replaced with pre-computed rv_spx/rv_ndx floats so this
-    # function only receives hashable args and @st.cache_data works correctly.
     from plotly.subplots import make_subplots
     from scipy.stats import norm as _norm
 
     rng = np.random.default_rng()
 
     def _sim_paths(spot, ann_vol, vvix_val, vts_s, days, n):
-        # OPT: generate ALL random numbers in two bulk calls (n*days each)
-        # instead of 3 calls inside a Python loop — ~40% faster for n=6000.
         sig = ann_vol / 100.0
         dt  = 1 / 252
         params = _merton_calibrate(ann_vol, vvix_val, vts_s, vrp_val=0)
@@ -209,34 +215,27 @@ def _forward_prob_fig(
         jump_comp = params["jump_comp"]
         drift = -0.5 * sig**2 - jump_comp
 
-        # Pre-generate all noise: shape (days, n)
         Z_all  = rng.standard_normal((days, n))
         NJ_all = rng.poisson(lam * dt, (days, n))
-        # Jump sizes: only draw where jumps occur, rest are zero
         J_raw  = rng.normal(mj, sj, (days, n))
-        J_all  = J_raw * NJ_all   # zero-out non-jump steps
+        J_all  = J_raw * NJ_all
 
-        step = np.exp(drift * dt + sig * np.sqrt(dt) * Z_all + J_all)  # (days, n)
+        step = np.exp(drift * dt + sig * np.sqrt(dt) * Z_all + J_all)
 
-        # Build paths via cumprod along day axis
-        log_paths = np.log(spot) + np.cumsum(np.log(step), axis=0)  # (days, n)
+        log_paths = np.log(spot) + np.cumsum(np.log(step), axis=0)
         paths = np.empty((n, days + 1))
         paths[:, 0] = spot
         paths[:, 1:] = np.exp(log_paths).T
         return paths
 
     def _density_grid(paths, spot, days, n_levels=60):
-        # OPT: fully vectorised — eliminates the O(days*n_levels) Python loop.
-        # Broadcasts paths (n, days) against lvls (n_levels,) using digitize.
         lo   = spot * 0.93
         hi   = spot * 1.07
         lvls = np.linspace(lo, hi, n_levels)
         bkt  = (hi - lo) / n_levels
         pcts = (lvls / spot - 1) * 100
-        # paths_mid: shape (n, days) — columns d=1..days
-        paths_mid = paths[:, 1:]  # (n_paths, days)
-        # bin each path-day into [0, n_levels] — values outside → 0 or n_levels
-        bins = np.floor((paths_mid - lo) / bkt).astype(np.int32)  # (n, days)
+        paths_mid = paths[:, 1:]
+        bins = np.floor((paths_mid - lo) / bkt).astype(np.int32)
         Z = np.zeros((n_levels, days), dtype=np.float32)
         n_paths = paths_mid.shape[0]
         for d in range(days):
@@ -991,8 +990,6 @@ def _medium_term_engine(
         rec_score: float,
         prob: dict,
 ) -> dict:
-    # FIX 2: Goldilocks base reduced from +2.0 → +1.0 to prevent systematic
-    # bull tilt from regime label alone on otherwise ambiguous days.
     regime_base = {
         "Goldilocks":   +1.0,
         "Overheating":  +0.5,
@@ -1081,12 +1078,6 @@ def _composite(prob: dict, vrp_val: float,
 
     s = s * _SCALE
 
-    # FIX 1: Backwardation contrarian NO EDGE bug.
-    # Previously: `if at_flip or (abs(s) < 1.5 and mom_abs < 0.5)`
-    # This wiped out the backwardation contrarian signal even when it was the
-    # primary edge (VTS backwardation + positive gamma + slight fear).
-    # Fix: exclude the backwardation case from the NO EDGE condition so the
-    # vol mean-reversion signal survives weak-momentum days.
     mom_abs = abs(intra.get("mom_spx", 0)) + abs(intra.get("mom_credit", 0))
     _vts_contrarian = (vts_shape == "BACKWARDATION") and not at_flip
     if at_flip or (abs(s) < 1.5 and mom_abs < 0.5 and not _vts_contrarian):
@@ -1472,12 +1463,12 @@ def _build_doc_style_thesis(
     if np.isfinite(vrp_val):
         if vrp_val >= 2:
             score += 1
-            drivers.append(("🟢", f"VRP positive ({vrp_val:.2f})"))
+            drivers.append(("🟢", f"VRP positive ({vrp_val:.4f})"))
         elif vrp_val <= -2:
             score -= 1
-            drivers.append(("🔴", f"VRP negative ({vrp_val:.2f})"))
+            drivers.append(("🔴", f"VRP negative ({vrp_val:.4f})"))
 
-    # 3) Fear composite — sentiment / positioning
+    # 3) Fear composite — > 1.0 = elevated, < -1.0 = complacent
     if fear_z >= 1.0:
         score -= 1
         drivers.append(("🔴", "Fear composite ELEVATED"))
@@ -1507,7 +1498,7 @@ def _build_doc_style_thesis(
     elif score == 1:  bias, color = "LEANING BULLISH", "#34d399"
     else:             bias, color = "BULLISH",          "#10b981"
 
-    # Risk flags — top 3 most actionable, generic phrasing (dealer detail lives in GEX section)
+    # Risk flags — top 3 most actionable
     risks = []
     if fear_z >= 1.0:
         risks.append("⚠️ Elevated fear composite — potential for sharp moves")
@@ -1572,8 +1563,6 @@ def render_thesis_page():
     idx=pd.date_range(start,end,freq="D")
 
     with st.spinner("Loading macro data…"):
-        # OPT: load_macro hits FRED + yfinance; cache for 10 min since FRED
-        # updates at most hourly and market close data is daily.
         @st.cache_data(ttl=600, show_spinner=False)
         def _cached_macro(s, e):
             return load_macro(s, e)
@@ -1696,29 +1685,57 @@ def render_thesis_page():
             macro_reg = _ext_reg
     except Exception:
         pass
-    _hys_filled = (hys.fillna(hys.dropna().mean())
-                   if hys is not None and hys.dropna().size > 0
-                   else pd.Series(3.0, index=idx))
 
-    _epu_filled = (epu.fillna(epu.dropna().mean())
-                   if epu is not None and epu.dropna().size > 0
-                   else pd.Series(100.0, index=idx))
+    # ── Fear Composite — reference-doc aligned ────────────────────────────────
+    # Four factors z-scored against their 1-year mean.
+    # > 1.0σ = ELEVATED fear  |  < -1.0σ = COMPLACENT
+    _hys_filled = (
+        hys.ffill().bfill()
+        if hys is not None and hys.dropna().size > 0
+        else pd.Series(3.0, index=idx)
+    )
+    _epu_filled = (
+        epu.ffill().bfill()
+        if epu is not None and epu.dropna().size > 0
+        else pd.Series(100.0, index=idx)
+    )
+    _vix_filled  = vix_s.ffill().bfill()
+    _nfci_filled = nfci.ffill().bfill()
 
-    def _rz(s: pd.Series, window: int = 252) -> pd.Series:
-        mu  = s.rolling(window, min_periods=63).mean()
-        sig = s.rolling(window, min_periods=63).std()
-        return (s - mu) / sig.replace(0, np.nan).ffill().fillna(1)
+    def _rz_1y(s: pd.Series, window: int = 252) -> pd.Series:
+        """
+        1-year rolling z-score (min 126 obs).
+        Matches reference doc: all fear components z-scored against
+        their 1-year mean. > 1.0 = elevated fear. < -1.0 = complacency.
+        """
+        s = s.astype(float)
+        mu = s.rolling(window, min_periods=126).mean()
+        sd = s.rolling(window, min_periods=126).std().replace(0, np.nan)
+        z  = (s - mu) / sd
+        return z.replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0)
 
-    vz   = _rz(vix_s.fillna(vix_s.dropna().median()))
-    nz   = _rz(nfci.fillna(0))
-    hyz  = _rz(_hys_filled)
-    epuz = _rz(_epu_filled)
+    # Equal-weight 4-factor composite (VIX 25%, HY OAS 25%, NFCI 25%, EPU 25%)
+    vz   = _rz_1y(_vix_filled)
+    nz   = _rz_1y(_nfci_filled)
+    hyz  = _rz_1y(_hys_filled)
+    epuz = _rz_1y(_epu_filled)
 
-    fear_raw = 0.35*vz + 0.25*hyz + 0.25*nz + 0.15*epuz
+    fear_series = (vz + nz + hyz + epuz) / 4.0
+    fear_z = float(fear_series.dropna().iloc[-1]) if fear_series.dropna().size > 0 else 0.0
 
-    _fear_raw_scalar = float(fear_raw.dropna().iloc[-1]) if fear_raw.dropna().size > 0 else 0.0
-    fear   = float(np.clip(100.0 / (1.0 + np.exp(-_fear_raw_scalar)), 0, 100))
-    fear_z = _fear_raw_scalar
+    # Optional 0-100 display score (not used for thesis logic)
+    fear = float(np.clip(50 + 15 * fear_z, 0, 100))
+
+    # Labels driven by doc thresholds: > 1.0 = elevated, < -1.0 = complacent
+    if fear_z > 1.0:
+        fl2 = "ELEVATED"
+        fc  = "#ef4444"
+    elif fear_z < -1.0:
+        fl2 = "COMPLACENT"
+        fc  = "#10b981"
+    else:
+        fl2 = "NEUTRAL"
+        fc  = "#f59e0b"
 
     vl=_sl(vix_s,20.0); sahmv=_sl(sahm,0.0) if sahm is not None else 0.0
     hyv=_sl(hys,3.0) if hys is not None else 3.0
@@ -1739,10 +1756,8 @@ def render_thesis_page():
     tgadd=(tga.diff(28)<0).astype(int); rrpd=(rrp<50).astype(int)
     trp=float(np.clip(50+20*float(tgadd.iloc[-1])+15*float(rrpd.iloc[-1])+15*float(nl4w.iloc[-1]>=0),0,100))
     threeP=float(np.clip(0.35*trp+0.35*fp+0.30*tp,0,100))
+
     # ── Recession probability — four explicit drivers matching the glossary ──
-    # Compute rolling inputs from already-loaded monthly UNRATE and weekly ICSA.
-    # UNRATE is monthly; rolling(3) on the daily-resampled series gives a 3-month
-    # window over the ffill'd values, which is equivalent to a 3-month average.
     _unrate_clean = unrate.dropna()
     if _unrate_clean.size >= 12:
         _ur_3m_avg   = float(_unrate_clean.rolling(3,  min_periods=2).mean().iloc[-1])
@@ -1760,11 +1775,11 @@ def render_thesis_page():
         _claims_1y_avg = float("nan")
 
     rec = compute_recession_probability(
-        yc_2s10s              = crl,           # 2s10s in bp (already computed above)
+        yc_2s10s              = crl,
         unemployment          = ur,
         unemployment_3m_avg   = _ur_3m_avg,
         unemployment_12m_min  = _ur_12m_min,
-        initial_claims        = _claims_now,   # in thousands
+        initial_claims        = _claims_now,
         initial_claims_1y_avg = _claims_1y_avg,
     )
     rec     = round(rec, 1)
@@ -1822,7 +1837,7 @@ def render_thesis_page():
     s2s10v=(tnxv-irxv)*100 if (np.isfinite(tnxv) and np.isfinite(irxv)) else crl
     vix_live=q.get("VIX_last",vl)
     vxn_live=q.get("VXN_last", vix_live * 1.10)
-    vrp=_vrp_full(vix_live, spy, idx, vix_series=vix_s)
+    vrp=_vrp_full(vix_live, spy, idx)
     vts=_vts(q); tail=_tail(q)
     rd=_retdist(spy,idx,spx)
     b=_bands(spx,vix_live)
@@ -1830,8 +1845,6 @@ def render_thesis_page():
     gex_spot=spx if gex_sym in ("SPY","SPX") else ndx
     with st.spinner("Fetching options data…"):
         client=get_schwab_client(); chain_df=None
-        # OPT: cache yfinance chain for 5 min — options data doesn't change
-        # tick-by-tick for GEX purposes; avoids re-fetching on UI interactions.
         @st.cache_data(ttl=300, show_spinner=False)
         def _cached_yf_chain(sym):
             return get_gex_from_yfinance(sym)
@@ -1903,8 +1916,6 @@ def render_thesis_page():
     _fl_bias_label = "Flow Bias" if _fl_using_vol else "OI Bias (inventory)"
 
     with st.spinner("Computing signals…"):
-        # OPT: wrap leading-stack computation in a cached helper so repeated
-        # Streamlit rerenders (e.g. sidebar interactions) skip the heavy pandas work.
         @st.cache_data(ttl=300, show_spinner=False)
         def _cached_leading(start_str, end_str, macro_reg_key):
             return compute_leading_stack(
@@ -1916,8 +1927,6 @@ def render_thesis_page():
         nc=float(current_pct_rank(-_to_1d(nfci).reindex(idx).ffill(),252))
         lc=float(50.0+np.sign(nl4wv)*20)
     with st.spinner("Loading feeds…"):
-        # OPT: RSS feeds update at most every few minutes; cache parsed results
-        # for 3 min to avoid re-fetching on every Streamlit interaction.
         @st.cache_data(ttl=180, show_spinner=False)
         def _cached_feeds():
             try:
@@ -1955,9 +1964,6 @@ def render_thesis_page():
     _rv5  = float(_spy_rets.rolling(5,  min_periods=3).std().dropna().iloc[-1] * np.sqrt(252) * 100) if len(_spy_rets) > 5  else float("nan")
     _rv20 = float(_spy_rets.rolling(20, min_periods=10).std().dropna().iloc[-1] * np.sqrt(252) * 100) if len(_spy_rets) > 20 else float("nan")
 
-    # FIX 3: Override stale daily closes with live Schwab intraday data.
-    # Without this, reruns during the trading day use last night's close for
-    # 1d momentum, making _intraday_engine blind to the current session move.
     _intraday_live = get_intraday_signals(client) if client else {}
     if _intraday_live:
         _spx_1d_ret = _intraday_live.get("SPY_pct", _spx_1d_ret)
@@ -1986,13 +1992,10 @@ def render_thesis_page():
     def _ua(p): return f"{p*um:,.0f}"
     reg_col={"Goldilocks":"#10b981","Overheating":"#f59e0b","Stagflation":"#ef4444",
              "Deflation":"#6366f1","Disinflation":"#06b6d4"}.get(macro_reg,"#94a3b8")
-    fl2="ELEVATED" if fear_z>1.0 else "MODERATE" if fear_z>0.0 else "COMPLACENT" if fear_z<-1.0 else "LOW"
-    fc="#ef4444" if fear_z>1.0 else "#f59e0b" if fear_z>0.0 else "#10b981"
 
     # ── 1. MARKET REGIME ──────────────────────────────────────────────────
     _q_live = dict(q)
     if _intraday_live:
-        # FIX 3 (cont): _intraday_bias uses percent; Schwab returns fractions
         _q_live["SPX_pct"] = _intraday_live.get("SPY_pct", q.get("SPX_pct", 0.0)) * 100
         _q_live["VIX_pct"] = _intraday_live.get("VIX_pct", q.get("VIX_pct", 0.0))
         _q_live["HYG_pct"] = _intraday_live.get("HYG_pct", q.get("HYG_pct", 0.0)) * 100
@@ -2118,8 +2121,6 @@ def render_thesis_page():
     st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>4. SPX / NDX FORWARD PROBABILITY HEATMAP — 1-WEEK FORECAST</div>",unsafe_allow_html=True)
     st.caption("Merton Jump-Diffusion Monte Carlo (n=6,000) · VIX/VXN implied vol · VVIX-calibrated jump intensity · Risk-neutral drift · 5 trading days")
     with st.spinner("Running simulations…"):
-        # Pre-compute rv floats here (uses Series) so the cached fig function
-        # only receives hashable scalar args — fixes UnhashableParamError.
         def _rv20_scalar(series):
             s = _to_1d(series).reindex(idx).ffill()
             v = s.pct_change().rolling(20, min_periods=10).std().dropna()
@@ -2214,13 +2215,12 @@ def render_thesis_page():
     vbd = (
         _sh(10, "THESIS VERDICT")
         + f"<div style='font-size:36px;font-weight:900;color:{c};margin-bottom:6px;'>{th['bias']}</div>"
-        + f"<div style='font-size:12px;color:rgba(255,255,255,0.50);margin-bottom:4px;'>Composite Score: {th['score']:+d} / ±10  ·  {dt.datetime.now().strftime('%A, %B %d, %Y')}</div>"
+        + f"<div style='font-size:12px;color:rgba(255,255,255,0.50);margin-bottom:4px;'>Composite Score: {th['score']:+d} / ±3  ·  {dt.datetime.now().strftime('%A, %B %d, %Y')}</div>"
         + "<div style='height:14px;'></div>"
         + "<div style='font-size:10px;color:rgba(255,255,255,0.35);letter-spacing:0.12em;text-transform:uppercase;margin-bottom:8px;'>Signal Breakdown</div>"
         + sig_html
         + "<div style='height:14px;'></div>"
         + "<div style='display:grid;grid-template-columns:1fr 1fr;gap:6px 24px;'>"
-        # Key levels
         + "<div><div style='font-size:10px;color:rgba(255,255,255,0.35);letter-spacing:0.12em;text-transform:uppercase;margin-bottom:6px;'>Key Levels</div>"
         + _kv("SPX Spot",  f"{lv['SPX Spot']:,.2f}", "#fff")
         + _kv("GEX Flip",  f"{lv['GEX Flip']:,.2f}",  "#f59e0b")
@@ -2231,7 +2231,6 @@ def render_thesis_page():
         + _kv("1σ Weekly", f"{lv['1σ Weekly'][0]:,.0f} — {lv['1σ Weekly'][1]:,.0f}")
         + _kv("2σ Weekly", f"{lv['2σ Weekly'][0]:,.0f} — {lv['2σ Weekly'][1]:,.0f}")
         + "</div>"
-        # Risk factors
         + "<div><div style='font-size:10px;color:rgba(255,255,255,0.35);letter-spacing:0.12em;text-transform:uppercase;margin-bottom:6px;'>Risk Factors</div>"
         + risk_html
         + "</div>"
@@ -2247,7 +2246,7 @@ def render_thesis_page():
             _sh(11,"GLOSSARY — WHAT EVERYTHING MEANS")
             +_gl("VRP (Variance Risk Premium)",
                  "The difference between implied volatility (what the market expects) and realized volatility "
-                 "(what actually happened). Computed as VIX minus 21-day realized vol. "
+                 "(what actually happened). VRP = VIX minus 21-day realized vol. "
                  "Positive VRP = options are overpriced relative to actual moves — traders sell vol when VRP is high. "
                  "Negative VRP = vol is cheap relative to actual moves — consider buying protection.")
             +_gl("GEX (Gamma Exposure)",
@@ -2260,6 +2259,11 @@ def render_thesis_page():
                  "Contango = VIX3M > VIX (longer-dated higher than near-term) — normal, calm market. "
                  "Backwardation = VIX > VIX3M (near-term higher than longer-dated) — fear is elevated, hedging demand is high. "
                  "Backwardation is a warning sign; vol tends to mean-revert within 1–3 weeks.")
+            +_gl("Fear Composite",
+                 "Combines EPU (Economic Policy Uncertainty), VIX, NFCI (Financial Conditions), and HY OAS "
+                 "(high-yield credit spreads) into a single fear score. "
+                 "All components are z-scored against their 1-year mean. "
+                 "> 1.0σ = ELEVATED fear. < −1.0σ = COMPLACENT.")
             +_gl("Tail Risk (VVIX/VIX)",
                  "VVIX measures the volatility of VIX itself — the vol of vol. "
                  "A high VVIX/VIX ratio means the market is pricing sharp VIX spikes — tail risk is elevated. "
@@ -2319,14 +2323,12 @@ def render_thesis_page():
                  "Bottom panel: the VRP spread bar chart. "
                  "Green = IV > RV (vol premium, sell bias). Red = IV < RV (vol discount, consider protection).")
             +_gl("Fear Composite",
-                 "Combines four inputs into a single fear score: "
-                 "VIX (35%), HY OAS — high-yield credit spreads (25%), NFCI — financial conditions (25%), "
-                 "and EPU — economic policy uncertainty (15%). "
-                 "Each component is z-scored against its own 252-day rolling window, "
-                 "so a VIX spike reads as elevated relative to the past 12 months regardless of the long-run mean. "
-                 ">+1.0σ = ELEVATED. <−1.0σ = COMPLACENT.")
+                 "Combines EPU (Economic Policy Uncertainty), VIX, NFCI (Financial Conditions), and HY OAS "
+                 "(high-yield credit spreads) into a single fear score. "
+                 "All components are z-scored against their 1-year mean. "
+                 "> 1.0σ = ELEVATED fear. < −1.0σ = COMPLACENT.")
             +_gl("Composite Score",
-                 "Driver-first thesis engine. Score is an integer −3 to +3 displayed as-is (e.g. −3 / ±10 means maximum bearish). "
+                 "Driver-first thesis engine. Score ranges from −3 (max bearish) to +3 (max bullish). "
                  "Inputs: GEX regime (structure), VRP (vol carry), Fear composite (sentiment), "
                  "Recession risk (macro stress), and Macro regime (backdrop). "
                  "Signal bullets show the top 3 drivers as plain-English cause → effect statements.")),

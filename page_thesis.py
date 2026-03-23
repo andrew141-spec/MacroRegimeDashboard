@@ -1425,36 +1425,36 @@ def _build_doc_style_thesis(
     # 1) GEX / structure — most reliable, mechanical
     if neg:
         score -= 2
-        drivers.append(("🔴", f"GEX negative ({gex_score:+d}) — dealers amplify, trending conditions"))
+        drivers.append(("🔴", f"GEX negative ({gex_score:+d})"))
     elif pos:
         score += 1
-        drivers.append(("🟢", f"GEX positive ({gex_score:+d}) — dealers suppress, mean-reversion dominant"))
+        drivers.append(("🟢", f"GEX positive ({gex_score:+d})"))
 
     # 2) VRP — is vol cheap or expensive vs realized?
     vrp_val = vrp.get("val", float("nan"))
     if np.isfinite(vrp_val):
         if vrp_val >= 2:
             score += 1
-            drivers.append(("🟢", f"VRP rich ({vrp_val:+.2f}) — vol sellers have carry, fading premium"))
+            drivers.append(("🟢", f"VRP positive ({vrp_val:.2f})"))
         elif vrp_val <= -2:
             score -= 1
-            drivers.append(("🔴", f"VRP cheap ({vrp_val:+.2f}) — protection underpriced, consider tail hedges"))
+            drivers.append(("🔴", f"VRP negative ({vrp_val:.2f})"))
 
     # 3) Fear composite — sentiment / positioning
     if fear_z >= 1.0:
         score -= 1
-        drivers.append(("🔴", f"Fear elevated ({fear_z:+.2f}σ) — crowded hedging, potential squeeze"))
+        drivers.append(("🔴", "Fear composite ELEVATED"))
     elif fear_z <= -1.0:
         score += 1
-        drivers.append(("🟢", f"Fear low ({fear_z:+.2f}σ) — complacency, watch for reversals"))
+        drivers.append(("🟢", "Fear composite COMPLACENT"))
 
     # 4) Recession / macro stress — slow backdrop
     if rec >= 60:
         score -= 1
-        drivers.append(("🔴", f"Recession risk {rec:.0f}% — monitor labor data, risk-off conditions"))
+        drivers.append(("🔴", f"Recession risk elevated ({rec:.1f}%)"))
     elif rec <= 30:
         score += 1
-        drivers.append(("🟢", f"Recession risk {rec:.0f}% — expansion backdrop"))
+        drivers.append(("🟢", f"Recession risk low ({rec:.1f}%)"))
 
     # 5) Macro regime tilt — directional but slow-moving
     if macro_reg in ("Deflation", "Stagflation", "Disinflation"):
@@ -1470,17 +1470,17 @@ def _build_doc_style_thesis(
     elif score == 1:  bias, color = "LEANING BULLISH", "#34d399"
     else:             bias, color = "BULLISH",          "#10b981"
 
-    # Risk flags — top 3 most actionable
+    # Risk flags — top 3 most actionable, generic phrasing (dealer detail lives in GEX section)
     risks = []
-    if neg and fear_z >= 1.0:
-        risks.append("🔴 Neg gamma + fear elevated — dealers amplify, trending conditions")
+    if fear_z >= 1.0:
+        risks.append("⚠️ Elevated fear composite — potential for sharp moves")
     if rec >= 60:
-        risks.append(f"⚠️ Recession risk {rec:.0f}% — monitor labor data")
+        risks.append(f"⚠️ Recession probability at {rec:.1f}% — monitor labor data")
     if np.isfinite(stlc) and stlc > 0.2:
-        risks.append("⚠️ Stock-bond correlation positive — diversification impaired")
+        risks.append("⚠️ Positive stock-bond correlation — diversification impaired")
     if vts.get("shape") == "BACKWARDATION":
         risks.append("⚠️ Vol backwardation — near-term stress elevated")
-    if neg and not (neg and fear_z >= 1.0):
+    if neg:
         risks.append("⚠️ Negative gamma — dealers may amplify moves")
     if not risks:
         risks.append("✅ No major risk flags")
@@ -2156,7 +2156,7 @@ def render_thesis_page():
     vbd = (
         _sh(10, "THESIS VERDICT")
         + f"<div style='font-size:36px;font-weight:900;color:{c};margin-bottom:6px;'>{th['bias']}</div>"
-        + f"<div style='font-size:12px;color:rgba(255,255,255,0.50);margin-bottom:4px;'>Score: {th['score']:+d} / ±3  ·  {dt.datetime.now().strftime('%A, %B %d, %Y')}</div>"
+        + f"<div style='font-size:12px;color:rgba(255,255,255,0.50);margin-bottom:4px;'>Composite Score: {th['score']*3:+d} / ±10  ·  {dt.datetime.now().strftime('%A, %B %d, %Y')}</div>"
         + "<div style='height:14px;'></div>"
         + "<div style='font-size:10px;color:rgba(255,255,255,0.35);letter-spacing:0.12em;text-transform:uppercase;margin-bottom:8px;'>Signal Breakdown</div>"
         + sig_html

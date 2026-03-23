@@ -832,54 +832,65 @@ def _rdist_fig(spy: pd.Series, idx, rd: Dict, spot: float = float("nan")) -> go.
     )
     return fig
 
-def _recession_stress(sahm: float, hy: float, s2s10_bp: float,
-                      icsa_4w_chg: float, vix: float,
-                      icsa_series: "pd.Series | None" = None,
-                      spx_dd: float = 0.0, epu_z: float = 0.0,
-                      s2s10_series: "pd.Series | None" = None) -> dict:
-    from scipy.special import expit as _sigmoid
+def compute_recession_probability(
+    yc_2s10s: float,
+    unemployment: float,
+    unemployment_3m_avg: float,
+    unemployment_12m_min: float,
+    initial_claims: float,
+    initial_claims_1y_avg: float,
+) -> float:
+    """
+    Recession probability 0–100% driven by exactly four inputs:
 
-    sahm_z = np.clip(sahm / 0.4, 0, 1)
-    hy_z   = np.clip((hy - 350) / 450, 0, 1)
-    curve_z = np.clip((-s2s10_bp) / 150, 0, 1)
+      1. Yield curve (2s10s in bp)   — early warning, not timing
+      2. Sahm Rule                   — best real-time recession trigger (weight 3.0)
+      3. Initial claims              — labor deterioration / acceleration
+      4. Unemployment level          — lagging confirmation
 
-    inv_dur_mult = 1.0
-    if s2s10_series is not None and s2s10_series.dropna().size > 10:
-        _inv_days = int((s2s10_series.dropna() < 0).rolling(252, min_periods=1).sum().iloc[-1])
-        inv_dur_mult = float(np.clip(1.0 + _inv_days / 365.0, 1.0, 2.0))
-    curve_z = np.clip(curve_z * inv_dur_mult, 0, 1)
+    The Sahm Rule is computed here directly from the unemployment series
+    so the model matches the glossary exactly:
+      sahm = 3-month avg UR - 12-month min UR
+      >= 0.5 → strong recession signal
+      >= 0.3 → moderate signal
 
-    if icsa_series is not None and icsa_series.dropna().size >= 26:
-        _ic   = icsa_series.dropna()
-        _mean = float(_ic.rolling(52, min_periods=26).mean().iloc[-1])
-        _std  = float(_ic.rolling(52, min_periods=26).std().iloc[-1])
-        icsa_z = float(np.clip((_ic.iloc[-1] - _mean) / (_std * 3.0), 0, 1)) if (np.isfinite(_mean) and _std > 0) else float(np.clip(icsa_4w_chg / 0.20, 0, 1))
-    else:
-        icsa_z = float(np.clip(icsa_4w_chg / 0.20, 0, 1))
+    Sigmoid centred at +2 (score=2 → ~50%, score=5 → ~95%, score=0 → ~12%).
+    """
+    score = 0.0
 
-    raw = 0.40 * sahm_z + 0.25 * hy_z + 0.20 * curve_z + 0.15 * icsa_z
+    # 1. Yield curve (bp) — inversion = pressure, not yet recession
+    if np.isfinite(yc_2s10s):
+        if yc_2s10s < 0:
+            score += 1.5    # inverted: meaningful early warning
+        elif yc_2s10s < 50:
+            score += 0.5    # flat: mild pressure
 
-    score = float(_sigmoid((raw - 0.35) * 8) * 100)
-    score = round(np.clip(score, 1, 99), 1)
+    # 2. Sahm Rule — MOST IMPORTANT (weight 3.0 at trigger)
+    if np.isfinite(unemployment_3m_avg) and np.isfinite(unemployment_12m_min):
+        sahm = unemployment_3m_avg - unemployment_12m_min
+        if sahm >= 0.5:
+            score += 3.0    # classic Sahm trigger: recession typically already started
+        elif sahm >= 0.3:
+            score += 1.5    # approaching trigger: deterioration underway
 
-    if sahm >= 0.35 or hy > 375 or score > 60:  label = "ELEVATED"
-    elif sahm >= 0.20 or hy > 320:               label = "MODERATE"
-    else:                                          label = "LOW"
+    # 3. Initial claims — weekly labor signal, leads payrolls by 4–6 weeks
+    if np.isfinite(initial_claims) and np.isfinite(initial_claims_1y_avg) and initial_claims_1y_avg > 0:
+        claims_ratio = initial_claims / initial_claims_1y_avg
+        if claims_ratio > 1.2:
+            score += 1.5    # 20%+ above 1Y avg: significant deterioration
+        elif claims_ratio > 1.1:
+            score += 0.75   # 10–20% above: early deterioration
 
-    return {
-        "score": score, "label": label,
-        "components": {
-            "sahm_contribution":  round(0.40 * sahm_z  * 100, 1),
-            "hy_contribution":    round(0.25 * hy_z    * 100, 1),
-            "curve_contribution": round(0.20 * curve_z * 100, 1),
-            "icsa_contribution":  round(0.15 * icsa_z  * 100, 1),
-        },
-        "note": (
-            "Recession Stress Index — orthogonal to fear composite (no VIX/EPU). "
-            "Sahm 40% + HY OAS 25% + yield curve 20% (with duration mult) + ICSA 15%. "
-            "NOT a calibrated probability. Use Estrella-Mishkin for that."
-        ),
-    }
+    # 4. Unemployment level — lagging but confirms regime
+    if np.isfinite(unemployment):
+        if unemployment >= 5.0:
+            score += 1.0    # clearly elevated
+        elif unemployment >= 4.5:
+            score += 0.5    # moderately elevated
+
+    # Sigmoid centred at 2: score=2→50%, score=3.5→82%, score=5→95%, score=0→12%
+    prob = 100.0 / (1.0 + np.exp(-score + 2))
+    return float(np.clip(prob, 1.0, 99.0))
 
 # ══════════════════════════════════════════════════════════════════════════════
 # THREE-HORIZON ENGINES + COMPOSITE
@@ -1728,15 +1739,36 @@ def render_thesis_page():
     tgadd=(tga.diff(28)<0).astype(int); rrpd=(rrp<50).astype(int)
     trp=float(np.clip(50+20*float(tgadd.iloc[-1])+15*float(rrpd.iloc[-1])+15*float(nl4w.iloc[-1]>=0),0,100))
     threeP=float(np.clip(0.35*trp+0.35*fp+0.30*tp,0,100))
-    _stress = _recession_stress(
-        sahmv, hyv*100, crl, icsa_4w_chg, vl,
-        icsa_series=icsa,
-        spx_dd=float(spydd.iloc[-1]),
-        epu_z=float(epuz.dropna().iloc[-1]) if epuz.dropna().size > 0 else 0.0,
-        s2s10_series=s2s10,
+    # ── Recession probability — four explicit drivers matching the glossary ──
+    # Compute rolling inputs from already-loaded monthly UNRATE and weekly ICSA.
+    # UNRATE is monthly; rolling(3) on the daily-resampled series gives a 3-month
+    # window over the ffill'd values, which is equivalent to a 3-month average.
+    _unrate_clean = unrate.dropna()
+    if _unrate_clean.size >= 12:
+        _ur_3m_avg   = float(_unrate_clean.rolling(3,  min_periods=2).mean().iloc[-1])
+        _ur_12m_min  = float(_unrate_clean.rolling(12, min_periods=6).min().iloc[-1])
+    else:
+        _ur_3m_avg   = float(_unrate_clean.iloc[-1]) if _unrate_clean.size > 0 else ur
+        _ur_12m_min  = float(_unrate_clean.min())    if _unrate_clean.size > 0 else ur
+
+    _icsa_clean_rec = (icsa.dropna() / 1000) if icsa is not None and icsa.dropna().size > 0 else pd.Series(dtype=float)
+    if _icsa_clean_rec.size >= 26:
+        _claims_now    = float(_icsa_clean_rec.iloc[-1])
+        _claims_1y_avg = float(_icsa_clean_rec.rolling(52, min_periods=26).mean().iloc[-1])
+    else:
+        _claims_now    = float("nan")
+        _claims_1y_avg = float("nan")
+
+    rec = compute_recession_probability(
+        yc_2s10s              = crl,           # 2s10s in bp (already computed above)
+        unemployment          = ur,
+        unemployment_3m_avg   = _ur_3m_avg,
+        unemployment_12m_min  = _ur_12m_min,
+        initial_claims        = _claims_now,   # in thousands
+        initial_claims_1y_avg = _claims_1y_avg,
     )
-    rec     = _stress["score"]
-    rec_lbl = _stress["label"]
+    rec     = round(rec, 1)
+    rec_lbl = "ELEVATED" if rec >= 60 else "MODERATE" if rec >= 35 else "LOW"
     sr=_to_1d(spy).reindex(idx).ffill().pct_change().dropna()
     tr2=_to_1d(tlt).reindex(idx).ffill().pct_change().reindex(sr.index).dropna()
     stlc=round(float(sr.rolling(21).corr(tr2).dropna().iloc[-1]),3) if sr.dropna().size>21 else float("nan")
@@ -2246,9 +2278,16 @@ def render_thesis_page():
                  "Markets almost always have negative skew and positive excess kurtosis.")
             +_gl("Recession P(6m)",
                  "Probability of a US recession starting in the next 6 months. "
-                 "Built from the yield curve (2s10s spread), unemployment rate, initial jobless claims, and the Sahm Rule. "
-                 "Sahm Rule: if the 3-month average unemployment rate rises 0.5% above its 12-month low, "
-                 "a recession has typically already begun. The dashboard loads the Sahm Rule series directly from FRED.")
+                 "Driven by four explicit inputs: "
+                 "(1) Yield curve — 2s10s spread: inverted (<0bp) adds 1.5pts, flat (<50bp) adds 0.5pts. "
+                 "(2) Sahm Rule (weight 3.0 — the most important): "
+                 "computed as 3-month avg unemployment minus 12-month min unemployment. "
+                 "≥0.5 adds 3.0pts (classic trigger, recession typically already started). "
+                 "≥0.3 adds 1.5pts (approaching trigger). "
+                 "(3) Initial claims vs 1-year average: >20% above avg adds 1.5pts, >10% adds 0.75pts. "
+                 "(4) Unemployment level: ≥5.0% adds 1.0pt, ≥4.5% adds 0.5pts. "
+                 "Total score converted to probability via sigmoid centred at 2 "
+                 "(score=2→50%, score=3.5→82%, score=5→95%).")
             +_gl("Net Liquidity",
                  "Fed Balance Sheet (WALCL) minus TGA (Treasury's cash balance) minus RRP (overnight reverse repos). "
                  "When net liquidity expands, more money flows into risk assets. "

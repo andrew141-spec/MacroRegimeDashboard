@@ -2303,15 +2303,13 @@ def render_thesis_page():
             +_gl("Recession P(6m)",
                  "Probability of a US recession starting in the next 6 months. "
                  "Driven by four explicit inputs: "
-                 "(1) Yield curve — 2s10s spread: inverted (<0bp) adds 1.5pts, flat (<50bp) adds 0.5pts. "
-                 "(2) Sahm Rule (weight 3.0 — the most important): "
-                 "computed as 3-month avg unemployment minus 12-month min unemployment. "
-                 "≥0.5 adds 3.0pts (classic trigger, recession typically already started). "
-                 "≥0.3 adds 1.5pts (approaching trigger). "
-                 "(3) Initial claims vs 1-year average: >20% above avg adds 1.5pts, >10% adds 0.75pts. "
-                 "(4) Unemployment level: ≥5.0% adds 1.0pt, ≥4.5% adds 0.5pts. "
-                 "Total score converted to probability via sigmoid centred at 2 "
-                 "(score=2→50%, score=3.5→82%, score=5→95%).")
+                 "(1) Yield curve — 2s10s spread: inverted (<0bp) adds 1.5pts, flat (0–50bp) adds 1.0pt, modest positive (50–100bp) adds 0.4pts. "
+                 "(2) Sahm Rule (most important): "
+                 "3-month avg unemployment minus 12-month min unemployment. "
+                 "≥0.50 adds 3.0pts · ≥0.40 adds 2.3pts · ≥0.30 adds 1.8pts · ≥0.25 adds 1.5pts · ≥0.20 adds 1.0pt. "
+                 "(3) Initial claims vs 1-year average: ≥20% above adds 1.5pts · ≥10% adds 1.0pt · ≥5% adds 0.5pts. "
+                 "(4) Unemployment level: ≥5.0% adds 1.0pt · ≥4.7% adds 0.75pts · ≥4.4% adds 0.5pts · ≥4.2% adds 0.25pts. "
+                 "Sigmoid centred at 2.25: score=3.0→68% · score=3.5→78% · score=5.0→95%.")
             +_gl("Net Liquidity",
                  "Fed Balance Sheet (WALCL) minus TGA (Treasury's cash balance) minus RRP (overnight reverse repos). "
                  "When net liquidity expands, more money flows into risk assets. "

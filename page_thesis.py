@@ -1468,98 +1468,127 @@ def _build_doc_style_thesis(
     gex_sym: str,
 ) -> dict:
     """
-    Flat, driver-first thesis engine.
-    Philosophy: show cause → effect in 3 signal bullets. No weighted sum.
-    Score is an integer -3..+3 for display only (not used to drive charts).
+    Contextual thesis engine — score -10..+10.
+
+    VRP is regime-dependent:
+      Calm (pos/neutral GEX AND fear < 1.0): high VRP = sell vol = bullish
+      Full stress (neg GEX AND fear >= 1.0): high VRP = panic hedging = bearish
+      Partial stress (one flag only): VRP zeroed — signal is noise
+
+    Hard caps:
+      rec >= 55% OR fear >= 1.5: score capped at 0 (cannot go bullish)
     """
     neg = gex_state.regime in (GammaRegime.NEGATIVE, GammaRegime.STRONG_NEGATIVE)
     pos = gex_state.regime in (GammaRegime.POSITIVE, GammaRegime.STRONG_POSITIVE)
+    full_stress    = neg and (fear_z >= 1.0)
+    partial_stress = neg or  (fear_z >= 1.0)
 
     score   = 0
     drivers = []
 
-    # 1) GEX / structure — most reliable, mechanical
+    # 1) GEX — most mechanically reliable
     if neg:
         score -= 4
-        drivers.append(("🔴", f"GEX negative ({gex_score:+d})"))
+        drivers.append(("\U0001f534", f"GEX negative ({gex_score:+d}) \u2014 dealers amplify moves"))
     elif pos:
         score += 2
-        drivers.append(("🟢", f"GEX positive ({gex_score:+d})"))
+        drivers.append(("\U0001f7e2", f"GEX positive ({gex_score:+d}) \u2014 dealers suppress moves"))
 
-    # 2) VRP — is vol cheap or expensive vs realized?
+    # 2) VRP — meaning depends on regime context
     vrp_val = vrp.get("val", float("nan"))
     if np.isfinite(vrp_val):
-        if vrp_val >= 4:
-            score += 2
-            drivers.append(("🟢", f"VRP rich (+{vrp_val:.2f}) — sell vol"))
-        elif vrp_val >= 2:
-            score += 1
-            drivers.append(("🟢", f"VRP positive ({vrp_val:.2f})"))
-        elif vrp_val <= -4:
-            score -= 2
-            drivers.append(("🔴", f"VRP very cheap ({vrp_val:.2f}) — buy protection"))
-        elif vrp_val <= -2:
-            score -= 1
-            drivers.append(("🔴", f"VRP negative ({vrp_val:.2f})"))
+        if full_stress:
+            # Neg GEX + elevated fear: high VRP = panic hedging, not a buy
+            if vrp_val >= 3:
+                score -= 1
+                drivers.append(("\U0001f534", f"VRP {vrp_val:.2f} in stress = panic hedging demand"))
+            elif vrp_val <= -3:
+                score -= 1
+                drivers.append(("\U0001f534", f"VRP cheap ({vrp_val:.2f}) in stress \u2014 protection underpriced"))
+        elif partial_stress:
+            # One stress flag: conflicting context, zero out VRP
+            pass
+        else:
+            # Clean calm regime: pure vol-carry signal
+            if vrp_val >= 4:
+                score += 2
+                drivers.append(("\U0001f7e2", f"VRP rich (+{vrp_val:.2f}) \u2014 options expensive, sell vol"))
+            elif vrp_val >= 2:
+                score += 1
+                drivers.append(("\U0001f7e2", f"VRP positive ({vrp_val:.2f})"))
+            elif vrp_val <= -4:
+                score -= 2
+                drivers.append(("\U0001f534", f"VRP very cheap ({vrp_val:.2f}) \u2014 buy protection"))
+            elif vrp_val <= -2:
+                score -= 1
+                drivers.append(("\U0001f534", f"VRP negative ({vrp_val:.2f})"))
 
-    # 3) Fear composite — > 1.0 = elevated, < -1.0 = complacent
+    # 3) Fear composite
     if fear_z >= 2.0:
         score -= 2
-        drivers.append(("🔴", f"Fear composite VERY ELEVATED ({fear_z:.2f}σ)"))
+        drivers.append(("\U0001f534", f"Fear VERY ELEVATED ({fear_z:.2f}\u03c3) \u2014 systemic stress"))
     elif fear_z >= 1.0:
         score -= 1
-        drivers.append(("🔴", f"Fear composite ELEVATED ({fear_z:.2f}σ)"))
+        drivers.append(("\U0001f534", f"Fear ELEVATED ({fear_z:.2f}\u03c3)"))
     elif fear_z <= -1.0:
         score += 1
-        drivers.append(("🟢", f"Fear composite COMPLACENT ({fear_z:.2f}σ)"))
+        drivers.append(("\U0001f7e2", f"Fear COMPLACENT ({fear_z:.2f}\u03c3) \u2014 positioning light"))
 
-    # 4) Recession / macro stress — slow backdrop
+    # 4) Recession risk
     if rec >= 70:
         score -= 2
-        drivers.append(("🔴", f"Recession risk ELEVATED ({rec:.1f}%)"))
+        drivers.append(("\U0001f534", f"Recession risk ELEVATED ({rec:.1f}%)"))
     elif rec >= 55:
         score -= 1
-        drivers.append(("🔴", f"Recession risk elevated ({rec:.1f}%)"))
+        drivers.append(("\U0001f534", f"Recession risk elevated ({rec:.1f}%)"))
     elif rec <= 20:
         score += 1
-        drivers.append(("🟢", f"Recession risk low ({rec:.1f}%)"))
+        drivers.append(("\U0001f7e2", f"Recession risk low ({rec:.1f}%)"))
 
-    # 5) Macro regime tilt — directional but slow-moving
-    if macro_reg in ("Deflation",):
+    # 5) Macro regime
+    if macro_reg == "Deflation":
         score -= 2
+        drivers.append(("\U0001f534", "Macro: Deflation \u2014 severe demand destruction"))
     elif macro_reg in ("Stagflation", "Disinflation"):
         score -= 1
-    elif macro_reg in ("Goldilocks",):
+        drivers.append(("\U0001f534", f"Macro: {macro_reg}"))
+    elif macro_reg == "Goldilocks":
         score += 1
-    elif macro_reg in ("Overheating",):
-        score += 0  # mixed signal, no contribution
+        drivers.append(("\U0001f7e2", "Macro: Goldilocks \u2014 growth + contained inflation"))
+    elif macro_reg == "Overheating":
+        drivers.append(("\u26aa", "Macro: Overheating \u2014 growth ok, inflation risk"))
+
+    # ── Hard caps ─────────────────────────────────────────────────────
+    # Elevated recession or fear means no bullish read is reliable
+    if rec >= 55 or fear_z >= 1.5:
+        score = min(score, 0)
 
     score = int(np.clip(score, -10, 10))
 
-    if score <= -4:   bias, color = "BEARISH",         "#ef4444"
-    elif score <= -2: bias, color = "LEANING BEARISH", "#f97316"
+    if score <= -6:   bias, color = "BEARISH",         "#ef4444"
+    elif score <= -3: bias, color = "LEANING BEARISH", "#f97316"
     elif score == 0:  bias, color = "NEUTRAL",          "#94a3b8"
-    elif score <= 3:  bias, color = "LEANING BULLISH",  "#34d399"
+    elif score <= 4:  bias, color = "LEANING BULLISH",  "#34d399"
     else:             bias, color = "BULLISH",           "#10b981"
 
-    # Risk flags — top 3 most actionable
+    # Risk flags
     risks = []
     if fear_z >= 1.0:
-        risks.append("⚠️ Elevated fear composite — potential for sharp moves")
+        risks.append("\u26a0\ufe0f Elevated fear composite \u2014 potential for sharp moves")
     if rec >= 60:
-        risks.append(f"⚠️ Recession probability at {rec:.1f}% — monitor labor data")
+        risks.append(f"\u26a0\ufe0f Recession probability at {rec:.1f}% \u2014 monitor labor data")
     if np.isfinite(stlc) and stlc > 0.2:
-        risks.append("⚠️ Positive stock-bond correlation — diversification impaired")
+        risks.append("\u26a0\ufe0f Positive stock-bond correlation \u2014 diversification impaired")
     if vts.get("shape") == "BACKWARDATION":
-        risks.append("⚠️ Vol backwardation — near-term stress elevated")
+        risks.append("\u26a0\ufe0f Vol backwardation \u2014 near-term stress elevated")
     if neg:
-        risks.append("⚠️ Negative gamma — dealers may amplify moves")
+        risks.append("\u26a0\ufe0f Negative gamma \u2014 dealers may amplify moves")
     if not risks:
-        risks.append("✅ No major risk flags")
+        risks.append("\u2705 No major risk flags")
     risks = risks[:3]
 
-    # Signal bullets: VRP first, then Fear, then Recession, then GEX
-    priority = ["VRP", "Fear", "Recession", "GEX"]
+    # Signal bullets — GEX first (most reliable), then Fear, VRP, Recession
+    priority = ["GEX", "Fear", "VRP", "Recession", "Macro"]
     ordered  = []
     for key in priority:
         for item in drivers:
@@ -1568,7 +1597,7 @@ def _build_doc_style_thesis(
     for item in drivers:
         if item not in ordered:
             ordered.append(item)
-    ordered = ordered[:3]
+    ordered = ordered[:4]
 
     mult = 10.0 if gex_sym in ("SPY", "SPX") else 40.0 if gex_sym in ("QQQ", "NDX") else 1.0
 
@@ -1583,10 +1612,10 @@ def _build_doc_style_thesis(
             "GEX Flip":  flip  * mult,
             "GEX Upper": upper * mult,
             "GEX Lower": lower * mult,
-            "1σ Daily":  (b["d1lo"], b["d1hi"]),
-            "2σ Daily":  (b["d2lo"], b["d2hi"]),
-            "1σ Weekly": (b["w1lo"], b["w1hi"]),
-            "2σ Weekly": (b["w2lo"], b["w2hi"]),
+            "1\u03c3 Daily":  (b["d1lo"], b["d1hi"]),
+            "2\u03c3 Daily":  (b["d2lo"], b["d2hi"]),
+            "1\u03c3 Weekly": (b["w1lo"], b["w1hi"]),
+            "2\u03c3 Weekly": (b["w2lo"], b["w2hi"]),
         },
     }
 
@@ -2071,25 +2100,33 @@ def render_thesis_page():
     vc2=("#ef4444" if vrp["regime"]=="CHEAP" else "#10b981" if vrp["regime"]=="RICH" else "#94a3b8")
     tc=("#ef4444" if vts["shape"]=="BACKWARDATION" else "#10b981" if vts["shape"]=="CONTANGO" else "#f59e0b")
     trc=("#ef4444" if tail["regime"]=="ELEVATED" else "#f59e0b" if tail["regime"]=="MODERATE" else "#10b981")
+    _vrp_z_str = f"Z: {vrp['z']:+.2f} | Pct: {vrp['pct']:.0f}%" if np.isfinite(vrp.get('z', float('nan'))) else ""
     vol=(  _sh(2,"VOLATILITY REGIME")
-         +"<div style='display:grid;grid-template-columns:1fr 1fr;gap:6px 32px;'><div>"
+         +"<div style='display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px 20px;'><div>"
          +"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>VRP</div>"
-         +_kv("Value",f"{vrp['val']:+.2f} ({vrp['regime']})" if np.isfinite(vrp['val']) else "N/A",vc2)
-         +_kv("VIX (IV)",f"{vix_live:.1f}%")
-         +_kv("21D RV",f"{vrp['rv21']:.1f}%" if np.isfinite(vrp['rv21']) else "N/A")
+         +_kv("Value",f"{vrp['val']:+.4f}" if np.isfinite(vrp['val']) else "N/A",vc2)
+         +(f"<div style='font-size:11px;color:rgba(255,255,255,0.45);margin-bottom:3px;'>{_vrp_z_str}</div>" if _vrp_z_str else "")
+         +_kv("Regime",vrp['regime'],vc2)
+         +"<div style='margin-top:8px;font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>IV vs RV</div>"
+         +_kv("VIX",f"{vix_live:.2f}")
+         +_kv("21d RV",f"{vrp['rv21']:.2f}%" if np.isfinite(vrp['rv21']) else "N/A")
          +_kv("VRP Spread",f"{vrp['spread']:+.2f}" if np.isfinite(vrp['spread']) else "N/A",vc2)
-         +"<div style='margin-top:8px;font-size:10px;color:rgba(255,255,255,0.4);letter-spacing:0.1em;'>TERM STRUCTURE</div>"
+         +"</div><div>"
+         +"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>Term Structure</div>"
          +_kv("Shape",vts["shape"],tc)
          +_kv("VIX/VIX3M",f"{vts['ratio']:.3f}" if np.isfinite(vts.get('ratio',float('nan'))) else "N/A")
          +_kv("Carry",f"{vts['carry']:.2f}%" if np.isfinite(vts.get('carry',float('nan'))) else "N/A")
-         +"</div><div>"
-         +"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>TAIL RISK</div>"
-         +_kv("VVIX/VIX",f"{tail['ratio']:.2f} ({tail['regime']})" if np.isfinite(tail['ratio']) else "N/A",trc)
-         +"<div style='margin-top:8px;font-size:10px;color:rgba(255,255,255,0.4);letter-spacing:0.1em;'>ATM IV</div>"
-         +_kv("SPX ATM IV",
+         +"<div style='margin-top:8px;font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>SPX ATM IV</div>"
+         +_kv("",
               f"{atm_iv_chain:.1f}%" if (atm_iv_chain and gex_sym in ("SPY","SPX"))
               else f"{vix_live:.1f}% (VIX proxy)")
-         +_kv("NDX ATM IV",
+         +"</div><div>"
+         +"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>Tail Risk</div>"
+         +_kv("VVIX",f"{tail['vvix']:.1f}" if np.isfinite(tail['vvix']) else "N/A")
+         +_kv("VVIX/VIX",f"{tail['ratio']:.2f}" if np.isfinite(tail['ratio']) else "N/A",trc)
+         +_kv("Regime",tail['regime'],trc)
+         +"<div style='margin-top:8px;font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>NDX ATM IV</div>"
+         +_kv("",
               f"{atm_iv_chain:.1f}%" if (atm_iv_chain and gex_sym in ("QQQ","NDX"))
               else f"{q.get('VIX3M_last', vix_live * 0.92):.1f}% (VIX3M proxy)")
          +"</div></div>")

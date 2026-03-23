@@ -1567,8 +1567,9 @@ def _build_doc_style_thesis(
 
     if score <= -6:   bias, color = "BEARISH",         "#ef4444"
     elif score <= -3: bias, color = "LEANING BEARISH", "#f97316"
+    elif score <  0:  bias, color = "CAUTIOUS",         "#f59e0b"
     elif score == 0:  bias, color = "NEUTRAL",          "#94a3b8"
-    elif score <= 4:  bias, color = "LEANING BULLISH",  "#34d399"
+    elif score <= 3:  bias, color = "LEANING BULLISH",  "#34d399"
     else:             bias, color = "BULLISH",           "#10b981"
 
     # Risk flags

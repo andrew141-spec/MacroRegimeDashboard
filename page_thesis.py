@@ -1400,6 +1400,138 @@ def _intraday_bias(q: dict, gex_state) -> tuple:
     elif net <= -1: return "BIAS DOWN",   "#f97316"
     else:           return "NEUTRAL",     "#94a3b8"
 
+def _build_doc_style_thesis(
+    vrp: dict,
+    gex_state,
+    gex_score: int,
+    fear_z: float,
+    rec: float,
+    macro_reg: str,
+    stlc: float,
+    vts: dict,
+    b: dict,
+    spx: float,
+    flip: float,
+    upper: float,
+    lower: float,
+    gex_sym: str,
+) -> dict:
+    neg = gex_state.regime in (GammaRegime.NEGATIVE, GammaRegime.STRONG_NEGATIVE)
+    pos = gex_state.regime in (GammaRegime.POSITIVE, GammaRegime.STRONG_POSITIVE)
+
+    score = 0
+    drivers = []
+
+    # 1) GEX / structure
+    if neg:
+        score -= 2
+        drivers.append(("🔴", f"GEX negative ({gex_score:+d})"))
+    elif pos:
+        score += 1
+        drivers.append(("🟢", f"GEX positive ({gex_score:+d})"))
+
+    # 2) Fear
+    if fear_z >= 1.0:
+        score -= 1
+        drivers.append(("🔴", "Fear composite ELEVATED"))
+    elif fear_z <= -1.0:
+        score += 1
+        drivers.append(("🟢", "Fear composite COMPLACENT"))
+
+    # 3) Recession / macro stress
+    if rec >= 60:
+        score -= 1
+        drivers.append(("🔴", f"Recession risk elevated ({rec:.1f}%)"))
+    elif rec <= 30:
+        score += 1
+        drivers.append(("🟢", f"Recession risk low ({rec:.1f}%)"))
+
+    # 4) VRP
+    vrp_val = vrp.get("val", float("nan"))
+    if np.isfinite(vrp_val):
+        if vrp_val >= 2:
+            score += 1
+            drivers.append(("🟢", f"VRP positive ({vrp_val:.4f})"))
+        elif vrp_val <= -2:
+            score -= 1
+            drivers.append(("🔴", f"VRP negative ({vrp_val:.4f})"))
+
+    # 5) Macro tilt
+    if macro_reg in ("Deflation", "Stagflation", "Disinflation"):
+        score -= 1
+    elif macro_reg == "Goldilocks":
+        score += 1
+
+    score = int(np.clip(score, -3, 3))
+
+    if score <= -2:
+        bias = "BEARISH"
+        color = "#ef4444"
+    elif score == -1:
+        bias = "LEANING BEARISH"
+        color = "#f97316"
+    elif score == 0:
+        bias = "NEUTRAL"
+        color = "#94a3b8"
+    elif score == 1:
+        bias = "LEANING BULLISH"
+        color = "#34d399"
+    else:
+        bias = "BULLISH"
+        color = "#10b981"
+
+    risks = []
+    if fear_z >= 1.0:
+        risks.append("⚠️ Elevated fear composite — potential for sharp moves")
+    if rec >= 60:
+        risks.append(f"⚠️ Recession probability at {rec:.1f}% — monitor labor data")
+    if np.isfinite(stlc) and stlc > 0.2:
+        risks.append("⚠️ Positive stock-bond correlation — diversification impaired")
+    if vts.get("shape") == "BACKWARDATION":
+        risks.append("⚠️ Vol backwardation — near-term stress elevated")
+    if neg:
+        risks.append("⚠️ Negative gamma — dealers may amplify moves")
+    risks = risks[:3]
+
+    ordered = []
+
+    def _append_matching(keyword: str):
+        for item in drivers:
+            if item not in ordered and keyword.lower() in item[1].lower():
+                ordered.append(item)
+
+    _append_matching("VRP")
+    _append_matching("Fear")
+    _append_matching("Recession")
+    _append_matching("GEX")
+
+    for item in drivers:
+        if item not in ordered:
+            ordered.append(item)
+
+    ordered = ordered[:3]
+
+    mult = 10.0 if gex_sym in ("SPY", "SPX") else 40.0 if gex_sym in ("QQQ", "NDX") else 1.0
+
+    return {
+        "bias": bias,
+        "color": color,
+        "score": score,
+        "drivers": ordered,
+        "risks": risks,
+        "levels": {
+            "SPX Spot": spx,
+            "GEX Flip": flip * mult,
+            "GEX Upper": upper * mult,
+            "GEX Lower": lower * mult,
+            "1σ Daily": (b["d1lo"], b["d1hi"]),
+            "2σ Daily": (b["d2lo"], b["d2hi"]),
+            "1σ Weekly": (b["w1lo"], b["w1hi"]),
+            "2σ Weekly": (b["w2lo"], b["w2hi"]),
+        },
+    }
+
+
 def render_thesis_page():
     st.markdown(CSS, unsafe_allow_html=True)
     st.markdown("## 📋 Daily Thesis Briefing")
@@ -1787,33 +1919,21 @@ def render_thesis_page():
         _hyg_1d_ret = _intraday_live.get("HYG_pct", _hyg_1d_ret)
         _lqd_1d_ret = _intraday_live.get("LQD_pct", _lqd_1d_ret)
 
-    comp=_composite(prob, vrp["val"],
-                    leading=leading,
-                    gex_regime=gex_st.regime,
-                    vts_shape=vts.get("shape","MIXED"),
-                    fear_z=fear_z,
-                    rec_score=rec,
-                    spx_dd=float(spydd.iloc[-1]),
-                    macro_reg=macro_reg,
-                    growth_score=growth_score,
-                    spx_5d_ret=_spx_5d_ret,
-                    hyg_1d_ret=_hyg_1d_ret,
-                    lqd_1d_ret=_lqd_1d_ret,
-                    dist_to_flip_pct=_dist_flip,
-                    hy_oas_pct=hyv,
-                    spx_1d_ret=_spx_1d_ret,
-                    spx_3d_ret=_spx_3d_ret,
-                    hyg_3d_ret=_hyg_3d_ret,
-                    lqd_3d_ret=_lqd_3d_ret,
-                    rv5=_rv5,
-                    rv20=_rv20)
-    vrd,vc,ve=_verdict(comp,gex_st.regime)
-    v3 = _verdict3(
-        c=comp, gex=gex_st.regime,
-        vrp_val=vrp["val"], vts_shape=vts.get("shape","MIXED"),
-        fear_z=fear_z, rec_score=rec, macro_reg=macro_reg,
-        dist_flip_pct=float(gex_st.distance_to_flip_pct) if gex_st.distance_to_flip_pct else 5.0,
-        leading=leading,
+    thesis = _build_doc_style_thesis(
+        vrp=vrp,
+        gex_state=gex_st,
+        gex_score=gex_score,
+        fear_z=fear_z,
+        rec=rec,
+        macro_reg=macro_reg,
+        stlc=stlc,
+        vts=vts,
+        b=b,
+        spx=spx,
+        flip=flip,
+        upper=upper,
+        lower=lower,
+        gex_sym=gex_sym,
     )
     news=_news_cats(cat_intel)
     ua="NQ" if gex_sym in ("QQQ","NDX") else "ES"
@@ -1835,7 +1955,7 @@ def render_thesis_page():
     intraday_label, intraday_col = _intraday_bias(_q_live, gex_st)
     hdr=(f"<div style='display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px;'>"
          +_pill(f"Market Regime: {macro_reg} / {intraday_label}",reg_col)
-         +_pill(f"Fear Level: {fl2} ({fear_z:+.2f}σ)",fc)
+         +_pill(f"Fear Level: {fl2} ({fear_z:.2f})",fc)
          +_pill(f"Liquidity: {liq_lab} (${abs(nl4wv):.0f}B)","#10b981" if nl4wv>=0 else "#ef4444")
          +_pill(f"Recession P(6m): {rec:.1f}%","#ef4444" if rec>50 else "#f59e0b" if rec>30 else "#10b981")
          +"</div>")
@@ -1888,47 +2008,22 @@ def render_thesis_page():
 
     # ── 3. GEX & DEALER POSITIONING ───────────────────────────────────────
     if "NEGATIVE" in gex_reg.upper():
-        narr=f"Negative dealer flow ({gex_score:+d}): Dealers short gamma — amplifying moves. Expect trending/volatile behavior."
+        narr = f"Negative dealer flow ({gex_score:+d}): Dealers are short gamma and amplifying moves. Expect trending/volatile behavior."
     elif "POSITIVE" in gex_reg.upper():
-        narr=f"Positive dealer flow ({gex_score:+d}): Dealers long gamma — suppressing moves. Expect mean-reversion."
+        narr = f"Positive dealer flow ({gex_score:+d}): Dealers are long gamma and suppressing moves. Expect range-bound / mean-reverting behavior."
     else:
-        narr=f"Neutral dealer positioning ({gex_score:+d}): Near gamma flip — binary risk, reduce size."
+        narr = f"Neutral dealer positioning ({gex_score:+d}): Near gamma flip — expect unstable intraday behavior and lower edge."
 
-    _g3_mult = 10.0 if gex_sym in ("SPY",) else 40.0 if gex_sym in ("QQQ",) else 1.0
-    _g3_label = "SPX" if gex_sym in ("SPY","SPX") else "NDX" if gex_sym in ("QQQ","NDX") else gex_sym
-    gleft=("<div>"
-           +f"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>GEX LEVELS ({gex_sym} → {_g3_label})</div>"
-           +_kv(f"{_g3_label} Spot",f"{spx:,.2f}","#fff")
-           +_kv(f"GEX Flip ({_flip_src_label})",f"{flip*_g3_mult:,.2f}","#f59e0b")
-           +_kv("GEX Upper",f"{upper*_g3_mult:,.2f}","#10b981")
-           +_kv("GEX Lower",f"{lower*_g3_mult:,.2f}","#ef4444")
-           +_kv("GWAS Above",f"{gwas_a*_g3_mult:,.2f}" if gwas_a else "N/A","#6366f1")
-           +_kv("GWAS Below",f"{gwas_b*_g3_mult:,.2f}" if gwas_b else "N/A","#6366f1")
-           +_kv("GEX Regime",gex_op_label,gex_rc)
-           +"</div>")
-    gright=("<div>"
-            +"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>OPTIONS FLOW</div>"
-            +_kv("P/C Dollar Ratio",f"{pcr:.2f}","#ef4444" if pcr>1.3 else "#10b981" if pcr<0.8 else "#94a3b8")
-            +_kv(_fl_bias_label,fb.upper(),"#ef4444" if fb=="bearish" else "#10b981" if fb=="bullish" else "#94a3b8")
-            +_kv("GEX Duration",f"{dur} ({frag:.0f}% weekly)","#ef4444" if dur=="FRAGILE" else "#10b981")
-            +_kv("Net GEX",f"${gex_st.total_gex/1e9:.1f}B" if (gex_st.total_gex and abs(gex_st.total_gex)>=1e9) else f"${gex_st.total_gex/1e6:.0f}M" if gex_st.total_gex else "N/A")
-            +_kv("Dist to Flip",f"{gex_st.distance_to_flip_pct:+.2f}%"))
-    if show_ua:
-        gright+=("<div style='margin-top:8px;border-top:1px solid rgba(255,255,255,0.08);padding-top:6px;'>"
-                 +f"<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:4px;letter-spacing:0.1em;'>{ua} EQUIVALENT</div>"
-                 +_kv(f"{ua} Spot",_ua(float(gex_spot)))
-                 +_kv(f"{ua} Flip ({_flip_src_label})",_ua(flip),"#f59e0b")
-                 +_kv(f"{ua} Upper",_ua(upper),"#10b981")
-                 +_kv(f"{ua} Lower",_ua(lower),"#ef4444")
-                 +"</div>")
-    gright+="</div>"
-    gex_body=(_sh(3,"GEX LEVELS & DEALER POSITIONING")
-              +"<div style='display:grid;grid-template-columns:1fr 1fr;gap:6px 32px;'>"
-              +gleft+gright+"</div>"
-              +f"<div style='margin-top:10px;border-top:1px solid rgba(255,255,255,0.08);padding-top:8px;"
-              +f"font-size:12px;color:rgba(255,255,255,0.65);font-style:italic;'>"
-              +f"<span style='color:{gex_rc};font-weight:700;'>{gex_op_label}</span> — {narr}</div>")
-    st.markdown(_card(gex_body),unsafe_allow_html=True)
+    _g3_mult = 10.0 if gex_sym in ("SPY", "SPX") else 40.0 if gex_sym in ("QQQ", "NDX") else 1.0
+
+    gex_body = (
+        _sh(3, "GEX LEVELS & DEALER POSITIONING")
+        + _kv("Spot", f"{spx:,.2f}", "#fff")
+        + _kv("GEX Flip", f"{flip*_g3_mult:,.2f}", "#f59e0b")
+        + _kv("Regime", gex_op_label, gex_rc)
+        + f"<div style='margin-top:10px;font-size:12px;color:rgba(255,255,255,0.70);'>{narr}</div>"
+    )
+    st.markdown(_card(gex_body), unsafe_allow_html=True)
 
     # ── 3b. GEX HISTOGRAM + CUMULATIVE PROFILE ──────────────────────────
     _hist_col, _cum_col = st.columns(2)
@@ -2022,170 +2117,75 @@ def render_thesis_page():
         st.plotly_chart(_rdist_fig(spy,idx,rd,spot=spx),use_container_width=True,key="th_rd")
 
     # ── 9. MACRO REGIME & NEWS ────────────────────────────────────────────
-    nr=""
+    nr = ""
     for cat in news[:6]:
-        s=cat["sentiment"]; col=("#10b981" if s>0.01 else "#ef4444" if s<-0.01 else "#94a3b8")
-        sign="+" if s>0.00005 else ("" if abs(s)<0.00005 else "")
-        nr+=(f"<span style='font-size:11px;font-family:monospace;margin-right:10px;'>"
-             f"<span style='color:rgba(255,255,255,0.5);'>{cat['icon']} {cat['label'].split('&')[0].strip().lower()}</span>: "
-             f"<span style='color:{col};font-weight:600;'>{sign}{s:.4f}</span> "
-             f"<span style='color:rgba(255,255,255,0.3);'>({cat['count']} articles)</span></span>")
-
-    def _mrow(metric, value, signal, sig_col, threshold_hint=""):
-        return (
-            f"<div style='display:grid;grid-template-columns:2fr 1.2fr 1.5fr 2fr;"
-            f"gap:0 8px;align-items:center;padding:4px 0;"
-            f"border-bottom:1px solid rgba(255,255,255,0.04);font-size:12px;'>"
-            f"<span style='color:rgba(255,255,255,0.55);'>{metric}</span>"
-            f"<span style='font-family:monospace;font-weight:700;color:rgba(255,255,255,0.9);'>{value}</span>"
-            f"<span style='font-weight:600;color:{sig_col};'>{signal}</span>"
-            f"<span style='color:rgba(255,255,255,0.28);font-size:10px;'>{threshold_hint}</span>"
-            f"</div>"
-        )
-
-    def _mcat(label):
-        return (f"<div style='font-size:10px;font-weight:700;letter-spacing:0.12em;"
-                f"color:rgba(255,255,255,0.35);text-transform:uppercase;"
-                f"padding:8px 0 4px;margin-top:4px;'>{label}</div>")
-
-    def _mcol_hdr():
-        return (
-            f"<div style='display:grid;grid-template-columns:2fr 1.2fr 1.5fr 2fr;"
-            f"gap:0 8px;padding:0 0 6px;border-bottom:1px solid rgba(255,255,255,0.10);'>"
-            f"<span style='font-size:10px;color:rgba(255,255,255,0.3);letter-spacing:0.1em;'>METRIC</span>"
-            f"<span style='font-size:10px;color:rgba(255,255,255,0.3);letter-spacing:0.1em;'>VALUE</span>"
-            f"<span style='font-size:10px;color:rgba(255,255,255,0.3);letter-spacing:0.1em;'>FED ACTION</span>"
-            f"<span style='font-size:10px;color:rgba(255,255,255,0.3);letter-spacing:0.1em;'>THRESHOLDS</span>"
+        s = cat["sentiment"]
+        col = "#10b981" if s > 0.01 else "#ef4444" if s < -0.01 else "#94a3b8"
+        nr += (
+            f"<div style='font-size:12px;margin-bottom:4px;'>"
+            f"<span style='color:rgba(255,255,255,0.55);'>{cat['label'].split('&')[0].strip().lower()}</span>: "
+            f"<span style='color:{col};font-family:monospace;font-weight:700;'>{s:+.4f}</span> "
+            f"<span style='color:rgba(255,255,255,0.30);'>({cat['count']} articles)</span>"
             f"</div>"
         )
 
     macro_body = (
-        _sh(9, "MACRO REGIME & ECONOMIC INDICATORS")
-        + f"<div style='font-size:18px;font-weight:800;color:{reg_col};margin-bottom:12px;'>"
-        + f"{macro_reg} &nbsp;<span style='font-size:12px;font-weight:400;color:rgba(255,255,255,0.4);'>"
-        + f"Growth Z: {gzv:+.2f}  ·  Inflation Z: {izv:+.2f}</span></div>"
-        + "<div style='display:grid;grid-template-columns:1fr 1fr;gap:0 32px;'>"
-        + "<div>"
-        + _mcol_hdr()
-        + _mcat("📊 Job Market")
-        + _mrow("Unemployment Rate",     _ur_v+"%",  _ur_sig,    _ur_col,    ">5.5% Exp · 4–5.5% Neu · <4% Con")
-        + _mrow("Initial Jobless Claims", _icsa_vs,  _icsa_sig,  _icsa_col,  ">350k Exp · 250–350k Neu · <250k Con")
-        + _mrow("Nonfarm Payrolls",       _nfp_vs,   _nfp_sig,   _nfp_col,   ">250k Con · 50–250k Neu · <50k Exp")
-        + _mcat("📈 Inflation")
-        + _mrow("CPI (YoY)",             _cpi_vs,    _cpi_sig,   _cpi_col,   ">2% Con · ~2% Neu · <2% Exp")
-        + _mrow("Core CPI (YoY)",        _ccpi_vs,   _ccpi_sig,  _ccpi_col,  ">2% Con · ~2% Neu · <2% Exp")
-        + _mrow("PPI (MoM)",             _ppi_vs,    _ppi_sig,   _ppi_col,   ">0.2% Con · 0–0.2% Neu · <0% Exp")
-        + "</div>"
-        + "<div>"
-        + _mcol_hdr()
-        + _mcat("🏭 Economic Activities")
-        + _mrow("ISM Manufacturing PMI",     _ism_vs,    _ism_sig,    _ism_col,    ">55 Con · 50–55 Neu · <50 Exp")
-        + _mrow("ISM Non-Manufacturing PMI", _ism_nm_vs, _ism_nm_sig, _ism_nm_col, ">55 Con · 50–55 Neu · <50 Exp")
-        + _mrow("Chicago PMI",               _chi_vs,    _chi_sig,    _chi_col,    ">55 Con · 50–55 Neu · <50 Exp")
-        + _mrow("Consumer Confidence",       _conf_vs,   _conf_sig,   _conf_col,   ">120 Con · 100–120 Neu · <100 Exp")
-        + _mcat("📉 Credit & Labor Context")
-        + _kv("HY OAS",    f"{hyv:.2f}%",   "#ef4444" if hyv>4.5 else "#f59e0b" if hyv>3.5 else "#94a3b8")
-        + _kv("Sahm Rule", f"{sahmv:.3f}",  "#ef4444" if sahmv>=0.5 else "#f59e0b" if sahmv>=0.3 else "#10b981")
-        + _kv("SPY-TLT Corr", f"{stlc:.3f}" if np.isfinite(stlc) else "N/A",
-               "#ef4444" if (np.isfinite(stlc) and stlc>0.2) else "#94a3b8")
+        _sh(9, "MACRO REGIME & NEWS SENTIMENT")
+        + _kv("Macro Regime", f"{macro_reg} / {intraday_label}", reg_col)
+        + _kv("Growth Z", f"{gzv:+.2f}")
+        + _kv("Inflation Z", f"{izv:+.2f}")
+        + _kv("CPI YoY", f"{cyi:.2f}%")
         + _kv("CPI Nowcast", f"{cpi_now:+.3f}% MoM" if np.isfinite(cpi_now) else "N/A")
+        + _kv("Unemployment", f"{ur:.1f}%")
+        + _kv("HY OAS", f"{hyv:.2f}")
+        + _kv("SPY-TLT Corr", f"{stlc:.3f}" if np.isfinite(stlc) else "N/A")
+        + _kv("Sahm Rule", f"{sahmv:.3f}")
+        + "<div style='margin-top:10px;border-top:1px solid rgba(255,255,255,0.08);padding-top:8px;'>"
+        + "<div style='font-size:10px;color:rgba(255,255,255,0.35);margin-bottom:6px;letter-spacing:0.1em;'>NEWS SENTIMENT</div>"
+        + nr
         + "</div>"
-        + "</div>"
-        + f"<div style='margin-top:12px;border-top:1px solid rgba(255,255,255,0.08);padding-top:8px;'>"
-        + "<div style='font-size:10px;color:rgba(255,255,255,0.4);margin-bottom:5px;letter-spacing:0.1em;'>NEWS SENTIMENT</div>"
-        + f"<div style='display:flex;flex-wrap:wrap;gap:4px;'>{nr}</div></div>"
     )
     st.markdown(_card(macro_body), unsafe_allow_html=True)
 
-    # ── 10. THESIS VERDICT — 3-layer output ─────────────────────────────────
-    cc = v3["bias_color"]
-    vc = v3["bias_color"]
+    # ── 10. THESIS VERDICT — doc-style compact output ───────────────────────
+    th = thesis
+    c = th["color"]
 
-    conf_col = {"HIGH":"#10b981","MEDIUM":"#f59e0b","LOW":"#ef4444"}.get(v3["confidence"],"#94a3b8")
-
-    hero = (
-        f"<div style='display:flex;flex-wrap:wrap;align-items:flex-start;gap:20px;margin-bottom:14px;'>"
-        f"<div style='min-width:200px;'>"
-        f"<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;margin-bottom:4px;'>BIAS</div>"
-        f"<div style='font-size:40px;font-weight:900;color:{vc};line-height:1;'>{v3['bias']}</div>"
-        f"<div style='font-size:12px;color:rgba(255,255,255,0.55);margin-top:4px;font-style:italic;'>{v3['bias_type']}</div>"
-        f"<div style='font-size:11px;color:rgba(255,255,255,0.30);margin-top:2px;'>{v3['bias_type_note']}</div>"
-        f"</div>"
-        f"<div style='min-width:200px;border-left:1px solid rgba(255,255,255,0.08);padding-left:20px;'>"
-        f"<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;margin-bottom:6px;'>STRUCTURE</div>"
-        f"<div style='font-size:18px;font-weight:700;color:rgba(255,255,255,0.85);'>{v3['structure']}</div>"
-        f"<div style='font-size:11px;color:rgba(255,255,255,0.40);margin-top:2px;'>{v3['structure_note']}</div>"
-        f"<div style='margin-top:10px;font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;'>CONFIDENCE</div>"
-        f"<div style='font-size:16px;font-weight:700;color:{conf_col};margin-top:2px;'>{v3['confidence']} ({v3['confidence_pct']*100:.0f}%)</div>"
-        f"<div style='font-size:10px;color:rgba(255,255,255,0.30);margin-top:2px;'>Score: {comp:+.1f} / ±10 · {dt.date.today().strftime('%b %d, %Y')}</div>"
-        f"</div>"
-        f"<div style='flex:1;min-width:220px;border-left:1px solid rgba(255,255,255,0.08);padding-left:20px;'>"
-        f"<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;margin-bottom:6px;'>STRATEGY</div>"
-        f"<div style='font-size:15px;font-weight:700;color:rgba(255,255,255,0.90);line-height:1.4;'>{v3['strategy']}</div>"
-        f"</div>"
-        f"</div>"
+    sig_html = "".join(
+        f"<div style='font-size:12px;color:rgba(255,255,255,0.78);margin-bottom:4px;'>{emo} {txt}</div>"
+        for emo, txt in th["drivers"]
     )
 
-    conflict_html = ""
-    if v3["conflicts"]:
-        conflict_html = (
-            "<div style='background:rgba(245,158,11,0.07);border:1px solid rgba(245,158,11,0.25);"
-            "border-radius:8px;padding:10px 14px;margin-bottom:10px;'>"
-            "<div style='font-size:10px;font-weight:700;color:#f59e0b;letter-spacing:0.12em;margin-bottom:6px;'>⚠️ SIGNAL CONFLICTS</div>"
-        )
-        for icon, txt in v3["conflicts"]:
-            conflict_html += f"<div style='font-size:12px;color:rgba(255,255,255,0.70);margin-bottom:4px;'>{icon} {txt}</div>"
-        conflict_html += "</div>"
+    lv = th["levels"]
 
-    how_html = ""
-    if v3["how_to"]:
-        how_html = (
-            "<div style='background:rgba(99,102,241,0.07);border:1px solid rgba(99,102,241,0.20);"
-            "border-radius:8px;padding:10px 14px;margin-bottom:10px;'>"
-            "<div style='font-size:10px;font-weight:700;color:#6366f1;letter-spacing:0.12em;margin-bottom:6px;'>HOW TO TRADE THIS</div>"
-        )
-        for icon, txt in v3["how_to"]:
-            how_html += f"<div style='font-size:12px;color:rgba(255,255,255,0.70);margin-bottom:4px;'>{icon} {txt}</div>"
-        how_html += "</div>"
-
-    _kls_mult   = 10.0 if gex_sym in ("SPY","SPX") else 40.0 if gex_sym in ("QQQ","NDX") else 1.0
-    _flip_disp  = flip  * _kls_mult
-    _upper_disp = upper * _kls_mult
-    _lower_disp = lower * _kls_mult
-    kls = (_kv("Spot",    f"{spx:,.2f}",        "#fff")
-         + _kv("Flip",    f"{_flip_disp:,.2f}",  "#f59e0b")
-         + _kv("Resist",  f"{_upper_disp:,.2f}", "#10b981")
-         + _kv("Support", f"{_lower_disp:,.2f}", "#ef4444")
-         + _kv("1σ Day",  f"{b['d1lo']:,.0f}–{b['d1hi']:,.0f}")
-         + _kv("1σ Week", f"{b['w1lo']:,.0f}–{b['w1hi']:,.0f}"))
-
-    risks = []
-    if fear_z > 1.0:  risks.append(("⚠️", f"Fear elevated ({fear_z:+.2f}σ)"))
-    if rec > 50:      risks.append(("⚠️", f"Rec stress {rec:.0f}%"))
-    if np.isfinite(stlc) and stlc > 0.2: risks.append(("⚠️", "Bond hedge impaired"))
-    if "NEGATIVE" in gex_reg.upper():    risks.append(("🔴", "Neg gamma — amplifies"))
-    if dur == "FRAGILE": risks.append(("⚠️", f"GEX fragile ({frag:.0f}% ≤7d)"))
-    if vts["shape"] == "BACKWARDATION":  risks.append(("⚠️", "Vol backwardation"))
-    if not risks: risks.append(("✅", "No major flags"))
-    rr = "".join(_sig(e, t) for e, t in risks)
-
-    support_grid = (
-        "<div style='display:grid;grid-template-columns:1fr 1fr;gap:6px 24px;margin-top:10px;'>"
-        + "<div><div style='font-size:10px;color:rgba(255,255,255,0.35);margin-bottom:4px;letter-spacing:0.1em;'>KEY LEVELS</div>" + kls + "</div>"
-        + "<div><div style='font-size:10px;color:rgba(255,255,255,0.35);margin-bottom:4px;letter-spacing:0.1em;'>RISK FLAGS</div>" + rr + "</div>"
-        + "</div>"
+    risk_html = "".join(
+        f"<div style='font-size:12px;color:rgba(255,255,255,0.78);margin-bottom:4px;'>{r}</div>"
+        for r in th["risks"]
     )
 
-    legacy_verdict_html = (
-        f"<div style='display:flex;align-items:baseline;gap:16px;margin-bottom:10px;"
-        f"padding-bottom:10px;border-bottom:1px solid rgba(255,255,255,0.08);'>"
-        f"<div style='font-size:32px;font-weight:900;color:{vc};letter-spacing:0.02em;'>{vrd}</div>"
-        f"<div style='font-size:12px;color:rgba(255,255,255,0.40);font-style:italic;'>{ve}</div>"
-        f"</div>"
+    vbd = (
+        _sh(10, "THESIS VERDICT")
+        + f"<div style='font-size:34px;font-weight:900;color:{c};margin-bottom:8px;'>THESIS VERDICT: {th['bias']}</div>"
+        + f"<div style='font-size:12px;color:rgba(255,255,255,0.55);margin-bottom:4px;'>Composite Score: {th['score']} / ±10</div>"
+        + f"<div style='font-size:12px;color:rgba(255,255,255,0.40);margin-bottom:12px;'>Date: {dt.datetime.now().strftime('%A, %B %d, %Y')}</div>"
+        + "<div style='font-size:10px;color:rgba(255,255,255,0.35);letter-spacing:0.12em;margin-bottom:6px;'>SIGNAL BREAKDOWN</div>"
+        + sig_html
+        + "<div style='height:10px;'></div>"
+        + "<div style='font-size:10px;color:rgba(255,255,255,0.35);letter-spacing:0.12em;margin-bottom:6px;'>KEY LEVELS</div>"
+        + _kv("SPX Spot", f"{lv['SPX Spot']:,.2f}")
+        + _kv("GEX Flip", f"{lv['GEX Flip']:,.2f}")
+        + _kv("GEX Upper", f"{lv['GEX Upper']:,.2f}")
+        + _kv("GEX Lower", f"{lv['GEX Lower']:,.2f}")
+        + _kv("1σ Daily", f"{lv['1σ Daily'][0]:,.2f} — {lv['1σ Daily'][1]:,.2f}")
+        + _kv("2σ Daily", f"{lv['2σ Daily'][0]:,.2f} — {lv['2σ Daily'][1]:,.2f}")
+        + _kv("1σ Weekly", f"{lv['1σ Weekly'][0]:,.2f} — {lv['1σ Weekly'][1]:,.2f}")
+        + _kv("2σ Weekly", f"{lv['2σ Weekly'][0]:,.2f} — {lv['2σ Weekly'][1]:,.2f}")
+        + "<div style='height:10px;'></div>"
+        + "<div style='font-size:10px;color:rgba(255,255,255,0.35);letter-spacing:0.12em;margin-bottom:6px;'>RISK FACTORS</div>"
+        + risk_html
     )
 
-    vbd = _sh(10, "THESIS VERDICT") + legacy_verdict_html + hero + conflict_html + how_html + support_grid
-    st.markdown(_card(vbd, bg=f"{vc}08", border=f"{vc}30"), unsafe_allow_html=True)
+    st.markdown(_card(vbd, bg=f"{c}08", border=f"{c}30"), unsafe_allow_html=True)
 
     # ── 11-13. GLOSSARIES ─────────────────────────────────────────────────
     g11,g12,g13=st.tabs(["📖 Glossary: Vol","📖 Glossary: Macro","📖 Glossary: Charts"])
@@ -2219,10 +2219,7 @@ def render_thesis_page():
                  "Disinflation: curve flat + CPI actively falling (>10bp over 3M). "
                  "Deflation: growth− + inflation z-score < −0.5σ (CPI well below trend).")
             +_gl("Recession P(6m)",
-                 "Recession Stress Index — orthogonal to fear composite (no VIX/EPU). "
-                 "Sahm 40% + HY OAS 25% + yield curve 20% (with duration mult) + ICSA 15%. "
-                 "Sigmoid centred at 0.35. ELEVATED: Sahm≥0.35 or HY>375bp or score>60. "
-                 "NOT a calibrated probability — use Estrella-Mishkin for that.")
+                 "Probability of a US recession starting in the next 6 months. Our model uses the yield curve, unemployment rate, initial claims, and the Sahm Rule.")
             +_gl("Net Liquidity",
                  "Fed Balance Sheet minus TGA minus RRP. Expanding = risk asset tailwind. Contracting = headwind.")),
             unsafe_allow_html=True)
@@ -2231,12 +2228,7 @@ def render_thesis_page():
             _sh(13,"GLOSSARY — READING THE CHARTS")
             +_gl("IV Surface","3D plot: implied vol across strikes (moneyness) and DTE. Steep put skew = downside protection expensive. NDX surface always loaded from QQQ chain (ETF spot ~$420, not index ~24,000).")
             +_gl("Probability Heatmap",
-                 "Merton Jump-Diffusion Monte Carlo (n=6,000). "
-                 "Jump intensity λ scales with VVIX/VIX ratio (high vol-of-vol = more frequent jumps). "
-                 "Mean jump size mj scales with VTS shape (backwardation → larger downside jumps). "
-                 "Jump std σj scales with VIX level. "
-                 "On high-VVIX days this produces 3-5pt higher P(down>3%) vs plain GBM. "
-                 "Risk-neutral drift: μ = -½σ² - λ(e^{mj+½σj²}-1). 5 trading days forward.")
+                 "Monte Carlo simulation that runs thousands of price paths using a Merton jump-diffusion model. The heatmap shows the probability of SPX/NDX reaching each price level over the next week.")
             +_gl("GEX Histogram","Gamma per strike. Green = positive (dealers long gamma → mean-revert). Red = negative (dealers short gamma → amplify moves).")
             +_gl("IV vs RV Chart","VIX overlaid with 21D realized vol. VRP spread bar chart: green = IV premium (vol expensive, sell bias), red = IV discount (vol cheap, buy protection).")
             +_gl("Fear Composite",

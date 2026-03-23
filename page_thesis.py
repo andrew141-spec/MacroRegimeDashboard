@@ -840,55 +840,75 @@ def compute_recession_probability(
     initial_claims_1y_avg: float,
 ) -> float:
     """
-    Recession probability 0–100% driven by exactly four inputs:
+    Calibrated to match reference doc behaviour:
+      - flat/low-positive curve (e.g. 46bp) still contributes meaningfully
+      - Sahm near 0.25–0.27 already scores (pre-trigger deterioration)
+      - unemployment in the mid-4s contributes
+      - claims deterioration adds confirmation
 
-      1. Yield curve (2s10s in bp)   — early warning, not timing
-      2. Sahm Rule                   — best real-time recession trigger (weight 3.0)
-      3. Initial claims              — labor deterioration / acceleration
-      4. Unemployment level          — lagging confirmation
+    Reference calibration target:
+      2s10s ≈ 46bp  → +1.0
+      Sahm  ≈ 0.267 → +1.5
+      UR    ≈ 4.4%  → +0.5
+      claims neutral → +0.0
+      total score = 3.0
+      sigmoid(3.0 - 2.25) ≈ 67.9%  ✓ matches reference doc 67.8%
 
-    The Sahm Rule is computed here directly from the unemployment series
-    so the model matches the glossary exactly:
-      sahm = 3-month avg UR - 12-month min UR
-      >= 0.5 → strong recession signal
-      >= 0.3 → moderate signal
-
-    Sigmoid centred at +2 (score=2 → ~50%, score=5 → ~95%, score=0 → ~12%).
+    Returns 1–99 (%).
     """
     score = 0.0
 
-    # 1. Yield curve (bp) — inversion = pressure, not yet recession
+    # 1. Yield curve (2s10s, bp)
     if np.isfinite(yc_2s10s):
         if yc_2s10s < 0:
-            score += 1.5    # inverted: meaningful early warning
+            score += 1.5    # inverted: strong early warning
         elif yc_2s10s < 50:
-            score += 0.5    # flat: mild pressure
+            score += 1.0    # flat: meaningful pressure (was 0.5 — now calibrated)
+        elif yc_2s10s < 100:
+            score += 0.4    # modest positive but still below normal
 
-    # 2. Sahm Rule — MOST IMPORTANT (weight 3.0 at trigger)
+    # 2. Sahm Rule — MOST IMPORTANT
+    # sahm = 3-month avg UR - 12-month min UR
     if np.isfinite(unemployment_3m_avg) and np.isfinite(unemployment_12m_min):
         sahm = unemployment_3m_avg - unemployment_12m_min
-        if sahm >= 0.5:
-            score += 3.0    # classic Sahm trigger: recession typically already started
-        elif sahm >= 0.3:
-            score += 1.5    # approaching trigger: deterioration underway
+        if sahm >= 0.50:
+            score += 3.0    # classic trigger: recession likely already started
+        elif sahm >= 0.40:
+            score += 2.3
+        elif sahm >= 0.30:
+            score += 1.8
+        elif sahm >= 0.25:
+            score += 1.5    # pre-trigger deterioration — already matters
+        elif sahm >= 0.20:
+            score += 1.0
 
-    # 3. Initial claims — weekly labor signal, leads payrolls by 4–6 weeks
+    # 3. Initial claims vs 1-year average
     if np.isfinite(initial_claims) and np.isfinite(initial_claims_1y_avg) and initial_claims_1y_avg > 0:
         claims_ratio = initial_claims / initial_claims_1y_avg
-        if claims_ratio > 1.2:
+        if claims_ratio >= 1.20:
             score += 1.5    # 20%+ above 1Y avg: significant deterioration
-        elif claims_ratio > 1.1:
-            score += 0.75   # 10–20% above: early deterioration
+        elif claims_ratio >= 1.10:
+            score += 1.0
+        elif claims_ratio >= 1.05:
+            score += 0.5    # early softening
 
-    # 4. Unemployment level — lagging but confirms regime
+    # 4. Unemployment level
     if np.isfinite(unemployment):
         if unemployment >= 5.0:
-            score += 1.0    # clearly elevated
-        elif unemployment >= 4.5:
-            score += 0.5    # moderately elevated
+            score += 1.0
+        elif unemployment >= 4.7:
+            score += 0.75
+        elif unemployment >= 4.4:
+            score += 0.5    # mid-4s now contributes (was 4.5 threshold)
+        elif unemployment >= 4.2:
+            score += 0.25
 
-    # Sigmoid centred at 2: score=2→50%, score=3.5→82%, score=5→95%, score=0→12%
-    prob = 100.0 / (1.0 + np.exp(-score + 2))
+    # Sigmoid centred at 2.25:
+    # score=3.0 → ~67.9%  (reference doc: 67.8% with 46bp / Sahm 0.267 / UR 4.4%)
+    # score=3.5 → ~78%
+    # score=5.0 → ~95%
+    # score=0.0 → ~7%
+    prob = 100.0 / (1.0 + np.exp(-(score - 2.25)))
     return float(np.clip(prob, 1.0, 99.0))
 
 # ══════════════════════════════════════════════════════════════════════════════

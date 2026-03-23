@@ -93,15 +93,41 @@ def _quotes() -> Dict:
                 pass
     return out
 
-def _vrp_full(vix: float, spy: pd.Series, idx) -> Dict:
-    sa   = _to_1d(spy).reindex(idx).ffill()
-    rets = sa.pct_change()
-    rv21 = rets.rolling(21, min_periods=10).std() * np.sqrt(252) * 100
-    vrp  = vix - rv21
-    val  = _sl(vrp); z = _sl(zscore(vrp)); pct = current_pct_rank(vrp, 252)
-    rv21v = _sl(rv21)
-    reg  = ("RICH" if val>2 else "CHEAP" if val<-1 else "FAIR") if np.isfinite(val) else "N/A"
-    return {"val":val,"z":z,"pct":float(pct),"regime":reg,"rv21":rv21v,"spread":val}
+def _vrp_full(vix: float, spy: pd.Series, idx, vix_series: pd.Series = None) -> Dict:
+    """
+    VRP calculation — two distinct quantities:
+
+    val    = VRP from the HISTORICAL vix_s series minus rolling RV21.
+             Used for z-score and percentile rank because z-scoring requires
+             a time series, not a single live quote. This is what tells you
+             whether today's VRP is high or low relative to history.
+
+    spread = vix_live - rv21v: the LIVE VRP spread using today's VIX quote.
+             This is the raw carry number a vol seller actually captures today.
+             Displayed separately because it can differ significantly from val
+             when VIX has moved sharply intraday vs the prior close.
+    """
+    sa    = _to_1d(spy).reindex(idx).ffill()
+    rets  = sa.pct_change()
+    rv21  = rets.rolling(21, min_periods=10).std() * np.sqrt(252) * 100
+    rv21v = _sl(rv21)  # last realized vol value
+
+    # Historical VRP series: use vix_series if provided, else fall back to scalar broadcast
+    if vix_series is not None:
+        va   = _to_1d(vix_series).reindex(idx).ffill()
+        vrp_series = va - rv21
+    else:
+        vrp_series = vix - rv21   # scalar broadcast — less ideal for z-scoring
+
+    val = _sl(vrp_series)
+    z   = _sl(zscore(vrp_series))
+    pct = current_pct_rank(vrp_series, 252)
+
+    # Live spread: today's VIX minus last realized vol
+    spread = (vix - rv21v) if np.isfinite(rv21v) else val
+
+    reg = ("RICH" if val > 2 else "CHEAP" if val < -1 else "FAIR") if np.isfinite(val) else "N/A"
+    return {"val": val, "z": z, "pct": float(pct), "regime": reg, "rv21": rv21v, "spread": spread}
 
 def _vts(q: Dict) -> Dict:
     v=q.get("VIX_last",float("nan")); v3=q.get("VIX3M_last",float("nan"))
@@ -1764,7 +1790,7 @@ def render_thesis_page():
     s2s10v=(tnxv-irxv)*100 if (np.isfinite(tnxv) and np.isfinite(irxv)) else crl
     vix_live=q.get("VIX_last",vl)
     vxn_live=q.get("VXN_last", vix_live * 1.10)
-    vrp=_vrp_full(vix_live,spy,idx)
+    vrp=_vrp_full(vix_live, spy, idx, vix_series=vix_s)
     vts=_vts(q); tail=_tail(q)
     rd=_retdist(spy,idx,spx)
     b=_bands(spx,vix_live)
@@ -2156,7 +2182,7 @@ def render_thesis_page():
     vbd = (
         _sh(10, "THESIS VERDICT")
         + f"<div style='font-size:36px;font-weight:900;color:{c};margin-bottom:6px;'>{th['bias']}</div>"
-        + f"<div style='font-size:12px;color:rgba(255,255,255,0.50);margin-bottom:4px;'>Composite Score: {th['score']*3:+d} / ±10  ·  {dt.datetime.now().strftime('%A, %B %d, %Y')}</div>"
+        + f"<div style='font-size:12px;color:rgba(255,255,255,0.50);margin-bottom:4px;'>Composite Score: {th['score']:+d} / ±10  ·  {dt.datetime.now().strftime('%A, %B %d, %Y')}</div>"
         + "<div style='height:14px;'></div>"
         + "<div style='font-size:10px;color:rgba(255,255,255,0.35);letter-spacing:0.12em;text-transform:uppercase;margin-bottom:8px;'>Signal Breakdown</div>"
         + sig_html
@@ -2188,55 +2214,83 @@ def render_thesis_page():
         st.markdown(_card(
             _sh(11,"GLOSSARY — WHAT EVERYTHING MEANS")
             +_gl("VRP (Variance Risk Premium)",
-                 "Difference between implied vol (VIX) and realized vol. Positive VRP = options expensive vs actual moves. "
-                 "Traders sell vol when VRP is high. Negative VRP = market underpricing realized moves → buy protection.")
+                 "The difference between implied volatility (what the market expects) and realized volatility "
+                 "(what actually happened). Computed as VIX minus 21-day realized vol. "
+                 "Positive VRP = options are overpriced relative to actual moves — traders sell vol when VRP is high. "
+                 "Negative VRP = vol is cheap relative to actual moves — consider buying protection.")
             +_gl("GEX (Gamma Exposure)",
-                 "Total gamma held by options dealers. Positive GEX = dealers long gamma → buy dips, sell rips → suppresses vol. "
-                 "Negative GEX = dealers short gamma → amplify moves. GEX Flip = strike where dealer gamma flips sign.")
+                 "Total gamma held by options dealers. "
+                 "Positive GEX = dealers are long gamma — they buy dips and sell rips, suppressing volatility and keeping price in a range. "
+                 "Negative GEX = dealers are short gamma — they sell dips and buy rips, amplifying moves. "
+                 "GEX Flip = the strike price where net dealer gamma crosses zero (flips from positive to negative).")
             +_gl("VIX Term Structure",
-                 "Curve of implied vol across expirations. Contango (VIX3M > VIX) = normal. "
-                 "Backwardation (VIX > VIX3M) = near-term stress elevated, hedging demand high.")
+                 "The curve of VIX at different expirations. "
+                 "Contango = VIX3M > VIX (longer-dated higher than near-term) — normal, calm market. "
+                 "Backwardation = VIX > VIX3M (near-term higher than longer-dated) — fear is elevated, hedging demand is high. "
+                 "Backwardation is a warning sign; vol tends to mean-revert within 1–3 weeks.")
             +_gl("Tail Risk (VVIX/VIX)",
-                 "VVIX = vol of VIX (vol-of-vol). High ratio = market pricing sharp VIX spikes = crash insurance expensive. "
+                 "VVIX measures the volatility of VIX itself — the vol of vol. "
+                 "A high VVIX/VIX ratio means the market is pricing sharp VIX spikes — tail risk is elevated. "
+                 "Think of it as the market's crash insurance premium. "
                  "Ratio > 5.5 = elevated. < 4.5 = low.")),unsafe_allow_html=True)
     with g12:
         st.markdown(_card(
             _sh(12,"GLOSSARY — MACRO & PROBABILITY")
             +_gl("σ (Sigma / Standard Deviation)",
-                 "1σ ≈ 68% of expected moves, 2σ ≈ 95%, 3σ ≈ 99.7%. Daily σ of 1% → ±1% range 68% of the time.")
+                 "A measure of how spread out returns are. "
+                 "1σ captures ~68% of expected moves, 2σ captures ~95%, 3σ captures ~99.7%. "
+                 "If SPX has a daily σ of 1%, a 1σ band means the market stays within ±1% about 68% of the time.")
             +_gl("Skewness & Kurtosis",
-                 "Skewness = asymmetry. Negative skew = more large down moves. "
-                 "High kurtosis = fat tails (extreme moves more common than normal distribution predicts).")
-            +_gl("Market Regime",
-                 "2×2 framework on rolling z-scores: Growth (2s10s) × Inflation (core CPI YoY). "
-                 "Overheating: curve steep + CPI hot. Goldilocks: curve steep + CPI cooling. "
-                 "Stagflation: curve flat/inverted + CPI still hot. "
-                 "Disinflation: curve flat + CPI actively falling (>10bp over 3M). "
-                 "Deflation: growth− + inflation z-score < −0.5σ (CPI well below trend).")
+                 "Skewness measures asymmetry — negative skew means more big down moves than up. "
+                 "Kurtosis measures fat tails — high kurtosis means extreme moves happen more often than a normal distribution predicts. "
+                 "Markets almost always have negative skew and positive excess kurtosis.")
             +_gl("Recession P(6m)",
-                 "Probability of a US recession starting in the next 6 months. Built from the yield curve, unemployment, initial claims, and the Sahm Rule.")
+                 "Probability of a US recession starting in the next 6 months. "
+                 "Built from the yield curve (2s10s spread), unemployment rate, initial jobless claims, and the Sahm Rule. "
+                 "Sahm Rule: if the 3-month average unemployment rate rises 0.5% above its 12-month low, "
+                 "a recession has typically already begun. The dashboard loads the Sahm Rule series directly from FRED.")
             +_gl("Net Liquidity",
-                 "Fed Balance Sheet minus TGA minus RRP. Expanding = risk asset tailwind. Contracting = headwind.")),
+                 "Fed Balance Sheet (WALCL) minus TGA (Treasury's cash balance) minus RRP (overnight reverse repos). "
+                 "When net liquidity expands, more money flows into risk assets. "
+                 "When it contracts, less money is available — headwind for stocks. "
+                 "One of the strongest macro drivers of equity markets over 4–12 week horizons.")),
             unsafe_allow_html=True)
     with g13:
         st.markdown(_card(
             _sh(13,"GLOSSARY — READING THE CHARTS")
-            +_gl("IV Surface","3D plot: implied vol across strikes (moneyness) and DTE. Steep put skew = downside protection expensive. NDX surface always loaded from QQQ chain (ETF spot ~$420, not index ~24,000).")
+            +_gl("IV Surface",
+                 "A 3D plot showing implied volatility across strikes (moneyness) and time (DTE). "
+                 "The smile/skew shape reveals how the market prices risk. "
+                 "Steep put skew = downside protection is expensive. "
+                 "The surface flattens in calm markets and steepens before events or in stressed regimes. "
+                 "NDX surface is always built from QQQ chain (ETF spot ~$420, not the index level ~24,000).")
             +_gl("Probability Heatmap",
-                 "Monte Carlo simulation using a Merton jump-diffusion model. Shows the probability of SPX/NDX reaching different price levels over the next week.")
-            +_gl("GEX Histogram","Gamma per strike. Green = positive (dealers long gamma → mean-revert). Red = negative (dealers short gamma → amplify moves).")
-            +_gl("IV vs RV Chart","VIX overlaid with 21D realized vol. VRP spread bar chart: green = IV premium (vol expensive, sell bias), red = IV discount (vol cheap, buy protection).")
+                 "Monte Carlo simulation that runs thousands of price paths using a Merton jump-diffusion model "
+                 "(normal GBM moves plus random crash-like jumps calibrated to VVIX/VIX). "
+                 "The heatmap shows the probability of SPX/NDX reaching each price level over the next week. "
+                 "Brighter colors = higher probability. Jump intensity scales with the VVIX/VIX ratio.")
+            +_gl("GEX Histogram",
+                 "Shows gamma exposure at each strike price. "
+                 "Green bars = positive gamma (dealers stabilize price near that strike). "
+                 "Red bars = negative gamma (dealers amplify moves away from that strike). "
+                 "The largest green bars act as support/resistance — price tends to get pinned near high positive gamma strikes.")
+            +_gl("IV vs RV Chart",
+                 "Top panel: VIX (implied vol) overlaid with 21-day realized vol. "
+                 "When VIX is above RV, options are relatively expensive — good for vol sellers. "
+                 "Bottom panel: the VRP spread bar chart. "
+                 "Green = IV > RV (vol premium, sell bias). Red = IV < RV (vol discount, consider protection).")
             +_gl("Fear Composite",
-                 "4-component rolling z-score: VIX (35%) + HY OAS (25%) + NFCI (25%) + EPU (15%). "
-                 "Each component is z-scored against its own 252-day rolling window — NOT the 2Y global mean. "
-                 "This means a VIX of 40 today reads as elevated vs the past 12 months, even if VIX has been "
-                 "high for months (the old global mean would absorb the spike and understate fear). "
-                 ">+1.0σ = ELEVATED. <−1.0σ = COMPLACENT. Mapped 0–100 via logistic.")
+                 "Combines four inputs into a single fear score: "
+                 "VIX (35%), HY OAS — high-yield credit spreads (25%), NFCI — financial conditions (25%), "
+                 "and EPU — economic policy uncertainty (15%). "
+                 "Each component is z-scored against its own 252-day rolling window, "
+                 "so a VIX spike reads as elevated relative to the past 12 months regardless of the long-run mean. "
+                 ">+1.0σ = ELEVATED. <−1.0σ = COMPLACENT.")
             +_gl("Composite Score",
-                 "Driver-first thesis engine. Score is an integer −3 to +3. "
+                 "Driver-first thesis engine. Score is an integer −3 to +3 displayed as-is (e.g. −3 / ±10 means maximum bearish). "
                  "Inputs: GEX regime (structure), VRP (vol carry), Fear composite (sentiment), "
                  "Recession risk (macro stress), and Macro regime (backdrop). "
-                 "Signal bullets show the top 3 drivers as cause → effect statements.")),
+                 "Signal bullets show the top 3 drivers as plain-English cause → effect statements.")),
             unsafe_allow_html=True)
 
     st.markdown(

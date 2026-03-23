@@ -159,22 +159,17 @@ def _merton_calibrate(vix: float, vvix: float,
 def _forward_prob_fig(
     spx: float, vix: float,
     ndx: float, vxn: float,
-    spy: pd.Series, qqq: pd.Series,
-    idx, days: int = 5, n: int = 6000,
+    rv_spx: float, rv_ndx: float,
+    days: int = 5, n: int = 6000,
     vvix: float = float("nan"),
     vts_shape: str = "MIXED",
 ) -> go.Figure:
+    # spy/qqq/idx replaced with pre-computed rv_spx/rv_ndx floats so this
+    # function only receives hashable args and @st.cache_data works correctly.
     from plotly.subplots import make_subplots
     from scipy.stats import norm as _norm
 
     rng = np.random.default_rng()
-
-    def _rv20(series):
-        s = _to_1d(series).reindex(idx).ffill()
-        return float(s.pct_change().rolling(20, min_periods=10).std().dropna().iloc[-1] * np.sqrt(252) * 100)
-
-    rv_spx = _rv20(spy)
-    rv_ndx = _rv20(qqq)
 
     def _sim_paths(spot, ann_vol, vvix_val, vts_s, days, n):
         # OPT: generate ALL random numbers in two bulk calls (n*days each)
@@ -2079,11 +2074,19 @@ def render_thesis_page():
     st.markdown("<div style='font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);letter-spacing:0.15em;text-transform:uppercase;margin-bottom:4px;'>4. SPX / NDX FORWARD PROBABILITY HEATMAP — 1-WEEK FORECAST</div>",unsafe_allow_html=True)
     st.caption("Merton Jump-Diffusion Monte Carlo (n=6,000) · VIX/VXN implied vol · VVIX-calibrated jump intensity · Risk-neutral drift · 5 trading days")
     with st.spinner("Running simulations…"):
+        # Pre-compute rv floats here (uses Series) so the cached fig function
+        # only receives hashable scalar args — fixes UnhashableParamError.
+        def _rv20_scalar(series):
+            s = _to_1d(series).reindex(idx).ffill()
+            v = s.pct_change().rolling(20, min_periods=10).std().dropna()
+            return round(float(v.iloc[-1] * np.sqrt(252) * 100), 4) if len(v) else 15.0
+        _rv_spx = _rv20_scalar(spy)
+        _rv_ndx = _rv20_scalar(qqq)
         st.plotly_chart(
             _forward_prob_fig(
                 spx=round(spx, 2), vix=round(vix_live, 2),
                 ndx=round(ndx, 2), vxn=round(vxn_live, 2),
-                spy=spy, qqq=qqq, idx=idx,
+                rv_spx=_rv_spx, rv_ndx=_rv_ndx,
                 vvix=round(float(tail["vvix"]), 2) if np.isfinite(tail["vvix"]) else float("nan"),
                 vts_shape=vts.get("shape", "MIXED"),
             ),

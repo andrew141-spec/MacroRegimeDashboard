@@ -100,11 +100,19 @@ def _vrp_full(vix: float, spy: pd.Series, idx, vix_series: pd.Series = None) -> 
       RICH  >= 4  → options clearly expensive vs realized; sell-vol bias
       FAIR   0–4  → fair carry
       CHEAP <= 0  → implied not even above realized; consider protection
+
+    RV note: drop ffill'd duplicate rows before computing returns so that
+    weekends/holidays don't inject zero returns that suppress realized vol.
     """
     sa   = _to_1d(spy).reindex(idx).ffill()
-    rets = sa.pct_change()
+    # Drop consecutive duplicates (ffill'd non-trading days) so we only use
+    # actual price changes in the realized vol calculation.
+    sa_dedup = sa[sa != sa.shift()]
+    rets = sa_dedup.pct_change()
 
     rv21 = rets.rolling(21, min_periods=10).std() * np.sqrt(252) * 100
+    # Reindex back to full daily index so downstream code works unchanged
+    rv21 = rv21.reindex(idx).ffill()
     vrp_series = vix - rv21
 
     val   = _sl(vrp_series)
@@ -1472,51 +1480,67 @@ def _build_doc_style_thesis(
 
     # 1) GEX / structure — most reliable, mechanical
     if neg:
-        score -= 2
+        score -= 4
         drivers.append(("🔴", f"GEX negative ({gex_score:+d})"))
     elif pos:
-        score += 1
+        score += 2
         drivers.append(("🟢", f"GEX positive ({gex_score:+d})"))
 
     # 2) VRP — is vol cheap or expensive vs realized?
     vrp_val = vrp.get("val", float("nan"))
     if np.isfinite(vrp_val):
-        if vrp_val >= 2:
+        if vrp_val >= 4:
+            score += 2
+            drivers.append(("🟢", f"VRP rich (+{vrp_val:.2f}) — sell vol"))
+        elif vrp_val >= 2:
             score += 1
-            drivers.append(("🟢", f"VRP positive ({vrp_val:.4f})"))
+            drivers.append(("🟢", f"VRP positive ({vrp_val:.2f})"))
+        elif vrp_val <= -4:
+            score -= 2
+            drivers.append(("🔴", f"VRP very cheap ({vrp_val:.2f}) — buy protection"))
         elif vrp_val <= -2:
             score -= 1
-            drivers.append(("🔴", f"VRP negative ({vrp_val:.4f})"))
+            drivers.append(("🔴", f"VRP negative ({vrp_val:.2f})"))
 
     # 3) Fear composite — > 1.0 = elevated, < -1.0 = complacent
-    if fear_z >= 1.0:
+    if fear_z >= 2.0:
+        score -= 2
+        drivers.append(("🔴", f"Fear composite VERY ELEVATED ({fear_z:.2f}σ)"))
+    elif fear_z >= 1.0:
         score -= 1
-        drivers.append(("🔴", "Fear composite ELEVATED"))
+        drivers.append(("🔴", f"Fear composite ELEVATED ({fear_z:.2f}σ)"))
     elif fear_z <= -1.0:
         score += 1
-        drivers.append(("🟢", "Fear composite COMPLACENT"))
+        drivers.append(("🟢", f"Fear composite COMPLACENT ({fear_z:.2f}σ)"))
 
     # 4) Recession / macro stress — slow backdrop
-    if rec >= 60:
+    if rec >= 70:
+        score -= 2
+        drivers.append(("🔴", f"Recession risk ELEVATED ({rec:.1f}%)"))
+    elif rec >= 55:
         score -= 1
         drivers.append(("🔴", f"Recession risk elevated ({rec:.1f}%)"))
-    elif rec <= 30:
+    elif rec <= 20:
         score += 1
         drivers.append(("🟢", f"Recession risk low ({rec:.1f}%)"))
 
     # 5) Macro regime tilt — directional but slow-moving
-    if macro_reg in ("Deflation", "Stagflation", "Disinflation"):
+    if macro_reg in ("Deflation",):
+        score -= 2
+    elif macro_reg in ("Stagflation", "Disinflation"):
         score -= 1
     elif macro_reg in ("Goldilocks",):
         score += 1
+    elif macro_reg in ("Overheating",):
+        score += 0  # mixed signal, no contribution
 
-    score = int(np.clip(score, -3, 3))
+    score = int(np.clip(score, -10, 10))
 
-    if score <= -2:   bias, color = "BEARISH",        "#ef4444"
-    elif score == -1: bias, color = "LEANING BEARISH", "#f97316"
-    elif score == 0:  bias, color = "NEUTRAL",         "#94a3b8"
-    elif score == 1:  bias, color = "LEANING BULLISH", "#34d399"
-    else:             bias, color = "BULLISH",          "#10b981"
+    if score <= -4:   bias, color = "BEARISH",         "#ef4444"
+    elif score <= -2: bias, color = "LEANING BEARISH", "#f97316"
+    elif score == 0:  bias, color = "NEUTRAL",          "#94a3b8"
+    elif score <= 3:  bias, color = "LEANING BULLISH",  "#34d399"
+    else:             bias, color = "BULLISH",           "#10b981"
 
     # Risk flags — top 3 most actionable
     risks = []
@@ -1778,13 +1802,16 @@ def render_thesis_page():
     threeP=float(np.clip(0.35*trp+0.35*fp+0.30*tp,0,100))
 
     # ── Recession probability — four explicit drivers matching the glossary ──
-    _unrate_clean = unrate.dropna()
-    if _unrate_clean.size >= 12:
-        _ur_3m_avg   = float(_unrate_clean.rolling(3,  min_periods=2).mean().iloc[-1])
-        _ur_12m_min  = float(_unrate_clean.rolling(12, min_periods=6).min().iloc[-1])
+    # CRITICAL: UNRATE is monthly data ffill'd to daily. rolling(3) on the daily
+    # series gives a 3-DAY window not 3-MONTH, collapsing Sahm to ~0 always.
+    # Fix: resample to monthly-start frequency before computing Sahm windows.
+    _unrate_monthly = unrate.dropna().resample("MS").last().dropna()
+    if _unrate_monthly.size >= 6:
+        _ur_3m_avg  = float(_unrate_monthly.rolling(3,  min_periods=2).mean().iloc[-1])
+        _ur_12m_min = float(_unrate_monthly.rolling(12, min_periods=6).min().iloc[-1])
     else:
-        _ur_3m_avg   = float(_unrate_clean.iloc[-1]) if _unrate_clean.size > 0 else ur
-        _ur_12m_min  = float(_unrate_clean.min())    if _unrate_clean.size > 0 else ur
+        _ur_3m_avg  = float(_unrate_monthly.iloc[-1]) if _unrate_monthly.size > 0 else ur
+        _ur_12m_min = float(_unrate_monthly.min())    if _unrate_monthly.size > 0 else ur
 
     _icsa_clean_rec = (icsa.dropna() / 1000) if icsa is not None and icsa.dropna().size > 0 else pd.Series(dtype=float)
     if _icsa_clean_rec.size >= 26:
@@ -2235,7 +2262,7 @@ def render_thesis_page():
     vbd = (
         _sh(10, "THESIS VERDICT")
         + f"<div style='font-size:36px;font-weight:900;color:{c};margin-bottom:6px;'>{th['bias']}</div>"
-        + f"<div style='font-size:12px;color:rgba(255,255,255,0.50);margin-bottom:4px;'>Composite Score: {th['score']:+d} / ±3  ·  {dt.datetime.now().strftime('%A, %B %d, %Y')}</div>"
+        + f"<div style='font-size:12px;color:rgba(255,255,255,0.50);margin-bottom:4px;'>Composite Score: {th['score']:+d} / ±10  ·  {dt.datetime.now().strftime('%A, %B %d, %Y')}</div>"
         + "<div style='height:14px;'></div>"
         + "<div style='font-size:10px;color:rgba(255,255,255,0.35);letter-spacing:0.12em;text-transform:uppercase;margin-bottom:8px;'>Signal Breakdown</div>"
         + sig_html

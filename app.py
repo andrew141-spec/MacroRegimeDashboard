@@ -11,7 +11,7 @@ from config import CSS
 st.markdown(CSS, unsafe_allow_html=True)
 
 # ── Sidebar navigation ───────────────────────────────────────────────────────
-st.sidebar.markdown("## ⚡ Quant Dashboard")
+st.sidebar.markdown("## ⚡ Regime Dashboard")
 page = st.sidebar.radio(
     "Module",
     ["Dashboard", "Daily Thesis", "GEX Engine", "Trade Setups", "Execution", "Probability Engine", "Schwab/TOS", "Guide"],

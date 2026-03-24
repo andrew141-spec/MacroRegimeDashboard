@@ -94,7 +94,7 @@ def _get_secret(key: str, fallback: str = "") -> str:
 # PAGE CONFIG
 # ============================================================
 st.set_page_config(
-    page_title="Quant Regime Dashboard",
+    page_title="Regime Dashboard",
     layout="wide",
     page_icon="⚡",
     initial_sidebar_state="expanded",

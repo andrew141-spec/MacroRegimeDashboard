@@ -1061,7 +1061,7 @@ def render_gex_engine():
     # These survive navigation between pages because session_state persists for the
     # entire browser session. We only set defaults when the key is absent.
     _DEFAULTS = {
-        "gex_symbol_input":     "QQQ",
+        "gex_symbol_input":     "",
         # gex_use_schwab removed — Schwab is always primary
         "gex_view_mode":        "Heatmap",
         "gex_auto_refresh":     True,
@@ -1107,10 +1107,16 @@ def render_gex_engine():
     col_s, col_m = st.columns([1, 3])
     with col_s:
         # No 'value=' arg — Streamlit reads from session_state[key] automatically
-        symbol = st.text_input("Options Symbol", key="gex_symbol_input").strip().upper()
+        symbol = st.text_input("Options Symbol", key="gex_symbol_input", placeholder="e.g. SPY").strip().upper()
+
+    if not symbol:
+        st.info("Enter an options symbol above to load GEX data.")
+        return
 
     # ── Data fetch — Schwab/TOS only (yfinance removed as OI fallback) ──────
-    chain_df, spot, source = None, float(st.session_state.get("_last_known_spot", 500.0)), "unknown"
+    # Use a per-symbol spot key so switching tickers never bleeds the wrong price
+    _spot_key = f"_last_known_spot_{symbol}" if symbol else "_last_known_spot"
+    chain_df, spot, source = None, float(st.session_state.get(_spot_key, 500.0)), "unknown"
     with col_m:
         client = get_schwab_client()
         if client:
@@ -1121,7 +1127,7 @@ def render_gex_engine():
                 if spot_live and spot_live > 0:
                     spot = spot_live
                 else:
-                    last_known = float(st.session_state.get("_last_known_spot", 0))
+                    last_known = float(st.session_state.get(_spot_key, 0))
                     spot = last_known if last_known > 0 else float(chain_df["strike"].median())
                 st.success(f"Schwab connected — live IV · {symbol} · ${spot:.2f}")
             else:
@@ -1145,9 +1151,9 @@ def render_gex_engine():
                         "Go to the **Schwab/TOS** tab to authorise, or check your connection."
                     )
 
-    # Save last known good spot so next load has a better fallback than 0
+    # Save last known good spot keyed per symbol so switching tickers never bleeds price
     if spot and spot > 0:
-        st.session_state["_last_known_spot"] = spot
+        st.session_state[_spot_key] = spot
 
     if chain_df is None or len(chain_df) == 0:
         st.error(f"No options data available for **{symbol}**. Source: `{source}`")
@@ -1919,15 +1925,19 @@ def render_setups_page():
     # ── Symbol + data ─────────────────────────────────────────────────────
     # Persist settings across page navigation
     if "setups_symbol" not in st.session_state:
-        st.session_state["setups_symbol"] = "QQQ"
+        st.session_state["setups_symbol"] = ""
     if "setups_schwab" not in st.session_state:
         st.session_state["setups_schwab"] = False
 
     col_sym, col_info = st.columns([1, 3])
     with col_sym:
-        symbol = st.text_input("Symbol", key="setups_symbol").strip().upper()
+        symbol = st.text_input("Symbol", key="setups_symbol", placeholder="e.g. SPY").strip().upper()
 
-    chain_df, spot, source = None, float(st.session_state.get("_last_known_spot", 500.0)), "unknown"
+    if not symbol:
+        st.info("Enter a symbol above to load trade setups.")
+        return
+
+    chain_df, spot, source = None, float(st.session_state.get(f"_last_known_spot_{symbol}" if symbol else "_last_known_spot", 500.0)), "unknown"
     client = get_schwab_client()
     if client:
         chain_df = schwab_get_options_chain(client, symbol, spot=None)

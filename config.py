@@ -108,18 +108,20 @@ CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,500;0,9..40,700;1,9..40,300&display=swap');
 
 :root {
-  --bg0:    #04060C;
-  --bg1:    #080E1C;
-  --bg2:    #0D1628;
-  --panel:  rgba(255,255,255,0.038);
-  --border: rgba(255,255,255,0.09);
-  --text:   rgba(255,255,255,0.92);
-  --muted:  rgba(255,255,255,0.52);
-  --dim:    rgba(255,255,255,0.28);
+  --bg0:    #000000;
+  --bg1:    #050505;
+  --bg2:    #090909;
 
-  --green:   #10b981;
-  --teal:    #06b6d4;
-  --yellow:  #f59e0b;
+  --panel:  #050505;
+  --border: #1a1a1a;
+
+  --text:   rgba(255,255,255,0.88);
+  --muted:  rgba(255,255,255,0.50);
+  --dim:    rgba(255,255,255,0.24);
+
+  --green:   #22c55e;
+  --teal:    #16a34a;
+  --yellow:  #eab308;
   --orange:  #f97316;
   --red:     #ef4444;
   --crimson: #dc2626;
@@ -127,113 +129,105 @@ CSS = """
   --blue:    #3b82f6;
   --sky:     #38bdf8;
 
-  --gex-pos: #10b981;
+  --gex-pos: #22c55e;
   --gex-neg: #ef4444;
-  --gex-flip:#f59e0b;
+  --gex-flip:#eab308;
 
   --mono: 'Space Mono', ui-monospace, monospace;
   --sans: 'DM Sans', system-ui, sans-serif;
 
-  --shadow-lg: 0 16px 48px rgba(0,0,0,0.60);
-  --shadow-sm: 0 4px 16px rgba(0,0,0,0.40);
-  --glow-green: 0 0 20px rgba(16,185,129,0.20);
-  --glow-red:   0 0 20px rgba(239,68,68,0.20);
-  --glow-blue:  0 0 20px rgba(59,130,246,0.15);
+  --shadow-lg: none;
+  --shadow-sm: none;
+  --glow-green: none;
+  --glow-red: none;
+  --glow-blue: none;
 }
 
 html, body, [class*="css"] {
   font-family: var(--sans) !important;
   background:
-    radial-gradient(ellipse 140% 60% at 15% -5%, rgba(59,130,246,0.07), transparent 60%),
-    radial-gradient(ellipse 100% 50% at 88% 8%,  rgba(139,92,246,0.06), transparent 55%),
-    radial-gradient(ellipse 80%  40% at 50% 100%, rgba(16,185,129,0.04), transparent 60%),
-    linear-gradient(180deg, var(--bg0) 0%, var(--bg1) 50%, var(--bg2) 100%) !important;
+    linear-gradient(rgba(34,197,94,0.04), rgba(34,197,94,0)) top/100% 1px no-repeat,
+    #000 !important;
   color: var(--text) !important;
   min-height: 100vh;
 }
 
 .block-container {
-  padding-top: 0.8rem !important;
-  padding-bottom: 1rem !important;
-  max-width: 1600px !important;
+  padding-top: 0.35rem !important;
+  padding-bottom: 0.75rem !important;
+  max-width: 100% !important;
 }
 
 /* ─── PANELS ─── */
 .panel {
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 14px;
-  padding: 14px 16px 12px;
-  box-shadow: var(--shadow-sm);
-  backdrop-filter: blur(16px);
-  transition: border-color 140ms, transform 120ms;
+  border-radius: 0;
+  padding: 10px 12px 10px;
+  box-shadow: none;
+  backdrop-filter: none;
+  transition: border-color 120ms ease, background 120ms ease;
 }
-.panel:hover { border-color: rgba(255,255,255,0.14); transform: translateY(-1px); }
+.panel:hover {
+  border-color: rgba(34,197,94,0.35);
+  transform: none;
+  background: #080808;
+}
 .panel-title {
   font-family: var(--mono);
-  font-size: 9.5px;
-  letter-spacing: 1.2px;
+  font-size: 10px;
+  letter-spacing: 1.8px;
   text-transform: uppercase;
-  color: var(--muted);
+  color: var(--green);
   margin: 0 0 8px 0;
 }
 
 /* ─── CARDS ─── */
-.prob-card {
-  background: rgba(59,130,246,0.06);
-  border: 1px solid rgba(59,130,246,0.22);
-  border-radius: 14px;
-  padding: 14px;
-}
-.gex-card {
-  background: rgba(16,185,129,0.05);
-  border: 1px solid rgba(16,185,129,0.18);
-  border-radius: 14px;
-  padding: 14px;
-}
-.warn-card {
-  background: rgba(245,158,11,0.06);
-  border: 1px solid rgba(245,158,11,0.28);
-  border-radius: 12px;
-  padding: 10px 14px;
-  font-size: 12px;
-}
-.alert-card {
-  background: rgba(239,68,68,0.07);
-  border: 1px solid rgba(239,68,68,0.32);
-  border-radius: 12px;
-  padding: 10px 14px;
-  font-size: 12px;
-}
-.setup-card {
-  background: rgba(139,92,246,0.06);
-  border: 1px solid rgba(139,92,246,0.22);
-  border-radius: 12px;
-  padding: 12px 14px;
-}
-.api-card {
-  background: rgba(6,182,212,0.05);
-  border: 1px solid rgba(6,182,212,0.18);
-  border-radius: 14px;
-  padding: 14px;
-}
+.prob-card,
+.gex-card,
+.warn-card,
+.alert-card,
+.setup-card,
+.api-card,
 .failure-card {
-  background: rgba(220,38,38,0.06);
-  border: 1px solid rgba(220,38,38,0.25);
-  border-radius: 12px;
-  padding: 10px 14px;
+  background: #050505;
+  border: 1px solid #1a1a1a;
+  border-radius: 0;
+  padding: 10px 12px;
+  box-shadow: none;
 }
 
 /* ─── BADGES ─── */
 .badge {
-  display: inline-flex; align-items: center; gap: 5px;
-  padding: 4px 9px; border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: 0;
   border: 1px solid var(--border);
-  background: rgba(255,255,255,0.03);
-  color: var(--muted); font-size: 10.5px;
+  background: #090909;
+  color: var(--muted);
+  font-size: 10px;
   font-family: var(--mono);
 }
-.badge b { color: var(--text); font-weight: 700; }
+.badge b {
+  color: var(--text);
+  font-weight: 700;
+}
+
+.regime-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 0;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  border: 1px solid currentColor;
+}
 
 /* ─── REGIME CHIP ─── */
 .regime-chip {
@@ -251,35 +245,34 @@ html, body, [class*="css"] {
 
 /* ─── GEX LEVEL BARS ─── */
 .gex-row {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.04);
-  font-family: var(--mono); font-size: 11px;
-}
-.gex-row:last-child { border-bottom: none; }
-.gex-pos { color: var(--green); }
-.gex-neg { color: var(--red); }
-.gex-flip-marker { color: var(--yellow); font-weight: 700; }
-
-/* ─── SETUP SCORE ─── */
-.score-dot {
-  display: inline-block; width: 8px; height: 8px;
-  border-radius: 50%; margin-right: 5px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 3px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+  font-family: var(--mono);
+  font-size: 10.5px;
 }
 
-/* ─── CHECKLIST ─── */
 .check-row {
-  display: flex; align-items: flex-start; gap: 8px;
-  padding: 4px 0; font-size: 12px; line-height: 1.4;
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 2px 0;
+  font-size: 11px;
+  line-height: 1.35;
 }
-.check-ok   { color: var(--green); font-family: var(--mono); }
-.check-warn { color: var(--yellow); font-family: var(--mono); }
-.check-fail { color: var(--red); font-family: var(--mono); }
 
-/* ─── TERMINAL LOG ─── */
 .term {
-  font-family: var(--mono); font-size: 11px; line-height: 1.5;
-  background: rgba(0,0,0,0.30); border: 1px solid rgba(255,255,255,0.06);
-  border-radius: 10px; padding: 10px 12px; max-height: 280px; overflow-y: auto;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.45;
+  background: #030303;
+  border: 1px solid #1a1a1a;
+  border-radius: 0;
+  padding: 8px 10px;
+  max-height: 280px;
+  overflow-y: auto;
 }
 .term-row { padding: 2px 0; }
 .term-ts   { color: var(--dim); margin-right: 8px; }
@@ -293,20 +286,37 @@ html, body, [class*="css"] {
 .mono  { font-family: var(--mono); }
 hr { border-color: rgba(255,255,255,0.07) !important; }
 h1,h2,h3 { font-family: var(--sans) !important; letter-spacing: -0.2px; }
-div[data-testid="stMetricValue"] { font-family: var(--mono) !important; }
+div[data-testid="stMetric"] {
+  background: #050505 !important;
+  border: 1px solid #1a1a1a !important;
+  border-radius: 0 !important;
+  padding: 8px 10px !important;
+  box-shadow: none !important;
+}
+div[data-testid="stMetricValue"] {
+  font-family: var(--mono) !important;
+}
 
 /* ─── SECTION HEADER ─── */
 .section-hdr {
-  display: flex; align-items: center; gap: 10px;
-  margin: 18px 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 14px 0 8px;
 }
 .section-hdr::after {
-  content: ''; flex: 1; height: 1px;
-  background: linear-gradient(to right, rgba(255,255,255,0.12), transparent);
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(to right, rgba(34,197,94,0.28), transparent);
 }
 .section-hdr span {
-  font-family: var(--mono); font-size: 10px; letter-spacing: 1.4px;
-  text-transform: uppercase; color: var(--muted); white-space: nowrap;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 1.6px;
+  text-transform: uppercase;
+  color: var(--green);
+  white-space: nowrap;
 }
 </style>
 """

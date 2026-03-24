@@ -1052,6 +1052,33 @@ def _module3_setups(dg: "DealerGreeks", gs: "GammaState", spot: float,
 
 
 
+# ── Module-level cached computations ─────────────────────────────────────────
+# Defined at module scope (not inside render_gex_engine) so Streamlit's
+# cache_data uses a stable function identity. Adding `_symbol` as the first
+# argument creates a hard per-ticker cache partition — switching from QQQ to
+# SPY will NEVER return a stale QQQ result even within the 120s TTL window.
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_gamma_state(_symbol, _chain_json, _spot, _source, _max_dte):
+    import pandas as _pd, io as _io
+    _df = _pd.read_json(_io.StringIO(_chain_json))
+    return build_gamma_state(_df, _spot, _source, max_dte=_max_dte)
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_dealer_greeks(_symbol, _chain_json, _spot, _source, _max_dte):
+    import pandas as _pd, io as _io
+    _df = _pd.read_json(_io.StringIO(_chain_json))
+    return compute_dealer_greeks(_df, _spot, _source, max_dte=_max_dte)
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_analytics(_symbol, _chain_json, _spot):
+    import pandas as _pd, io as _io
+    _df = _pd.read_json(_io.StringIO(_chain_json))
+    return (compute_gwas(_df, _spot),
+            compute_gex_term_structure(_df, _spot),
+            compute_flow_imbalance(_df, _spot))
+
+
 def render_gex_engine():
     """Deep-dive GEX analysis page with GEX / VEX / CEX tabs."""
     st.markdown(CSS, unsafe_allow_html=True)
@@ -1114,8 +1141,8 @@ def render_gex_engine():
         return
 
     # ── Data fetch — Schwab/TOS only (yfinance removed as OI fallback) ──────
-    # Use a per-symbol spot key so switching tickers never bleeds the wrong price
-    _spot_key = f"_last_known_spot_{symbol}" if symbol else "_last_known_spot"
+    # Per-symbol spot key prevents QQQ spot bleeding into other tickers
+    _spot_key = f"_last_known_spot_{symbol}"
     chain_df, spot, source = None, float(st.session_state.get(_spot_key, 500.0)), "unknown"
     with col_m:
         client = get_schwab_client()
@@ -1151,7 +1178,7 @@ def render_gex_engine():
                         "Go to the **Schwab/TOS** tab to authorise, or check your connection."
                     )
 
-    # Save last known good spot keyed per symbol so switching tickers never bleeds price
+    # Save per-symbol so switching tickers never bleeds a stale price
     if spot and spot > 0:
         st.session_state[_spot_key] = spot
 
@@ -1174,31 +1201,11 @@ def render_gex_engine():
     # The cache is cleared on manual refresh or auto-refresh cycle.
     _max_dte = int(st.session_state.get('gex_hm_dte', 45))
 
-    @st.cache_data(ttl=120, show_spinner=False)
-    def _cached_gamma_state(_chain_json, _spot, _source, _max_dte):
-        import pandas as _pd, io as _io
-        _df = _pd.read_json(_io.StringIO(_chain_json))
-        return build_gamma_state(_df, _spot, _source, max_dte=_max_dte)
-
-    @st.cache_data(ttl=120, show_spinner=False)
-    def _cached_dealer_greeks(_chain_json, _spot, _source, _max_dte):
-        import pandas as _pd, io as _io
-        _df = _pd.read_json(_io.StringIO(_chain_json))
-        return compute_dealer_greeks(_df, _spot, _source, max_dte=_max_dte)
-
-    @st.cache_data(ttl=120, show_spinner=False)
-    def _cached_analytics(_chain_json, _spot):
-        import pandas as _pd, io as _io
-        _df = _pd.read_json(_io.StringIO(_chain_json))
-        return (compute_gwas(_df, _spot),
-                compute_gex_term_structure(_df, _spot),
-                compute_flow_imbalance(_df, _spot))
-
     try:
         _chain_json = chain_df.to_json()
-        gs   = _cached_gamma_state(_chain_json, spot, source, _max_dte)
-        dg   = _cached_dealer_greeks(_chain_json, spot, source, _max_dte)
-        gwas, term_str, flow = _cached_analytics(_chain_json, spot)
+        gs   = _cached_gamma_state(symbol, _chain_json, spot, source, _max_dte)
+        dg   = _cached_dealer_greeks(symbol, _chain_json, spot, source, _max_dte)
+        gwas, term_str, flow = _cached_analytics(symbol, _chain_json, spot)
     except Exception:
         # Fallback: compute directly if serialization fails
         gs   = build_gamma_state(chain_df, spot, source, max_dte=_max_dte)
@@ -1937,7 +1944,8 @@ def render_setups_page():
         st.info("Enter a symbol above to load trade setups.")
         return
 
-    chain_df, spot, source = None, float(st.session_state.get(f"_last_known_spot_{symbol}" if symbol else "_last_known_spot", 500.0)), "unknown"
+    _spot_key_s = f"_last_known_spot_{symbol}"
+    chain_df, spot, source = None, float(st.session_state.get(_spot_key_s, 500.0)), "unknown"
     client = get_schwab_client()
     if client:
         chain_df = schwab_get_options_chain(client, symbol, spot=None)
@@ -1945,6 +1953,8 @@ def render_setups_page():
         if chain_df is not None and len(chain_df) > 0:
             spot_live = schwab_get_spot(client, symbol)
             spot = spot_live if (spot_live and spot_live > 0) else float(chain_df["strike"].median())
+            if spot and spot > 0:
+                st.session_state[_spot_key_s] = spot
         else:
             err = st.session_state.get("_schwab_chain_error", "unknown error")
             st.warning(f"⚠️ Schwab empty chain for **{symbol}** ({err}). Falling back to yfinance.")
@@ -1953,6 +1963,8 @@ def render_setups_page():
         chain_df, spot_yf, source = get_gex_from_yfinance(symbol)
         if chain_df is not None and len(chain_df) > 0:
             spot = spot_yf or spot
+            if spot and spot > 0:
+                st.session_state[_spot_key_s] = spot
             if not client:
                 st.info(f"📊 yfinance OI data for **{symbol}** — connect Schwab/TOS for live IV.")
         else:

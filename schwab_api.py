@@ -140,6 +140,10 @@ def get_schwab_client():
     if token_dict is None:
         return None   # not yet authorised
 
+    # Clear any previous token-expiry flag before attempting
+    st.session_state.pop("_schwab_token_expired", None)
+    st.session_state.pop("_schwab_auth_error", None)
+
     try:
         tmp_path = _token_to_tempfile(token_dict)
         client   = schwab.auth.client_from_token_file(
@@ -154,7 +158,29 @@ def get_schwab_client():
         except Exception:
             pass
         return client
-    except Exception:
+    except Exception as e:
+        err_str = str(e)
+        # Detect refresh-token expiry / revocation — these require re-authorization,
+        # not just a retry.  Surface a clear flag so the UI can prompt the user.
+        _REFRESH_INDICATORS = (
+            "refresh_token_authentication_error",
+            "unsupported_token_type",
+            "refresh_token",
+            "OAuthError",
+            "invalid_grant",
+        )
+        is_token_expired = any(ind in err_str for ind in _REFRESH_INDICATORS)
+        if is_token_expired:
+            st.session_state["_schwab_token_expired"] = True
+            st.session_state["_schwab_auth_error"] = (
+                f"Schwab refresh token expired or revoked — please re-authorize "
+                f"on the Schwab/TOS tab to restore live IV data. "
+                f"(Detail: {err_str[:200]})"
+            )
+        else:
+            st.session_state["_schwab_auth_error"] = (
+                f"Schwab client error: {type(e).__name__}: {err_str[:200]}"
+            )
         return None
 
 

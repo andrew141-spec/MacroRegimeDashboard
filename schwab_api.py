@@ -211,35 +211,82 @@ def schwab_run_auth_flow(client_id: str, client_secret: str,
 def schwab_complete_auth(client_id: str, client_secret: str,
                           redirect_uri: str, callback_url: str) -> Tuple[bool, str]:
     """
-    Complete the OAuth2 flow using schwab.auth.client_from_manual_flow.
-    Saves the resulting token to Supabase.
-    Returns (success: bool, message: str).
-    """
-    if not SCHWAB_AVAILABLE:
-        return False, "schwab-py not installed"
-    try:
-        tmp_path = tempfile.mktemp(suffix=".json", prefix="schwab_token_")
+    Complete the OAuth2 flow by directly exchanging the authorization code
+    for tokens via the Schwab /oauth/token endpoint.
 
-        # client_from_manual_flow is the current schwab-py API for server/cloud use.
-        # It takes the full redirected callback URL, exchanges the code, and writes
-        # the token to tmp_path.
-        client = schwab.auth.client_from_manual_flow(
-            api_key=client_id,
-            app_secret=client_secret,
-            callback_url=redirect_uri,
-            token_path=tmp_path,
-            redirected_url=callback_url,
+    schwab-py's client_from_manual_flow() is interactive (stdin prompts) and
+    does not accept a pre-captured callback URL — it cannot be used in a
+    Streamlit/server context.  We replicate the token exchange it performs
+    internally using plain requests + base64, then build the token dict in
+    the same format schwab-py expects so client_from_token_file works normally.
+
+    Args:
+        client_id:    Schwab app key (Client ID)
+        client_secret: Schwab app secret
+        redirect_uri: The callback URL registered in your Schwab app
+        callback_url: The full URL the browser was redirected to after login
+                      (contains ?code=...&session=...)
+    Returns:
+        (success: bool, message: str)
+    """
+    import urllib.parse
+    import base64
+    import requests as _requests
+
+    try:
+        # ── 1. Extract the authorization code from the redirected URL ────────
+        parsed = urllib.parse.urlparse(callback_url)
+        params = urllib.parse.parse_qs(parsed.query)
+
+        # Schwab encodes the code as "code=...@" — strip the trailing @
+        raw_code = params.get("code", [None])[0]
+        if not raw_code:
+            return False, (
+                "No 'code' parameter found in the callback URL. "
+                "Make sure you pasted the full URL from your browser's address bar."
+            )
+        # Schwab appends a literal '@' to the code value — keep it as-is for
+        # the exchange request; stripping it causes a 400 error.
+        auth_code = raw_code  # e.g. "Ab1Cd2Ef3...@"
+
+        # ── 2. Exchange code for tokens ──────────────────────────────────────
+        credentials = base64.b64encode(
+            f"{client_id}:{client_secret}".encode("utf-8")
+        ).decode("utf-8")
+
+        headers = {
+            "Authorization": f"Basic {credentials}",
+            "Content-Type":  "application/x-www-form-urlencoded",
+        }
+        payload = {
+            "grant_type":   "authorization_code",
+            "code":         auth_code,
+            "redirect_uri": redirect_uri,
+        }
+
+        resp = _requests.post(
+            "https://api.schwabapi.com/v1/oauth/token",
+            headers=headers,
+            data=payload,
+            timeout=15,
         )
 
-        token_dict = _token_from_tempfile(tmp_path)
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
+        if resp.status_code != 200:
+            return False, (
+                f"Token exchange failed ({resp.status_code}): {resp.text[:300]}"
+            )
 
-        if token_dict is None:
-            return False, "Token file empty after exchange"
+        token_data = resp.json()
 
+        # ── 3. Build token dict in the format schwab-py's token file expects ─
+        # schwab-py stores: creation_timestamp + expires_in alongside the raw
+        # OAuth fields so it can calculate when to refresh.
+        token_dict = {
+            **token_data,
+            "creation_timestamp": time.time(),
+        }
+
+        # ── 4. Persist ───────────────────────────────────────────────────────
         if not SUPABASE_AVAILABLE or _get_supabase() is None:
             st.session_state["_schwab_token_local"] = token_dict
             return True, "Token stored in session (no Supabase — local mode)"
@@ -247,9 +294,10 @@ def schwab_complete_auth(client_id: str, client_secret: str,
         saved = _supabase_save_token(token_dict)
         if saved:
             get_schwab_client.clear()
-            return True, "Token saved to Supabase ✓"
+            return True, "Authenticated and token saved to Supabase ✓"
         else:
-            return False, "Supabase save failed — check SUPABASE_URL and SUPABASE_KEY"
+            return False, "Token exchange succeeded but Supabase save failed — check SUPABASE_URL and SUPABASE_KEY"
+
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
 

@@ -58,7 +58,7 @@ def render_schwab_page():
                     except: pass
                 st.session_state.pop("_schwab_token_local", None)
                 st.session_state.pop("_schwab_client_obj", None)
-        st.session_state.pop("_schwab_client_ts", None)
+                st.session_state.pop("_schwab_client_ts", None)
                 st.rerun()
         st.divider()
 
@@ -197,7 +197,7 @@ SUPABASE_KEY = "eyJ..."   # anon/public key
                         st.success(f"✅ {msg}")
                         st.balloons()
                         st.session_state.pop("_schwab_client_obj", None)
-        st.session_state.pop("_schwab_client_ts", None)  # ensure cache is cleared before rerun
+                        st.session_state.pop("_schwab_client_ts", None)  # ensure cache is cleared before rerun
                         time.sleep(0.5)            # brief pause so Supabase write propagates
                         st.rerun()
                     else:

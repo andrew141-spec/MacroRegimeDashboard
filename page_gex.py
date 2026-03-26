@@ -1173,6 +1173,9 @@ def render_gex_engine():
                     st.info(f"📊 Using yfinance OI data for **{symbol}** — connect Schwab/TOS for live IV and volume.")
             else:
                 if not client:
+                    auth_err = st.session_state.get("_schwab_auth_error")
+                    if auth_err:
+                        st.error(f"🔑 Schwab connection error: {auth_err}")
                     st.warning(
                         "🔌 **Schwab/TOS not connected** and yfinance returned no data. "
                         "Go to the **Schwab/TOS** tab to authorise, or check your connection."

@@ -194,12 +194,30 @@ SUPABASE_KEY = "eyJ..."   # anon/public key
                             client_id, client_secret, redirect_uri, callback.strip()
                         )
                     if ok:
-                        st.success(f"✅ {msg}")
-                        st.balloons()
-                        st.session_state.pop("_schwab_client_obj", None)
-                        st.session_state.pop("_schwab_client_ts", None)  # ensure cache is cleared before rerun
-                        time.sleep(0.5)            # brief pause so Supabase write propagates
-                        st.rerun()
+                        # Verify the token actually landed in Supabase before
+                        # declaring success — avoids the "saved!" → navigate → gone
+                        # race condition caused by st.rerun() firing before Supabase
+                        # confirms the write.
+                        time.sleep(0.8)
+                        from schwab_api import _supabase_load_token
+                        verified = _supabase_load_token()
+                        if verified is not None:
+                            st.success("✅ Token saved and verified in Supabase — you can now navigate to GEX Engine.")
+                            st.balloons()
+                            # Clear stale client cache so next get_schwab_client()
+                            # builds a fresh client from the verified token.
+                            st.session_state.pop("_schwab_client_obj", None)
+                            st.session_state.pop("_schwab_client_ts", None)
+                            # Don't st.rerun() here — it resets the tab to tab 1
+                            # and can trigger a premature get_schwab_client() call
+                            # that races with the Supabase write.
+                        else:
+                            st.warning(
+                                f"⚠️ Token exchange succeeded but Supabase read-back failed. "
+                                f"The token may still be saving — wait a moment and refresh. "
+                                f"Check SUPABASE_URL / SUPABASE_KEY and table RLS policy.\n\n"
+                                f"Raw result: {msg}"
+                            )
                     else:
                         st.error(f"Auth failed: {msg}")
                         st.markdown("""

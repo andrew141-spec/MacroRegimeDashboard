@@ -57,7 +57,8 @@ def render_schwab_page():
                     try: sb.table("schwab_tokens").delete().eq("id","shared").execute()
                     except: pass
                 st.session_state.pop("_schwab_token_local", None)
-                get_schwab_client.clear()
+                st.session_state.pop("_schwab_client_obj", None)
+        st.session_state.pop("_schwab_client_ts", None)
                 st.rerun()
         st.divider()
 
@@ -195,7 +196,8 @@ SUPABASE_KEY = "eyJ..."   # anon/public key
                     if ok:
                         st.success(f"✅ {msg}")
                         st.balloons()
-                        get_schwab_client.clear()  # ensure cache is cleared before rerun
+                        st.session_state.pop("_schwab_client_obj", None)
+        st.session_state.pop("_schwab_client_ts", None)  # ensure cache is cleared before rerun
                         time.sleep(0.5)            # brief pause so Supabase write propagates
                         st.rerun()
                     else:

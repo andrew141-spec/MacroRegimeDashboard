@@ -64,29 +64,57 @@ def _get_supabase() -> Optional[object]:
         return None
 
 
+def _wrap_token(token_dict: Dict) -> Dict:
+    """
+    Ensure the token dict is in schwab-py's native file format: {"token": {...}}.
+    schwab-py's client_from_token_file always expects this wrapper.
+    Storing in this format in Supabase means no conversion is ever needed on load.
+    """
+    if "token" in token_dict and isinstance(token_dict["token"], dict):
+        return token_dict  # already wrapped
+    return {"token": token_dict}
+
+
+def _unwrap_token(token_dict: Dict) -> Dict:
+    """Return the inner token dict regardless of whether it's wrapped or flat."""
+    if "token" in token_dict and isinstance(token_dict["token"], dict):
+        return token_dict["token"]
+    return token_dict
+
+
 def _supabase_load_token() -> Optional[Dict]:
-    """Load the Schwab token dict from Supabase."""
+    """
+    Load the Schwab token from Supabase.
+    Always returns the WRAPPED format {"token": {...}} so it can be written
+    directly to the temp file without any conversion.
+    """
     sb = _get_supabase()
     if sb is None:
         return None
     try:
         res = sb.table("schwab_tokens").select("token").eq("id", "shared").execute()
         if res.data:
-            return res.data[0]["token"]
+            stored = res.data[0]["token"]
+            return _wrap_token(stored)  # normalise to wrapped format
     except Exception:
         pass
     return None
 
 
 def _supabase_save_token(token_dict: Dict) -> bool:
-    """Upsert the Schwab token dict to Supabase."""
+    """
+    Upsert the Schwab token to Supabase.
+    Always saves the INNER flat token dict so the Supabase JSONB column
+    stays clean and _supabase_load_token can reliably wrap it on the way out.
+    """
     sb = _get_supabase()
     if sb is None:
         return False
     try:
+        inner = _unwrap_token(token_dict)  # strip wrapper before storing
         sb.table("schwab_tokens").upsert({
             "id": "shared",
-            "token": token_dict,
+            "token": inner,
         }).execute()
         return True
     except Exception:
@@ -96,30 +124,27 @@ def _supabase_save_token(token_dict: Dict) -> bool:
 def _token_to_tempfile(token_dict: Dict) -> str:
     """
     Write token dict to a temp file and return its path.
-    schwab-py requires a file path for token storage; we use a temp file
-    as a bridge between Supabase (our real store) and the library.
-    The temp file is recreated on every call — no filesystem persistence.
+    schwab-py requires a file path; we use a temp file as a bridge.
+    Always writes the wrapped {"token": {...}} format that schwab-py expects.
     """
     tmp = tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False, prefix="schwab_token_"
     )
-    # schwab-py's client_from_token_file expects {"token": {...}} at the top level.
-    # Wrap if the dict doesn't already have that structure.
-    if "token" not in token_dict:
-        file_payload = {"token": token_dict}
-    else:
-        file_payload = token_dict
-    json.dump(file_payload, tmp)
+    json.dump(_wrap_token(token_dict), tmp)
     tmp.flush()
     tmp.close()
     return tmp.name
 
 
 def _token_from_tempfile(path: str) -> Optional[Dict]:
-    """Read token from temp file (after schwab-py may have refreshed it)."""
+    """
+    Read token from temp file after schwab-py may have refreshed it.
+    Returns the wrapped {"token": {...}} format.
+    """
     try:
         with open(path, "r") as f:
-            return json.load(f)
+            data = json.load(f)
+        return _wrap_token(data)
     except Exception:
         return None
 
@@ -144,10 +169,12 @@ def get_schwab_client():
     if not client_id or not client_secret:
         return None
 
-    # Try Supabase first, fall back to session state (set during local/no-Supabase auth)
+    # Try Supabase first (returns wrapped format), fall back to session state
     token_dict = _supabase_load_token()
     if token_dict is None:
-        token_dict = st.session_state.get("_schwab_token_local")
+        local = st.session_state.get("_schwab_token_local")
+        if local is not None:
+            token_dict = _wrap_token(local)
     if token_dict is None:
         return None   # not yet authorised — caller falls back to yfinance
 
@@ -163,13 +190,14 @@ def get_schwab_client():
             client = schwab.auth.client_from_token_file(
                 tmp_path, client_id, client_secret
             )
-        # Save any refreshed token back to Supabase.
-        # _token_from_tempfile reads the {"token": {...}} wrapped file;
-        # unwrap before saving so Supabase always stores the flat token dict.
-        refreshed_raw = _token_from_tempfile(tmp_path)
-        refreshed = refreshed_raw.get("token", refreshed_raw) if refreshed_raw else None
-        if refreshed and refreshed != token_dict:
-            _supabase_save_token(refreshed)
+        # If schwab-py refreshed the access token it rewrites the temp file.
+        # Compare the inner token dicts (not the wrappers) to detect real changes.
+        refreshed_wrapped = _token_from_tempfile(tmp_path)
+        if refreshed_wrapped:
+            refreshed_inner  = _unwrap_token(refreshed_wrapped)
+            original_inner   = _unwrap_token(token_dict)
+            if refreshed_inner.get("access_token") != original_inner.get("access_token"):
+                _supabase_save_token(refreshed_inner)
         try:
             os.unlink(tmp_path)
         except Exception:
@@ -191,7 +219,6 @@ def get_schwab_client():
             "refresh_token",
             "OAuthError",
             "invalid_grant",
-            "token format has changed",
         )
         is_token_expired = any(ind in err_str for ind in _REFRESH_INDICATORS)
         if is_token_expired:
@@ -303,35 +330,31 @@ def schwab_complete_auth(client_id: str, client_secret: str,
         token_data = resp.json()
 
         # ── 3. Build token dict in the format schwab-py's token file expects ─
-        # schwab-py stores: creation_timestamp + expires_in alongside the raw
-        # OAuth fields so it can calculate when to refresh.
+        # schwab-py needs: access_token, refresh_token, token_type, expires_in,
+        # scope, id_token, plus creation_timestamp for expiry calculation.
         token_dict = {
             **token_data,
             "creation_timestamp": time.time(),
         }
 
         # ── 4. Persist ───────────────────────────────────────────────────────
-        # Clear the cache FIRST so the next get_schwab_client() call re-reads
-        # from Supabase rather than returning the cached None from before auth.
+        # Clear the session cache FIRST so the next get_schwab_client() call
+        # re-reads from Supabase rather than returning any stale cached value.
         st.session_state.pop("_schwab_client_obj", None)
         st.session_state.pop("_schwab_client_ts", None)
+        st.session_state.pop("_schwab_token_expired", None)
+        st.session_state.pop("_schwab_auth_error", None)
+
+        # Also store in session state for immediate use on the next rerun
+        # (avoids a Supabase round-trip before the first get_schwab_client call)
+        st.session_state["_schwab_token_local"] = token_dict
 
         if not SUPABASE_AVAILABLE or _get_supabase() is None:
-            st.session_state["_schwab_token_local"] = token_dict
             return True, "Token stored in session (no Supabase — local mode)"
 
         saved = _supabase_save_token(token_dict)
         if not saved:
             return False, "Token exchange succeeded but Supabase save failed — check SUPABASE_URL and SUPABASE_KEY"
-
-        # ── 5. (Verification skipped for fresh tokens) ───────────────────────
-        # A freshly-exchanged token is valid by construction.
-        # Calling client_from_token_file here can raise spurious warnings/
-        # exceptions (e.g. "token format has changed") for tokens created by
-        # older schwab-py versions, causing false auth failures.
-        # The real smoke-test happens the first time get_schwab_client() is
-        # called from the dashboard — if the token is truly broken it will
-        # surface there with a clear re-auth prompt.
 
         return True, "Authenticated and token saved to Supabase ✓"
 

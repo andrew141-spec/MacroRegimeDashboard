@@ -287,16 +287,45 @@ def schwab_complete_auth(client_id: str, client_secret: str,
         }
 
         # ── 4. Persist ───────────────────────────────────────────────────────
+        # Clear the cache FIRST so the next get_schwab_client() call re-reads
+        # from Supabase rather than returning the cached None from before auth.
+        get_schwab_client.clear()
+
         if not SUPABASE_AVAILABLE or _get_supabase() is None:
             st.session_state["_schwab_token_local"] = token_dict
             return True, "Token stored in session (no Supabase — local mode)"
 
         saved = _supabase_save_token(token_dict)
-        if saved:
-            get_schwab_client.clear()
-            return True, "Authenticated and token saved to Supabase ✓"
-        else:
+        if not saved:
             return False, "Token exchange succeeded but Supabase save failed — check SUPABASE_URL and SUPABASE_KEY"
+
+        # ── 5. Verify the saved token round-trips through schwab-py ─────────
+        # This catches token format mismatches before the user hits the dashboard.
+        if SCHWAB_AVAILABLE:
+            try:
+                tmp_path     = _token_to_tempfile(token_dict)
+                client_id_v  = _get_secret("SCHWAB_CLIENT_ID")
+                client_sec_v = _get_secret("SCHWAB_CLIENT_SECRET")
+                test_client  = schwab.auth.client_from_token_file(
+                    tmp_path, client_id_v, client_sec_v
+                )
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+                if test_client is None:
+                    return False, (
+                        "Token saved to Supabase but client_from_token_file returned None — "
+                        "token format may be invalid. Check that SCHWAB_CLIENT_ID and "
+                        "SCHWAB_CLIENT_SECRET are correct."
+                    )
+            except Exception as verify_err:
+                return False, (
+                    f"Token saved to Supabase but verification failed: {verify_err}. "
+                    "You may still be able to use the dashboard — try refreshing."
+                )
+
+        return True, "Authenticated and token saved to Supabase ✓"
 
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"

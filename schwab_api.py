@@ -124,17 +124,19 @@ def _token_from_tempfile(path: str) -> Optional[Dict]:
         return None
 
 
-@st.cache_resource(ttl=300)   # re-check token every 5 min
 def get_schwab_client():
     """
     Return an authenticated Schwab client backed by Supabase token storage.
-
-    Flow on each call:
-      1. Load token JSON from Supabase
-      2. Write to temp file (schwab-py needs a file path)
-      3. Build client — schwab-py auto-refreshes if token is near expiry
-      4. Read back refreshed token and save to Supabase
+    Uses session-state caching (TTL 5 min) so that:
+      - A None result (no token yet) is NEVER cached — each page load re-checks Supabase.
+      - A live client IS cached for up to 5 min to avoid repeated token file I/O.
     """
+    # ── Fast path: return cached client if still fresh ───────────────────
+    cached   = st.session_state.get("_schwab_client_obj")
+    cached_t = st.session_state.get("_schwab_client_ts", 0)
+    if cached is not None and (time.time() - cached_t) < 300:
+        return cached
+
     if not SCHWAB_AVAILABLE:
         return None
     client_id     = _get_secret("SCHWAB_CLIENT_ID")
@@ -142,9 +144,12 @@ def get_schwab_client():
     if not client_id or not client_secret:
         return None
 
+    # Try Supabase first, fall back to session state (set during local/no-Supabase auth)
     token_dict = _supabase_load_token()
     if token_dict is None:
-        return None   # not yet authorised
+        token_dict = st.session_state.get("_schwab_token_local")
+    if token_dict is None:
+        return None   # not yet authorised — caller falls back to yfinance
 
     # Clear any previous token-expiry flag before attempting
     st.session_state.pop("_schwab_token_expired", None)
@@ -169,9 +174,15 @@ def get_schwab_client():
             os.unlink(tmp_path)
         except Exception:
             pass
+        # Cache the live client in session state (TTL enforced at top of function)
+        st.session_state["_schwab_client_obj"] = client
+        st.session_state["_schwab_client_ts"]  = time.time()
         return client
     except Exception as e:
         err_str = str(e)
+        # Evict any stale cached client so next call retries fresh
+        st.session_state.pop("_schwab_client_obj", None)
+        st.session_state.pop("_schwab_client_ts", None)
         # Detect refresh-token expiry / revocation — these require re-authorization,
         # not just a retry.  Surface a clear flag so the UI can prompt the user.
         _REFRESH_INDICATORS = (
@@ -302,7 +313,8 @@ def schwab_complete_auth(client_id: str, client_secret: str,
         # ── 4. Persist ───────────────────────────────────────────────────────
         # Clear the cache FIRST so the next get_schwab_client() call re-reads
         # from Supabase rather than returning the cached None from before auth.
-        get_schwab_client.clear()
+        st.session_state.pop("_schwab_client_obj", None)
+        st.session_state.pop("_schwab_client_ts", None)
 
         if not SUPABASE_AVAILABLE or _get_supabase() is None:
             st.session_state["_schwab_token_local"] = token_dict

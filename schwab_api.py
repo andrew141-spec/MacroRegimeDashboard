@@ -85,8 +85,8 @@ def _unwrap_token(token_dict: Dict) -> Dict:
 def _supabase_load_token() -> Optional[Dict]:
     """
     Load the Schwab token from Supabase.
-    Always returns the WRAPPED format {"token": {...}} so it can be written
-    directly to the temp file without any conversion.
+    Returns the full token object as stored (already in wrapped format
+    with creation_timestamp at outer level).
     """
     sb = _get_supabase()
     if sb is None:
@@ -95,7 +95,14 @@ def _supabase_load_token() -> Optional[Dict]:
         res = sb.table("schwab_tokens").select("token").eq("id", "shared").execute()
         if res.data:
             stored = res.data[0]["token"]
-            return _wrap_token(stored)  # normalise to wrapped format
+            # stored is the full {"token": {...}, "creation_timestamp": ...} object
+            # If it's an old-format token (flat dict without outer "token" key),
+            # wrap it so client_from_token_file still gets a valid structure.
+            if isinstance(stored, dict) and "token" in stored:
+                return stored  # already in correct format
+            else:
+                # Legacy flat format — re-wrap with current timestamp
+                return {"token": stored, "creation_timestamp": time.time()}
     except Exception as e:
         st.session_state["_schwab_auth_error"] = f"Supabase load error: {type(e).__name__}: {e}"
     return None
@@ -104,17 +111,18 @@ def _supabase_load_token() -> Optional[Dict]:
 def _supabase_save_token(token_dict: Dict) -> bool:
     """
     Upsert the Schwab token to Supabase.
-    Always saves the INNER flat token dict so the Supabase JSONB column
-    stays clean and _supabase_load_token can reliably wrap it on the way out.
+    Saves the full token object (including creation_timestamp at outer level)
+    so the format round-trips correctly through Supabase without corruption.
     """
     sb = _get_supabase()
     if sb is None:
         return False
     try:
-        inner = _unwrap_token(token_dict)  # strip wrapper before storing
+        # Ensure we always save in the correct wrapped format
+        wrapped = _wrap_token(token_dict)
         sb.table("schwab_tokens").upsert({
             "id": "shared",
-            "token": inner,
+            "token": wrapped,
         }).execute()
         return True
     except Exception as e:
@@ -126,12 +134,15 @@ def _token_to_tempfile(token_dict: Dict) -> str:
     """
     Write token dict to a temp file and return its path.
     schwab-py requires a file path; we use a temp file as a bridge.
-    Always writes the wrapped {"token": {...}} format that schwab-py expects.
+    token_dict must already be in the correct {"token": {...}, "creation_timestamp": ...} format.
     """
     tmp = tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False, prefix="schwab_token_"
     )
-    json.dump(_wrap_token(token_dict), tmp)
+    # Ensure it's in wrapped format before writing
+    if "token" not in token_dict:
+        token_dict = {"token": token_dict, "creation_timestamp": time.time()}
+    json.dump(token_dict, tmp)
     tmp.flush()
     tmp.close()
     return tmp.name
@@ -140,12 +151,15 @@ def _token_to_tempfile(token_dict: Dict) -> str:
 def _token_from_tempfile(path: str) -> Optional[Dict]:
     """
     Read token from temp file after schwab-py may have refreshed it.
-    Returns the wrapped {"token": {...}} format.
+    Returns the full token object as written by schwab-py.
     """
     try:
         with open(path, "r") as f:
             data = json.load(f)
-        return _wrap_token(data)
+        # schwab-py writes {"token": {...}, "creation_timestamp": ...}
+        if "token" not in data:
+            data = {"token": data, "creation_timestamp": time.time()}
+        return data
     except Exception:
         return None
 
@@ -192,13 +206,13 @@ def get_schwab_client():
                 tmp_path, client_id, client_secret
             )
         # If schwab-py refreshed the access token it rewrites the temp file.
-        # Compare the inner token dicts (not the wrappers) to detect real changes.
-        refreshed_wrapped = _token_from_tempfile(tmp_path)
-        if refreshed_wrapped:
-            refreshed_inner  = _unwrap_token(refreshed_wrapped)
-            original_inner   = _unwrap_token(token_dict)
+        # Compare access tokens to detect real changes and persist the update.
+        refreshed = _token_from_tempfile(tmp_path)
+        if refreshed:
+            refreshed_inner = refreshed.get("token", refreshed)
+            original_inner  = token_dict.get("token", token_dict)
             if refreshed_inner.get("access_token") != original_inner.get("access_token"):
-                _supabase_save_token(refreshed_inner)
+                _supabase_save_token(refreshed)
         try:
             os.unlink(tmp_path)
         except Exception:
@@ -331,10 +345,12 @@ def schwab_complete_auth(client_id: str, client_secret: str,
         token_data = resp.json()
 
         # ── 3. Build token dict in the format schwab-py's token file expects ─
-        # schwab-py needs: access_token, refresh_token, token_type, expires_in,
-        # scope, id_token, plus creation_timestamp for expiry calculation.
+        # Newer schwab-py versions expect creation_timestamp at the OUTER level:
+        # {"token": {access_token, refresh_token, ...}, "creation_timestamp": ...}
+        # Putting creation_timestamp inside the inner dict causes the
+        # "token format has changed" ValueError on client_from_token_file.
         token_dict = {
-            **token_data,
+            "token": token_data,
             "creation_timestamp": time.time(),
         }
 

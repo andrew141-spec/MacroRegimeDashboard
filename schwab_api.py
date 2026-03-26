@@ -96,8 +96,8 @@ def _supabase_load_token() -> Optional[Dict]:
         if res.data:
             stored = res.data[0]["token"]
             return _wrap_token(stored)  # normalise to wrapped format
-    except Exception:
-        pass
+    except Exception as e:
+        st.session_state["_schwab_auth_error"] = f"Supabase load error: {type(e).__name__}: {e}"
     return None
 
 
@@ -117,7 +117,8 @@ def _supabase_save_token(token_dict: Dict) -> bool:
             "token": inner,
         }).execute()
         return True
-    except Exception:
+    except Exception as e:
+        st.session_state["_schwab_auth_error"] = f"Supabase save error: {type(e).__name__}: {e}"
         return False
 
 

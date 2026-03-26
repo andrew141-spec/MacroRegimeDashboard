@@ -103,7 +103,13 @@ def _token_to_tempfile(token_dict: Dict) -> str:
     tmp = tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False, prefix="schwab_token_"
     )
-    json.dump(token_dict, tmp)
+    # schwab-py's client_from_token_file expects {"token": {...}} at the top level.
+    # Wrap if the dict doesn't already have that structure.
+    if "token" not in token_dict:
+        file_payload = {"token": token_dict}
+    else:
+        file_payload = token_dict
+    json.dump(file_payload, tmp)
     tmp.flush()
     tmp.close()
     return tmp.name
@@ -149,8 +155,11 @@ def get_schwab_client():
         client   = schwab.auth.client_from_token_file(
             tmp_path, client_id, client_secret
         )
-        # Save any refreshed token back to Supabase
-        refreshed = _token_from_tempfile(tmp_path)
+        # Save any refreshed token back to Supabase.
+        # _token_from_tempfile reads the {"token": {...}} wrapped file;
+        # unwrap before saving so Supabase always stores the flat token dict.
+        refreshed_raw = _token_from_tempfile(tmp_path)
+        refreshed = refreshed_raw.get("token", refreshed_raw) if refreshed_raw else None
         if refreshed and refreshed != token_dict:
             _supabase_save_token(refreshed)
         try:

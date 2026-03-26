@@ -153,8 +153,8 @@ SUPABASE_KEY = "eyJ..."   # anon/public key
             return
 
         if client is not None:
-            st.success("Already connected — no need to re-authorise unless you revoked the token above.")
-            return
+            st.success("Already connected — use 'Revoke & re-authorise' above if you need a fresh token.")
+            # Don't return — fall through so user can still re-auth if needed
 
         st.info(f"Redirect URI: `{redirect_uri}`  ← must match your Schwab app exactly")
 
@@ -195,6 +195,8 @@ SUPABASE_KEY = "eyJ..."   # anon/public key
                     if ok:
                         st.success(f"✅ {msg}")
                         st.balloons()
+                        get_schwab_client.clear()  # ensure cache is cleared before rerun
+                        time.sleep(0.5)            # brief pause so Supabase write propagates
                         st.rerun()
                     else:
                         st.error(f"Auth failed: {msg}")
@@ -205,5 +207,3 @@ SUPABASE_KEY = "eyJ..."   # anon/public key
 - Wrong Client ID or Secret
 - Supabase not configured — token can't be saved
 """)
-
-
